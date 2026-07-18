@@ -11,12 +11,13 @@
 #   exit 2  the sources it reads are missing/unusable -> Broken (never a false pass)
 #
 # Runs from the repository root (the claim store root). The verb list comes from the
-# *debug* binary's own `--help`, so it tracks the shipped CLI surface exactly — this
-# is why the repo's dogfooding workflow (and scripts/check.sh) builds `claim` before
-# running its checks: a `claim check` on a fresh gate always has a current debug
-# binary. A stale binary is guarded against: a missing one is Broken, not a false
-# pass. The MCP tool list comes from the server source (each `#[tool]` handler), the
-# single source of truth for what the server registers.
+# *debug* binary's own `--help`, so it tracks the shipped CLI surface exactly. The
+# gate keeps that binary current: `scripts/check.sh` has a "dogfood claims" step that
+# builds `claim` (also a side effect of `cargo test`) and then runs
+# `./target/debug/claim check --all --report-only`, which is what executes this check.
+# So on the gate the binary is always fresh; a missing one is Broken (exit 2), never a
+# false pass. The MCP tool list comes from the server source (each `#[tool]` handler),
+# the single source of truth for what the server registers.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,11 +25,10 @@ cd "$repo_root"
 
 doc="docs/index.html"
 mcp_src="crates/claim-mcp/src/server.rs"
-# The debug binary specifically: the one scripts/check.sh and the dogfooding
-# workflow build. A release binary is deliberately not consulted, because a stale
-# release artifact from an earlier build would report a verb list that does not match
-# the current source — a silent miscount is exactly the rot this claim exists to
-# catch, so we never risk it.
+# The debug binary specifically: the one scripts/check.sh's dogfood step builds. A
+# release binary is deliberately not consulted, because a stale release artifact from
+# an earlier build would report a verb list that does not match the current source — a
+# silent miscount is exactly the rot this claim exists to catch, so we never risk it.
 bin="target/debug/claim"
 
 if [ ! -x "$bin" ]; then
