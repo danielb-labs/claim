@@ -12,9 +12,10 @@
 //! - **How is one created?** [`Store::init`] scaffolds `.claims/` and
 //!   `.claims/log/` in a chosen directory, idempotently.
 //! - **What claims does it hold?** [`Store::load_all`] walks `.claims/**/*.md`,
-//!   parses each, and returns the whole corpus, so every consumer shares one
-//!   definition of "every claim in the store" rather than each re-deriving the
-//!   walk.
+//!   parses each file that opens with a frontmatter fence (a plain `README.md` is
+//!   a document, not a claim, and is skipped), and returns the whole corpus, so
+//!   every consumer shares one definition of "every claim in the store" rather
+//!   than each re-deriving the walk.
 //!
 //! The discovery rule is a deliberate contract: the store root is the directory
 //! *containing* `.claims/`, and there is exactly one per walk (the nearest),
@@ -108,11 +109,15 @@ impl Store {
     /// stable, deterministic order (a directory listing is order-unspecified across
     /// platforms), so a JSON array or a human table reads the same on every run.
     ///
-    /// Two directories under `.claims/` are deliberately skipped: `log/`, which
-    /// holds verdict-log JSON (`read_entries` owns those), and any file that is not
-    /// a `.md`. Everything else under `.claims/` is a standalone claim file, parsed
-    /// with [`claim_core::parse_claim_file`] and named — in a parse error — the way
-    /// it appears on disk relative to the store root.
+    /// Three things under `.claims/` are deliberately skipped: `log/`, which holds
+    /// verdict-log JSON (`read_entries` owns those); any file that is not a `.md`;
+    /// and any `.md` that does not open with a `---` frontmatter fence — a plain
+    /// document (a `README.md`) is not a claim and must not break the store. A `.md`
+    /// that *does* open with a fence is parsed with [`claim_core::parse_claim_file`]
+    /// and named — in a parse error — the way it appears on disk relative to the
+    /// store root, so a fenced-but-malformed claim stays a loud error rather than
+    /// being silently dropped. See `collect_claim_files` for the exact rule and
+    /// its trade-off.
     ///
     /// Embedded claims (`<!-- claim ... -->` blocks in host files like CLAUDE.md)
     /// are *not* collected here: v1 authoring writes standalone `.claims/*.md`
@@ -343,7 +348,29 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
 }
 
 /// Recursively collect standalone claim files under `dir`, skipping the verdict
-/// log directory and any non-`.md` file.
+/// log directory, any non-`.md` file, and any `.md` file that does not *intend*
+/// to be a claim.
+///
+/// A `.claims/**/*.md` file counts as a claim only when its content — after an
+/// optional UTF-8 BOM — opens with a `---` frontmatter fence
+/// ([`claim_core::has_frontmatter_fence`]). A `.md` that does not open with the
+/// fence (a `README.md` documenting the store, say) is a plain document and is
+/// skipped silently: it is not parsed, and it is not an error. Without this rule
+/// a single non-claim doc dropped into `.claims/` fails to parse and forces
+/// `check`/`list`/`drift` to exit 2, so documenting a store breaks it.
+///
+/// The trade-off is deliberate and narrow: a file that *meant* to be a claim but
+/// whose author forgot the opening `---` fence is silently skipped rather than
+/// flagged. That is acceptable — a claim file without frontmatter is not a valid
+/// claim file (it has no id, no check, no `max-age`), and the alternative (one
+/// stray README taking the whole store's nag offline) is the false-silence this
+/// tool exists to prevent, at store scale. A file that *does* open with the fence
+/// but has malformed YAML stays a loud [`load_one`] error: it declared its intent
+/// to be a claim, so a real-but-broken claim is never dropped (invariant #6).
+///
+/// A `.md` that cannot be read to inspect its first line is *kept*, not skipped,
+/// so [`load_one`] surfaces the read failure loudly rather than this walk deciding
+/// an unreadable file is a plain doc.
 ///
 /// Pushes absolute paths into `out`; the caller parses them. The `log_dir` guard
 /// is by path equality (not name), so a claim legitimately named `log.md` at the
@@ -386,11 +413,42 @@ fn collect_claim_files(
                 continue;
             }
             collect_claim_files(&path, log_dir, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+            && intends_to_be_a_claim(&path)
+        {
             out.push(path);
         }
     }
     Ok(())
+}
+
+/// Whether a `.md` file under `.claims/` should be parsed as a claim: its first
+/// line opens with a `---` frontmatter fence, or it could not be read to tell.
+///
+/// A readable file with no opening fence is a plain document and returns `false`
+/// (skip it). A file that opens with the fence returns `true` (parse it, so
+/// malformed YAML stays loud). An *unreadable* file also returns `true`: we cannot
+/// prove it is a plain doc, so it is kept for [`load_one`] to report the read
+/// failure rather than silently dropped here. See [`collect_claim_files`] for the
+/// rule and its trade-off.
+///
+/// Only the first line is read — the fence lives there and
+/// [`claim_core::has_frontmatter_fence`] looks no further — so this stays cheap on
+/// a store of many `.md` files and never re-reads the whole file that [`load_one`]
+/// is about to parse.
+fn intends_to_be_a_claim(path: &Path) -> bool {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let mut first_line = String::new();
+    // A read failure mid-file is treated the same as an unreadable file: keep it, so
+    // `load_one` surfaces the fault loudly rather than this walk deciding it is a doc.
+    match std::io::BufReader::new(file).read_line(&mut first_line) {
+        Ok(_) => claim_core::has_frontmatter_fence(&first_line),
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -448,16 +506,62 @@ mod tests {
     }
 
     #[test]
-    fn load_all_reports_a_malformed_file_without_dropping_the_good_ones() {
-        // M1: one bad file is its own error; the good claim still loads.
+    fn load_all_reports_a_frontmatter_fenced_file_with_bad_yaml_loudly() {
+        // M1: a file that *opens with a fence* declares itself a claim, so malformed
+        // YAML under it is a loud per-file error, never silently skipped. The good
+        // claim still loads (one broken sibling does not silence the store).
         let (_dir, store) = store();
         write(&store, ".claims/good.md", &claim_text("good"));
-        write(&store, ".claims/bad.md", "not a claim, no frontmatter\n");
+        write(
+            &store,
+            ".claims/broken.md",
+            "---\nchecks: [unclosed\n---\nS.\n",
+        );
         let load = store.load_all().unwrap();
         assert_eq!(load.claims.len(), 1);
         assert_eq!(load.claims[0].claim.id.as_str(), "good");
-        assert_eq!(load.errors.len(), 1);
-        assert_eq!(load.errors[0].file, ".claims/bad.md");
+        assert_eq!(load.errors.len(), 1, "the fenced-but-broken file is loud");
+        assert_eq!(load.errors[0].file, ".claims/broken.md");
+    }
+
+    #[test]
+    fn load_all_skips_a_non_claim_doc_with_no_frontmatter_fence() {
+        // The store scanner's core fix: a plain document dropped into `.claims/`
+        // (a README) has no opening `---` fence, so it is not a claim — it is
+        // skipped, not parsed and not reported as an error. Without this, one stray
+        // doc forces `check`/`list`/`drift` to exit 2 and takes the whole store's
+        // nag offline.
+        let (_dir, store) = store();
+        write(&store, ".claims/good.md", &claim_text("good"));
+        write(
+            &store,
+            ".claims/README.md",
+            "# My claim store\n\nDocuments the claims here.\n",
+        );
+        let load = store.load_all().unwrap();
+        assert_eq!(load.claims.len(), 1);
+        assert_eq!(load.claims[0].claim.id.as_str(), "good");
+        assert!(
+            load.errors.is_empty(),
+            "a non-claim doc is skipped, not an error"
+        );
+    }
+
+    #[test]
+    fn load_all_treats_a_bom_prefixed_fenced_file_as_a_claim() {
+        // The fence test tolerates a leading UTF-8 BOM exactly as `split_frontmatter`
+        // does, so a BOM-prefixed claim file is neither skipped as a plain doc nor
+        // mis-parsed. This guards the two rules staying in lockstep.
+        let (_dir, store) = store();
+        write(
+            &store,
+            ".claims/bom.md",
+            &format!("\u{feff}{}", claim_text("bom")),
+        );
+        let load = store.load_all().unwrap();
+        assert_eq!(load.claims.len(), 1);
+        assert_eq!(load.claims[0].claim.id.as_str(), "bom");
+        assert!(load.errors.is_empty());
     }
 
     #[test]

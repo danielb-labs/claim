@@ -177,7 +177,9 @@ fn stats_reports_a_load_error_without_aborting_or_failing() {
     repo.claim().arg("init").assert().success();
     repo.write_claim("good", &claim_file("good", "120d"));
     repo.write_verdict("good", "2026-07-15T00:00:00Z", "held");
-    repo.write_claim("bad", "not a claim, no frontmatter\n");
+    // Opens with a fence, so it is parsed and its malformed YAML is a loud error; a
+    // fenceless doc would be skipped as a non-claim rather than reported.
+    repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
 
     let out = repo
         .claim_at(NOW)

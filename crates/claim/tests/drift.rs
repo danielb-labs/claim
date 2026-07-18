@@ -124,7 +124,9 @@ fn drift_reports_a_load_error_and_exits_two() {
     repo.claim().arg("init").assert().success();
     repo.write_claim("gone", &claim_file("gone", ""));
     repo.write_verdict("gone", "2026-07-15T00:00:00Z", "drifted");
-    repo.write_claim("bad", "not a claim\n");
+    // A file that opens with a fence declares itself a claim, so malformed YAML under
+    // it is a loud error (a fenceless doc would be a skipped non-claim now).
+    repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
 
     let output = repo
         .claim_at(NOW)

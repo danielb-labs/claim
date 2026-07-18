@@ -430,6 +430,40 @@ pub fn parse_claim_file(path: &str, contents: &str) -> Result<Claim> {
     build_claim(path, yaml, body, source)
 }
 
+/// Whether a file's text *intends* to be a standalone claim: it opens with a
+/// `---` frontmatter fence (after an optional UTF-8 BOM).
+///
+/// This is the discriminator a store scanner uses to tell a claim file from a
+/// plain document living beside it (a `README.md` in `.claims/`). A file that
+/// opens with the fence is treated as a claim and parsed — so malformed YAML
+/// under an opening fence is still a *loud* [`parse_claim_file`] error, never
+/// silently skipped (invariant #6: a file that means to be a claim must nag when
+/// it is broken). A file that does *not* open with the fence is a plain document
+/// the scanner may skip.
+///
+/// This is the parser's opening-fence *acceptance* condition, and only that: it
+/// returns `true` for exactly the first lines [`parse_claim_file`] accepts as a
+/// fence. The parser is additionally stricter — it also requires a following
+/// newline and a body to proceed — so a file this accepts can still fail to
+/// parse (a bare `---` with no body is one such case). The divergence is
+/// one-directional and that is the load-bearing property: any file the parser
+/// would accept as a claim, this accepts too, so the scanner never skips a real
+/// claim; when the two differ, it is only the parser being louder, never the
+/// scanner being quieter. It inspects only the first line, so a caller may pass
+/// just that line rather than a whole file.
+#[must_use]
+pub fn has_frontmatter_fence(contents: &str) -> bool {
+    let text = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    // The parser's opening-fence acceptance: the first line must *start* with `---`
+    // (no leading whitespace — an indented `---` is not a fence) and carry nothing
+    // but whitespace after it. The parser then also needs a newline and a body, which
+    // this does not require — the accepted-as-fence set is a superset, so divergence
+    // only ever makes the parser louder.
+    text.strip_prefix(FRONTMATTER_FENCE)
+        .map(|rest| rest.split_once('\n').map_or(rest, |(head, _)| head))
+        .is_some_and(|line_rest| line_rest.trim().is_empty())
+}
+
 /// Extract every `<!-- claim ... -->` block embedded in a host file.
 ///
 /// A host file (CLAUDE.md, AGENTS.md, or any text file) may carry several claims.
@@ -1364,6 +1398,28 @@ See [[libfoo-cjk-repro]] for the reproduction.
             links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
             ["real"]
         );
+    }
+
+    #[test]
+    fn frontmatter_fence_detection_accepts_exactly_the_parser_opening_fence() {
+        // A store scanner uses this to tell a claim from a plain doc. It must accept
+        // every first line the parser accepts as a fence, or a fenced-but-broken
+        // claim could be skipped instead of erroring loudly; it may accept *more*
+        // (the parser is additionally stricter), which only ever makes the parser
+        // louder, never the scanner quieter.
+        assert!(has_frontmatter_fence("---\nid: a\n---\nS.\n"));
+        assert!(has_frontmatter_fence("---   \nid: a\n---\nS.\n")); // trailing space is fine
+        assert!(has_frontmatter_fence("\u{feff}---\nid: a\n")); // a leading BOM is tolerated
+                                                                // A bare `---` with no body is accepted as a fence here but the parser rejects
+                                                                // it (no body) — the safe divergence: the scanner keeps it, the parser is loud.
+        assert!(has_frontmatter_fence("---"));
+        assert!(parse_claim_file("f.md", "---").is_err());
+
+        assert!(!has_frontmatter_fence("# README\n\nnot a claim\n"));
+        assert!(!has_frontmatter_fence("")); // empty file
+        assert!(!has_frontmatter_fence("----\nid: a\n")); // four dashes is not the fence
+        assert!(!has_frontmatter_fence("---foo\nid: a\n")); // fence must be alone on its line
+        assert!(!has_frontmatter_fence(" ---\nid: a\n")); // leading space disqualifies it
     }
 
     // --- Negative paths: every validation must fail loudly and name the fix. ---

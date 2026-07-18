@@ -86,16 +86,19 @@ pub struct InitArgs {
 #[derive(Debug, clap::Args)]
 pub struct AddArgs {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
-    /// (e.g. `payments/libfoo-pin`).
+    /// (e.g. `payments/libfoo-pin`). Required (prompted for when a terminal is
+    /// attached; a clear error otherwise).
     #[arg(long)]
     pub id: Option<String>,
 
-    /// The plain-language statement — the fact the claim records.
+    /// The plain-language statement — the fact the claim records. Required
+    /// (prompted for when a terminal is attached; a clear error otherwise).
     #[arg(long)]
     pub statement: Option<String>,
 
     /// The `cmd` check's command line. Runs through the shell; exit 0 means the
-    /// fact holds, exit 1 means it drifted (unless `--negate` inverts).
+    /// fact holds, exit 1 means it drifted (unless `--negate` inverts). Required
+    /// (prompted for when a terminal is attached; a clear error otherwise).
     #[arg(long, value_name = "CMD")]
     pub run: Option<String>,
 
@@ -111,11 +114,30 @@ pub struct AddArgs {
 
     /// The dead-man's switch: how long a passing check keeps the claim fresh, as
     /// `<N>d` (e.g. `120d`).
+    ///
+    /// Required. Like `--id`, `--statement`, and `--run`, it is prompted for when a
+    /// terminal is attached; a non-interactive caller (an agent or CI, with no TTY)
+    /// that omits it fails with a clear "missing max-age; pass --max-age" error,
+    /// because a claim with no freshness window can never be nagged and would rot
+    /// silently. There is no default: how long a fact stays fresh is the author's
+    /// judgment, not the tool's.
     #[arg(long, value_name = "DAYS")]
     pub max_age: Option<String>,
 
     /// A `supports` target this claim justifies — a decision ref
     /// (`requirements.txt#libfoo`) or a bare claim id. Repeatable.
+    ///
+    /// A decision ref `path#anchor` resolves when `path` exists and the text
+    /// `anchor` occurs in it as a case-sensitive word-boundary text scan — not a
+    /// Markdown heading slug. `CLAUDE.md#approved-dependencies` looks for the exact
+    /// text `approved-dependencies`, so to point at a heading like "## Approved
+    /// dependencies" use the words as written and matching case (`CLAUDE.md#Approved
+    /// dependencies`), not the GitHub anchor slug; `#approved` will not match
+    /// `Approved`. A bare target (no `#`) resolves when it is an existing file or a
+    /// known claim id. `add` runs this check now and prints a warning for each
+    /// target that does not resolve (a forward reference is allowed, so it is a
+    /// warning, not a hard failure); `check` later reports an unresolved target as
+    /// review-needed.
     #[arg(long = "supports", value_name = "TARGET")]
     pub supports: Vec<String>,
 

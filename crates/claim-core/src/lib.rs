@@ -34,8 +34,8 @@ pub use check::{
     DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
 };
 pub use claim::{
-    extract_embedded_claims, parse_claim_file, Check, CheckKind, Claim, ClaimId, Days, Source,
-    SupportTarget, Trigger, WikiLink,
+    extract_embedded_claims, has_frontmatter_fence, parse_claim_file, Check, CheckKind, Claim,
+    ClaimId, Days, Source, SupportTarget, Trigger, WikiLink,
 };
 pub use error::{Error, Result};
 pub use log::{

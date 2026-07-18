@@ -255,8 +255,9 @@ fn a_malformed_claim_file_does_not_hide_the_good_ones() {
     repo.claim().arg("init").assert().success();
     repo.write_claim("good", &claim_file("good", "120d"));
     repo.write_verdict("good", "2026-07-10T00:00:00Z", "held");
-    // A file that does not parse (no frontmatter).
-    repo.write_claim("bad", "this is not a claim, it has no frontmatter\n");
+    // A file that opens with a fence but has malformed YAML: it declared itself a
+    // claim, so it is a loud error (a fenceless doc would be skipped as a non-claim).
+    repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
 
     let output = repo
         .claim_at(NOW)
