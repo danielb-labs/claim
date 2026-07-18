@@ -16,9 +16,9 @@ the parts you touch.
 - [`dogfooding.md`](dogfooding.md) — how this repository verifies its own
   load-bearing decisions with `claim`, and how to run those checks.
 - [`design/`](design/) — the product and design canon: `PRODUCT.md` (what v1 is),
-  `PROPOSAL.md` (why it exists), `SPEC.md` (original notes), and `TODO.md` (parked
-  decisions and deferred work). These describe the *product*; the docs above and
-  `--help` describe *using the tool as built*.
+  `PROPOSAL.md` (why it exists), and `SPEC.md` (original notes). These describe the
+  *product*; the docs above and `--help` describe *using the tool as built*. Parked
+  decisions and deferred work are tracked as GitHub issues under the `deferred` label.
 
 The authoritative flag reference is always `claim <verb> --help`; the CLI table
 in `index.html` mirrors it as of the current release.

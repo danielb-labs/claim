@@ -89,9 +89,12 @@ A Cargo workspace of four crates:
   [CI lanes](docs/ci.md), [agent checks](docs/agent-checks.md), and
   [dogfooding](docs/dogfooding.md).
 - [`docs/design/`](docs/design/) — the product and design canon (`PRODUCT.md`,
-  `PROPOSAL.md`, `SPEC.md`, `TODO.md`).
+  `PROPOSAL.md`, `SPEC.md`).
 - [`CLAUDE.md`](CLAUDE.md) — how the code gets built: the golden invariants, the
   stack, and the branch → review → merge workflow. Binding for every contributor.
+
+Parked decisions and deferred work live in the [issue tracker](../../issues) under
+the `deferred` label.
 
 ## Development
 
