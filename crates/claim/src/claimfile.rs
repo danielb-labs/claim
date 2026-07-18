@@ -1,96 +1,17 @@
-//! Rendering a claim to the on-disk `.claims/*.md` format.
+//! Gathering `claim add`'s fields and rendering them to the on-disk `.claims/*.md`
+//! format.
 //!
-//! `claim add` builds a claim's frontmatter and body as text, then hands that
-//! exact text to [`claim_core::parse_claim_file`] to validate it before writing —
-//! so the file the tool commits is proven to parse, not merely assembled and
-//! hoped-correct. Keeping the rendering here (rather than pulling a YAML serializer
-//! into the CLI) means the tool writes only the small, fixed set of fields it
-//! understands, in a stable shape a human will read in review.
+//! `claim add` builds a claim's frontmatter and body as text via the shared
+//! [`claim_store::render_claim`], then hands that exact text to
+//! [`claim_core::parse_claim_file`] to validate it before writing — so the file the
+//! tool commits is proven to parse, not merely assembled and hoped-correct. The
+//! renderer lives in `claim-store`, shared with the MCP `create` tool, so both front
+//! doors emit byte-identical files and the frontmatter's injection-hardening lives in
+//! exactly one place. This module keeps only the CLI's own gather structures and the
+//! draft→render→validate glue.
 
 use claim_core::{Check, CheckKind, Claim};
-
-/// Render a claim's fields to the `.claims/*.md` text: `---`-fenced YAML
-/// frontmatter followed by the statement body.
-///
-/// The output is deliberately minimal and canonical — only the fields the tool set,
-/// each on its own line — so two claims authored the same way produce byte-identical
-/// files and a reviewer reads a predictable shape. It is *not* a general YAML
-/// emitter; it emits exactly the v1 schema. `run` is quoted so shell metacharacters
-/// in a command (`|`, `#`, `:`) cannot break the YAML, and any embedded quote is
-/// escaped.
-///
-/// The rendered text is round-tripped through [`claim_core::parse_claim_file`] by
-/// the caller ([`render_and_validate`]) so a rendering bug is caught before the
-/// file is written, never after it is committed.
-#[must_use]
-pub fn render(claim: &ClaimDraft) -> String {
-    let mut out = String::new();
-    out.push_str("---\n");
-    out.push_str(&format!("id: {}\n", claim.id));
-    out.push_str("checks:\n");
-    for check in &claim.checks {
-        render_check(&mut out, check);
-    }
-    out.push_str(&format!("max-age: {}\n", claim.max_age));
-    if !claim.supports.is_empty() {
-        out.push_str("supports:\n");
-        for target in &claim.supports {
-            out.push_str(&format!("  - {}\n", yaml_scalar(target)));
-        }
-    }
-    out.push_str("---\n");
-    out.push_str(claim.statement.trim());
-    out.push('\n');
-    out
-}
-
-/// Render one check as a YAML list item under `checks:`.
-fn render_check(out: &mut String, check: &CheckDraft) {
-    out.push_str(&format!("  - kind: {}\n", check.kind_name()));
-    match &check.kind {
-        CheckDraftKind::Cmd { run, negate } => {
-            out.push_str(&format!("    run: {}\n", yaml_double_quoted(run)));
-            if *negate {
-                out.push_str("    negate: true\n");
-            }
-        }
-    }
-    out.push_str(&format!("    when: {}\n", check.when));
-}
-
-/// A YAML scalar that is safe unquoted when it has no special leading char or
-/// interior colon, and double-quoted otherwise. Conservative: when in doubt, quote.
-fn yaml_scalar(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.contains([':', '#', '"', '\'', '\n'])
-        || s.starts_with([
-            ' ', '-', '?', '[', ']', '{', '}', '&', '*', '!', '|', '>', '@', '`',
-        ])
-        || s.ends_with(' ');
-    if needs_quote {
-        yaml_double_quoted(s)
-    } else {
-        s.to_owned()
-    }
-}
-
-/// A YAML double-quoted scalar with `\` and `"` escaped. Used for the check `run`
-/// unconditionally, since a command is dense with characters YAML treats specially.
-fn yaml_double_quoted(s: &str) -> String {
-    let mut q = String::with_capacity(s.len() + 2);
-    q.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => q.push_str("\\\\"),
-            '"' => q.push_str("\\\""),
-            '\n' => q.push_str("\\n"),
-            '\t' => q.push_str("\\t"),
-            other => q.push(other),
-        }
-    }
-    q.push('"');
-    q
-}
+use claim_store::{render_claim, CheckRender, ClaimRender, RenderError};
 
 /// The claim fields `claim add` collected, before rendering and validation.
 ///
@@ -120,14 +41,6 @@ pub struct CheckDraft {
     pub when: String,
 }
 
-impl CheckDraft {
-    fn kind_name(&self) -> &'static str {
-        match self.kind {
-            CheckDraftKind::Cmd { .. } => "cmd",
-        }
-    }
-}
-
 /// The kind of a drafted check. Only `cmd` is authored by `claim add` in v1; the
 /// enum leaves room for `agent`/`human` authoring later without reshaping callers.
 pub enum CheckDraftKind {
@@ -140,21 +53,76 @@ pub enum CheckDraftKind {
     },
 }
 
+/// Why a draft could not be turned into a validated claim: either the shared renderer
+/// refused an injection-prone scalar, or the parser rejected the schema.
+///
+/// Both are surfaced to the user as "the claim you described is not valid: …" with the
+/// specific reason, so the two failure classes read the same to a caller while staying
+/// distinct in the type.
+#[derive(Debug)]
+pub enum DraftError {
+    /// A frontmatter scalar (`id`/`max-age`/`when`) carried a newline or control
+    /// character — refused by the renderer before any text was produced.
+    Render(RenderError),
+    /// The rendered text did not satisfy the claim schema.
+    Parse(claim_core::Error),
+}
+
+impl std::fmt::Display for DraftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DraftError::Render(e) => e.fmt(f),
+            DraftError::Parse(e) => e.fmt(f),
+        }
+    }
+}
+
 /// Render a draft and validate it by parsing the rendered bytes, returning the
 /// parsed [`Claim`] and the text that produced it.
 ///
 /// The returned text is exactly what will be written to disk, and the returned
-/// `Claim` is proof it parses — the same file, validated. Any schema violation
-/// (a bad id, an empty statement, a malformed trigger) surfaces here as a
-/// [`claim_core::Error`] naming the field, before anything is written.
+/// `Claim` is proof it parses — the same file, validated. The renderer refuses a
+/// newline or control character in `id`/`max-age`/`when` (so a crafted value cannot
+/// inject a phantom field past this round-trip), and any remaining schema violation
+/// (a bad id, an empty statement, a malformed trigger) surfaces from the parser
+/// naming the field, before anything is written.
 ///
 /// # Errors
 ///
-/// Returns the parser's error if the rendered claim does not satisfy the schema.
-pub fn render_and_validate(draft: &ClaimDraft, path: &str) -> claim_core::Result<(Claim, String)> {
-    let text = render(draft);
-    let claim = claim_core::parse_claim_file(path, &text)?;
+/// Returns [`DraftError::Render`] if the renderer refuses an injection-prone scalar,
+/// or [`DraftError::Parse`] if the rendered claim does not satisfy the schema.
+pub fn render_and_validate(draft: &ClaimDraft, path: &str) -> Result<(Claim, String), DraftError> {
+    let render = draft.as_render();
+    let text = render_claim(&render).map_err(DraftError::Render)?;
+    let claim = claim_core::parse_claim_file(path, &text).map_err(DraftError::Parse)?;
     Ok((claim, text))
+}
+
+impl ClaimDraft {
+    /// Borrow this draft as the shared renderer's input. `claim add` authors exactly
+    /// one check in v1, so the first (and only) check is rendered; a draft with no
+    /// check is impossible from the CLI's gather path.
+    fn as_render(&self) -> ClaimRender<'_> {
+        let check = match self.checks.first() {
+            Some(CheckDraft {
+                kind: CheckDraftKind::Cmd { run, negate },
+                ..
+            }) => CheckRender::Cmd {
+                run,
+                negate: *negate,
+            },
+            None => unreachable!("claim add always gathers exactly one check"),
+        };
+        let when = self.checks.first().map_or("on-change", |c| c.when.as_str());
+        ClaimRender {
+            id: &self.id,
+            max_age: &self.max_age,
+            check,
+            when,
+            supports: &self.supports,
+            statement: &self.statement,
+        }
+    }
 }
 
 /// The primary `cmd` check of a parsed claim, for the establishing and witness runs.
@@ -201,7 +169,8 @@ mod tests {
         // so the snapshot is stable and any format change is a reviewable diff. The
         // `#`-bearing supports target and the quoted command exercise the YAML
         // quoting rules.
-        insta::assert_snapshot!(render(&full_draft()));
+        let text = render_claim(&full_draft().as_render()).unwrap();
+        insta::assert_snapshot!(text);
     }
 
     #[test]
@@ -211,6 +180,6 @@ mod tests {
         let (claim, text) =
             render_and_validate(&draft, ".claims/payments/libfoo-pin.md").expect("valid claim");
         assert_eq!(claim.id.as_str(), "payments/libfoo-pin");
-        assert_eq!(text, render(&draft));
+        assert_eq!(text, render_claim(&draft.as_render()).unwrap());
     }
 }

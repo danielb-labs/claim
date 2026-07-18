@@ -316,7 +316,9 @@ fn amend_only_max_age_keeps_the_check_and_statement() {
         .map(|x| x.as_str().unwrap())
         .collect();
     assert_eq!(changed, ["max-age"]);
-    assert!(repo.read(".claims/pin.md").contains("max-age: 90d"));
+    // The re-rendered file quotes single-scalar frontmatter fields (the shared
+    // renderer's injection-hardening).
+    assert!(repo.read(".claims/pin.md").contains("max-age: \"90d\""));
     assert!(repo
         .read(".claims/pin.md")
         .contains("We pin libfoo at 4.2."));
@@ -442,5 +444,5 @@ fn amend_without_supports_flag_preserves_existing_supports() {
         file.contains("requirements.txt#libfoo"),
         "existing support preserved across an unrelated amend"
     );
-    assert!(file.contains("max-age: 90d"));
+    assert!(file.contains("max-age: \"90d\""));
 }
