@@ -25,4 +25,17 @@ cargo test --workspace --all-features
 echo "==> docs (broken intra-doc links are errors)"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+# The CI lanes' body-building logic (ci/render.mjs) is the one non-Rust piece of the
+# product, and its unit tests are the only coverage GitHub Actions can't run locally.
+# Gate on them too, so a change that breaks the comment/issue rendering fails here, not
+# in production. Node ships on GitHub runners; if a dev shell lacks it, we skip loudly
+# rather than pass silently — a skipped test that looks green is exactly what this tool
+# exists to prevent.
+echo "==> ci renderer tests"
+if command -v node >/dev/null 2>&1; then
+  node --test "ci/*.test.mjs"
+else
+  echo "WARNING: node not found; skipping ci/render.test.mjs (CI runs it)." >&2
+fi
+
 echo "OK"

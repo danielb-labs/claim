@@ -1,0 +1,10 @@
+# Routing for the claim CI lanes. Both lanes look up the owner of each claim's *file*
+# here and @-mention them on the finding, so drift lands in front of whoever owns the
+# decision it rested on. Last matching pattern wins (GitHub's CODEOWNERS rule).
+#
+# Own your claims by the same paths you own your code: a claim about payments lives
+# under the payments path and routes to the payments team.
+
+*                       @your-org/eng
+.claims/payments/       @your-org/payments
+.claims/builds/         @your-org/platform

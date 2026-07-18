@@ -1,0 +1,4 @@
+# Test CODEOWNERS. Last matching pattern wins (GitHub semantics).
+*                       @acme/eng
+.claims/payments/       @acme/payments
+.claims/builds/         @acme/platform

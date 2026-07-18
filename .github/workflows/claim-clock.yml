@@ -1,0 +1,185 @@
+# The clock lane, as a reusable workflow.
+#
+# A consumer repo calls this from its own scheduled workflow (see examples/consumer/).
+# On a cron it runs `claim check --due` against the trusted default branch, persists
+# the verdicts (this is the trusted context — PRODUCT.md section 3: main-branch and
+# clock-lane runs persist), commits the new verdict-log files back, and maintains ONE
+# standing issue titled "claim: due & drifted". The issue is created when there is
+# anything to report, its body is updated to the current queue, and it is closed when
+# the store is clean. This standing issue is the entire v1 nag mechanism: the bell
+# that turns computed staleness into something a human hears.
+#
+# Persistence is the point of this lane. Because it runs on the default branch with
+# the repo's own token, it has a git identity and write access; the committed verdicts
+# advance each claim's freshness clock so an `every Nd` claim is not perpetually due.
+# A read-only variant (drop the commit step and pass `--report-only`) is documented in
+# docs/ci.md for repos that would rather not commit from CI; it still nags via the
+# issue, it just never resets the due clock.
+
+name: claim clock
+
+on:
+  workflow_call:
+    inputs:
+      claim-repo:
+        description: The owner/name of the claim tool repository to build from.
+        type: string
+        default: your-org/claim
+      claim-ref:
+        description: The git ref of the claim tool repo to build the binary from.
+        type: string
+        default: main
+      codeowners:
+        description: Path to the CODEOWNERS file used to route findings to owners.
+        type: string
+        default: .github/CODEOWNERS
+      working-directory:
+        description: The directory containing the .claims/ store to check.
+        type: string
+        default: .
+      persist:
+        description: Commit the recorded verdicts back to the default branch.
+        type: boolean
+        default: true
+
+# The clock lane persists, so it needs to write commits and manage the standing issue.
+permissions:
+  contents: write
+  issues: write
+
+# Never overlap scheduled runs against the same store; a second run waits rather than
+# racing the first's commit.
+concurrency:
+  group: claim-clock-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  due:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+
+      - name: Check out the claim tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.claim-repo }}
+          ref: ${{ inputs.claim-ref }}
+          path: _claim_tool
+
+      - name: Install the claim binary
+        uses: ./_claim_tool/.github/actions/install-claim
+        with:
+          source-path: _claim_tool/crates/claim
+
+      # Give the persisting run a git identity so `claim check` can stamp verdicts.
+      # A report-only run (`persist: false`) does not need one, but setting it is
+      # harmless.
+      - name: Configure the committer identity
+        run: |
+          git config user.name "claim-bot"
+          git config user.email "claim-bot@users.noreply.github.com"
+
+      # Run the due claims. Persisting (`--due` alone) records verdicts to the log;
+      # report-only (`persist: false`) writes nothing. `|| true` keeps the job green:
+      # a drift or broken check is a finding to route via the issue, not a CI failure.
+      - name: Run due claims
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ "${{ inputs.persist }}" = "true" ]; then
+            claim --json check --due > "$RUNNER_TEMP/report.json" || true
+          else
+            claim --json check --due --report-only > "$RUNNER_TEMP/report.json" || true
+          fi
+
+      # Commit any new verdict-log files. `git diff --quiet` skips the commit and push
+      # when nothing changed (every check held, or report-only), so a quiet day makes
+      # no commit. This is the "a write to the truth is a commit" invariant (#4): the
+      # only way a verdict reaches the store is a committed file, no side channel.
+      - name: Commit recorded verdicts
+        if: ${{ inputs.persist }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          git add .claims/log
+          if git diff --cached --quiet; then
+            echo "No new verdicts to commit."
+          else
+            git commit -m "chore(claim): record scheduled verdicts"
+            git push
+          fi
+
+      - name: Render the issue body
+        id: render
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          body_file="$RUNNER_TEMP/issue.md"
+          set +e
+          node "$GITHUB_WORKSPACE/_claim_tool/ci/render.mjs" \
+            --mode issue \
+            --codeowners "$GITHUB_WORKSPACE/${{ inputs.codeowners }}" \
+            --root . \
+            --report "$RUNNER_TEMP/report.json" > "$body_file"
+          # The renderer exits 0 when the store is clean, non-zero when there is a
+          # queue. That decision — not any check exit code — drives open-vs-close. A
+          # non-zero from a renderer crash is also treated as "not clean", which errs
+          # toward opening the nag rather than silently closing it (invariant #6).
+          echo "clean=$?" >> "$GITHUB_OUTPUT"
+          echo "body_file=$body_file" >> "$GITHUB_OUTPUT"
+
+      # Maintain the single standing issue. Found by its marker (in the body) and its
+      # label. Open/update when there is a queue; close when clean. Idempotent: at most
+      # one open "claim: due & drifted" issue exists at any time.
+      - name: Maintain the standing issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.BODY_FILE, 'utf8');
+            const clean = process.env.CLEAN === '0';
+            const marker = '<!-- claim-bot:clock -->';
+            const title = 'claim: due & drifted';
+            const label = 'claim';
+            const { owner, repo } = context.repo;
+
+            // Find our one issue by marker across open issues (the label narrows the
+            // search; the marker is the authority).
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            });
+            const existing = open.find((i) => i.body && i.body.includes(marker));
+
+            if (clean) {
+              // Nothing to nag about: close the issue if it is open, otherwise do
+              // nothing. Never open an issue to say "all clear".
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: 'The claim store is clean; closing.',
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body, state: 'open',
+              });
+            } else {
+              // Ensure the label exists before applying it (createIssue with a missing
+              // label 422s otherwise).
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+              } catch {
+                await github.rest.issues.createLabel({
+                  owner, repo, name: label, color: 'b60205',
+                  description: 'Tracks the claim clock lane’s due & drifted queue.',
+                });
+              }
+              await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+            }
+        env:
+          BODY_FILE: ${{ steps.render.outputs.body_file }}
+          CLEAN: ${{ steps.render.outputs.clean }}

@@ -1,0 +1,128 @@
+# The on-change lane, as a reusable workflow.
+#
+# A consumer repo calls this from its own `pull_request` workflow (see
+# examples/consumer/). On every PR it runs every claim check against the PR's tree
+# and, if anything drifted, broke, or lost a support, posts ONE grouped, advisory
+# comment routing each finding to the file's CODEOWNERS owner. It NEVER fails the
+# build on a finding — invariant #6: drift routes, it does not block the changer.
+#
+# The checks run under `claim check --report-only`, which writes nothing and needs no
+# git identity, so this is safe on fork PRs with no write token (PRODUCT.md section 3:
+# a fork PR's CI reports in its output only; trusted runs persist). The comment step
+# is gated on the PR not coming from a fork, so a fork PR still gets its checks and
+# its advisory job summary without ever handling a write token.
+#
+# Because a reusable workflow's `uses: ./…` and script files resolve against the
+# *caller's* checkout, this workflow explicitly checks out the claim tool repo into a
+# side directory (`_claim_tool/`) to get the binary source and the renderer, and
+# checks out the consumer's code into the workspace root.
+
+name: claim on-change
+
+on:
+  workflow_call:
+    inputs:
+      claim-repo:
+        description: The owner/name of the claim tool repository to build from.
+        type: string
+        default: your-org/claim
+      claim-ref:
+        description: The git ref of the claim tool repo to build the binary from.
+        type: string
+        default: main
+      codeowners:
+        description: Path to the CODEOWNERS file used to route findings to owners.
+        type: string
+        default: .github/CODEOWNERS
+      working-directory:
+        description: The directory containing the .claims/ store to check.
+        type: string
+        default: .
+
+# Least privilege: read the code, write PR comments. No `contents: write` — the
+# on-change lane never persists a verdict, so it never needs to push. On a fork PR
+# GitHub downgrades `pull-requests` to read automatically; the comment step is gated
+# off for forks so it no-ops rather than failing.
+permissions:
+  contents: read
+  pull-requests: write
+
+# One in-flight run per PR; a new push cancels the previous so the comment reflects
+# the latest tree, never a stale earlier one.
+concurrency:
+  group: claim-on-change-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PR tree
+        uses: actions/checkout@v4
+
+      - name: Check out the claim tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.claim-repo }}
+          ref: ${{ inputs.claim-ref }}
+          path: _claim_tool
+
+      - name: Install the claim binary
+        uses: ./_claim_tool/.github/actions/install-claim
+        with:
+          source-path: _claim_tool/crates/claim
+
+      # Run every check, persist nothing. `|| true` keeps the job green regardless of
+      # the exit code: the finding is advisory and must never fail the PR.
+      - name: Run claims (report-only)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          claim --json check --all --report-only > "$RUNNER_TEMP/report.json" || true
+
+      # Build the comment body from the report. The renderer's stdout is the markdown;
+      # its exit code (0 clean / 1 dirty) is not used to gate anything here. The
+      # CODEOWNERS path is resolved against the workspace root (where CODEOWNERS lives),
+      # while `--root .` (the store dir) is where the claim files' relative paths point.
+      - name: Render the comment body
+        id: render
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          body_file="$RUNNER_TEMP/comment.md"
+          node "$GITHUB_WORKSPACE/_claim_tool/ci/render.mjs" \
+            --mode comment \
+            --codeowners "$GITHUB_WORKSPACE/${{ inputs.codeowners }}" \
+            --root . \
+            --report "$RUNNER_TEMP/report.json" > "$body_file" || true
+          echo "body_file=$body_file" >> "$GITHUB_OUTPUT"
+
+      # The job summary is the surface a fork PR (which cannot comment) still sees.
+      - name: Publish job summary
+        run: cat "${{ steps.render.outputs.body_file }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Find-or-create the single comment, keyed by the hidden marker in the body.
+      # Skipped for fork PRs (whose token is read-only): the checks still ran and the
+      # summary is still published, so nothing is lost and no write token is exposed.
+      # `continue-on-error` guarantees the advisory invariant even against a transient
+      # API failure: a comment that fails to post must not fail the PR.
+      - name: Upsert the advisory PR comment
+        if: ${{ github.event.pull_request.number && github.event.pull_request.head.repo.fork == false }}
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.BODY_FILE, 'utf8');
+            const marker = '<!-- claim-bot:on-change -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+        env:
+          BODY_FILE: ${{ steps.render.outputs.body_file }}

@@ -1,0 +1,30 @@
+# Build and install the `claim` binary from source, and put it on PATH.
+#
+# Factored out so both CI lanes install the tool identically. Builds with `cargo
+# install --path`, which produces a release binary in `~/.cargo/bin` (already on PATH
+# on GitHub runners). The Rust toolchain ships preinstalled on `ubuntu-latest`; the
+# cache keeps rebuilds cheap across runs.
+#
+# Pinned to building from source (rather than downloading a release) because the tool
+# has no published release channel yet; when one exists, this action gains a fast path
+# that downloads the pinned binary and skips the build.
+
+name: Install claim
+description: Build the claim binary from source and add it to PATH.
+
+inputs:
+  source-path:
+    description: Path to the claim CLI crate to build (the directory with its Cargo.toml).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Cache the cargo build
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.source-path }}
+
+    - name: Build and install
+      shell: bash
+      run: cargo install --path "${{ inputs.source-path }}" --locked

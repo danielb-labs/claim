@@ -1,0 +1,29 @@
+# Drop-in clock lane for a repo that has a .claims/ store.
+#
+# Copy this into your repo's `.github/workflows/`. It calls the claim tool's reusable
+# clock workflow on a schedule: it runs the due claims, records their verdicts back to
+# the store, and maintains one standing "claim: due & drifted" issue — created when
+# there is a queue, updated as it changes, closed when the store is clean. This issue
+# is your nag: it turns computed staleness into something a human sees.
+
+name: claims (clock)
+
+on:
+  schedule:
+    # 07:00 UTC daily. Pick a time; the checks are cheap.
+    - cron: "0 7 * * *"
+  # Allow a manual run from the Actions tab for a first check or a spot audit.
+  workflow_dispatch:
+
+jobs:
+  claims:
+    uses: your-org/claim/.github/workflows/claim-clock.yml@v1
+    with:
+      claim-repo: your-org/claim
+      claim-ref: v1
+      codeowners: .github/CODEOWNERS
+      # Set to false to nag via the issue without committing verdicts from CI.
+      persist: true
+    permissions:
+      contents: write
+      issues: write

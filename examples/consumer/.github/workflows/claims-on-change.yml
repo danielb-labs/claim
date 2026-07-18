@@ -1,0 +1,25 @@
+# Drop-in on-change lane for a repo that has a .claims/ store.
+#
+# Copy this into your repo's `.github/workflows/`. It calls the claim tool's reusable
+# on-change workflow on every pull request: it runs your claims' checks and, on drift,
+# posts one advisory comment routing each finding to the file's CODEOWNERS owner. It
+# never fails the build — drift routes, it does not block your merge.
+
+name: claims (on change)
+
+on:
+  pull_request:
+
+jobs:
+  claims:
+    # Point this at wherever the claim tool lives, at a pinned ref.
+    uses: your-org/claim/.github/workflows/claim-on-change.yml@v1
+    with:
+      claim-repo: your-org/claim
+      claim-ref: v1
+      codeowners: .github/CODEOWNERS
+    # The reusable workflow declares its own least-privilege permissions
+    # (contents: read, pull-requests: write); inherit the caller's token.
+    permissions:
+      contents: read
+      pull-requests: write
