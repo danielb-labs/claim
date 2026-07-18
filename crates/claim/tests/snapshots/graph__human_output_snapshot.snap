@@ -2,11 +2,10 @@
 source: crates/claim/tests/graph.rs
 expression: "String::from_utf8(out).unwrap()"
 ---
-DECISION.md#x
-  └─ a
-DECISION.md#y
-  └─ b
+a
+  ├─ DECISION.md#x
+  └─ b [claim]
 b
-  └─ a
+  └─ DECISION.md#y
 
-Not connected (1): c
+1 claim(s) support nothing: c

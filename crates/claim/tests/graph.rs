@@ -1,9 +1,10 @@
 //! Integration tests for `claim graph`: the `supports` graph, ASCII and JSON.
 //!
 //! The graph is a pure read over `supports` — no checks run, nothing is resolved — so
-//! the tests seed a store with known edges and assert the grouping, node classification,
-//! and the isolated-claim footer. Output is deterministic (sorted), so it also carries
-//! an insta snapshot.
+//! the tests seed a store with known edges and assert the grouping, the `[claim]`
+//! tagging of claim-to-claim edges, node classification, and the support-nothing
+//! footer. The default view groups by claim; `--backers` flips to grouping by target.
+//! Output is deterministic (sorted), so it also carries an insta snapshot.
 
 mod common;
 
@@ -38,16 +39,64 @@ fn seeded() -> TestRepo {
 }
 
 #[test]
-fn human_groups_backers_under_each_target() {
+fn human_groups_targets_under_each_claim() {
     let repo = seeded();
     repo.claim()
         .arg("graph")
         .assert()
         .code(0)
+        // `a` heads its group and lists the targets it supports, sorted.
+        .stdout(predicate::str::contains(
+            "a\n  ├─ DECISION.md#x\n  └─ b [claim]",
+        ))
+        .stdout(predicate::str::contains("b\n  └─ DECISION.md#y"))
+        // `c` supports nothing, so it heads no group; it lands in the footer instead.
+        .stdout(predicate::str::contains("1 claim(s) support nothing: c"));
+}
+
+#[test]
+fn claim_targets_are_tagged_and_decision_targets_are_not() {
+    let repo = seeded();
+    let out = repo
+        .claim()
+        .arg("graph")
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    // `b` is a known claim id, so the edge `a -> b` carries the `[claim]` tag.
+    assert!(
+        text.contains("└─ b [claim]"),
+        "a claim-to-claim edge is tagged: {text}"
+    );
+    // A decision ref is not a claim, so its child line carries no tag.
+    assert!(
+        text.contains("├─ DECISION.md#x\n"),
+        "a decision target is plain: {text}"
+    );
+    assert!(
+        !text.contains("DECISION.md#x [claim]"),
+        "a decision target is never tagged as a claim: {text}"
+    );
+}
+
+#[test]
+fn backers_flag_groups_claims_under_each_target() {
+    let repo = seeded();
+    repo.claim()
+        .args(["graph", "--backers"])
+        .assert()
+        .code(0)
+        // The inverse view: each target, then the claims backing it.
         .stdout(predicate::str::contains("DECISION.md#x\n  └─ a"))
-        // `a` supports claim `b` — a claim-to-claim edge groups under `b`.
-        .stdout(predicate::str::contains("b\n  └─ a"))
-        .stdout(predicate::str::contains("Not connected (1): c"));
+        .stdout(predicate::str::contains("DECISION.md#y\n  └─ b"))
+        // A target that is itself a claim keeps the `[claim]` tag on its header line.
+        .stdout(predicate::str::contains("b [claim]\n  └─ a"))
+        // The support-nothing footer belongs to the by-claim view; the backers view
+        // does not carry it, since a non-backer is not a target.
+        .stdout(predicate::str::contains("support nothing").not());
 }
 
 #[test]
@@ -86,6 +135,30 @@ fn json_shape_classifies_nodes_and_lists_edges() {
 }
 
 #[test]
+fn json_is_the_same_regardless_of_backers() {
+    // `--backers` only regroups the human view; the machine node/edge list is
+    // direction-agnostic, so the two must serialize identically.
+    let repo = seeded();
+    let plain = repo
+        .claim()
+        .args(["--json", "graph"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let flipped = repo
+        .claim()
+        .args(["--json", "graph", "--backers"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(plain, flipped);
+}
+
+#[test]
 fn a_store_with_no_supports_edges_says_so() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
@@ -94,7 +167,12 @@ fn a_store_with_no_supports_edges_says_so() {
         .arg("graph")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("No supports edges"));
+        // No claim declares a `supports`, so there is no group to head — but the lone
+        // claim is still surfaced as supporting nothing, never silently dropped.
+        .stdout(predicate::str::contains("No supports edges"))
+        .stdout(predicate::str::contains(
+            "1 claim(s) support nothing: lonely",
+        ));
 }
 
 #[test]
@@ -168,13 +246,28 @@ fn duplicate_supports_collapse_to_one_edge() {
         a_to_b, 1,
         "a duplicated supports target is one edge, not two"
     );
+
+    // The by-claim human view collapses the duplicate too: `b` appears once under `a`.
+    let human = repo
+        .claim()
+        .arg("graph")
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(human).unwrap().matches("─ b").count(),
+        1,
+        "the duplicated target renders once, not twice"
+    );
 }
 
 #[test]
-fn a_self_loop_renders_and_stays_connected() {
+fn a_self_loop_renders_and_heads_a_group() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    // `a` supports itself; `z` supports nothing and is supported by nothing.
+    // `a` supports itself; `z` supports nothing.
     repo.write_claim("a", &claim_with_supports("a", &["a"]));
     repo.write_claim("z", &claim_with_supports("z", &[]));
 
@@ -182,7 +275,8 @@ fn a_self_loop_renders_and_stays_connected() {
         .arg("graph")
         .assert()
         .code(0)
-        // The self-edge renders, and `a` is connected — only `z` is isolated.
-        .stdout(predicate::str::contains("a\n  └─ a"))
-        .stdout(predicate::str::contains("Not connected (1): z"));
+        // The self-edge renders under `a`, tagged as a claim-to-claim edge; only `z`
+        // supports nothing.
+        .stdout(predicate::str::contains("a\n  └─ a [claim]"))
+        .stdout(predicate::str::contains("1 claim(s) support nothing: z"));
 }
