@@ -7,6 +7,15 @@ for facts.**
 
 ---
 
+> **Proposal-era draft, not the shipped schema.** This is the "why" document; its
+> argument stands, but some illustrations predate the build. The example frontmatter
+> below uses `recheck:` and a top-level `max-age` — the shipped claim file has
+> neither: `max-age` lives under an optional `hub:` subfield, and there is no
+> `recheck`/`when` field. §6 rule 2's "every check seen failing once" became optional
+> (`--witness-cmd`; a passing check against reality is the birth gate). The §8 v0.1
+> list names a `log` verb the CLI does not ship. See `PRODUCT.md` and
+> `CLI-HUB-BOUNDARY.md` for the shipped model.
+
 ## 1. The problem
 
 Every codebase has places where someone wrote down a reason for a decision:
@@ -346,10 +355,10 @@ imports X") can only change when a commit lands, so they run on merges,
 filtered by watched paths. World facts ("the vendor's rate limit is 100
 rps") don't care about your merges, so running them per-merge is pointless;
 they run on a schedule, batched. The tool ships one command,
-`claim check --due`, which is cheap to call and runs only what's due. Where
-you call it from (CI step, cron, an agent's session start) is your business.
-The tool has no scheduler, the same way git has no opinion about when you
-fetch.
+`claim check`, cheap to call. Which claims run, and when, is the caller's
+business — the hub knows what's due, the stateless CLI does not. Where you
+call it from (CI step, cron, an agent's session start) is up to you. The tool
+has no scheduler, the same way git has no opinion about when you fetch.
 
 ## 8. What to build first
 

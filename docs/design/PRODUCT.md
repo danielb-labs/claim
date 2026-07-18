@@ -221,7 +221,7 @@ a **per-check verdict** — what a check found this run:
 | held | The check exited 0: the fact is still true. |
 | drifted | The check exited 1: the fact is no longer true. |
 | broken | The check could not run (any other exit, spawn failure, signal, timeout): it tells us nothing, and never a pass. |
-| unverifiable | An agent check ran but the evidence was inconclusive; or an agent check with no runner wired. Counts against freshness, but is not a tooling failure. |
+| unverifiable | An agent check ran but the evidence was inconclusive; an agent check with no runner wired; or a `human` check (never auto-verifiable in v1). Counts against freshness, but is not a tooling failure. |
 
 The CLI stops there — it reports these *now* and stores nothing. A claim's
 **standing** over time — verified, stale, suspect, retired — is the hub's
@@ -389,7 +389,8 @@ fact whose red can't be staged is verified by its passing check, never marked
 unverified for it. Running every check on every PR is cheap for a corpus of
 greps and closes the "invalidating change landed in a file nobody watched"
 hole by construction; when a store's checks get too slow for run-everything, a
-CI step selects a subset and the hub's scheduler runs the rest.
+CI step will select a subset — once the CLI gains check selection (issue #19) —
+and the hub's scheduler runs the rest.
 
 ### The MCP server
 
