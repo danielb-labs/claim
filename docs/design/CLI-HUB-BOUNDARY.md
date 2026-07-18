@@ -133,7 +133,7 @@ The other invariants reframe, not break:
   by claim id and `claim check --path <prefix>` by repo path — so a CI step can run a
   cheap subset on PRs and the rest on a clock, now that `when` no longer partitions them
   (issue #19). Positional ids are the union with `--path`; an unknown id is a usage error
-  (exit 2), an empty `--path` is not (it reports "no claims matched"). `--kind` was
+  (exit 2), an empty `--path` is not (it reports "no claims match"). `--kind` was
   **dropped** in favor of expressing two-speed cadence per-check with `skip.unless`,
   which is already honest — a skipped check is reported and never a false green, and one
   claim can carry both a cheap always-run check and an expensive nightly-only check.

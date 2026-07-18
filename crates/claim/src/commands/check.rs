@@ -11,7 +11,7 @@
 //! the run to their union, so a CI step can verify a cheap subset on a PR and leave
 //! the rest to a scheduled run. A named id must exist (an unknown id is a usage error,
 //! exit 2); a `--path` that matches nothing is not an error, and the report says "no
-//! claims matched" rather than a false "all held" (invariant #6).
+//! claims match" rather than a false "all held" (invariant #6).
 //!
 //! Two honesty properties are load-bearing and tested:
 //!
@@ -124,7 +124,7 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
 /// claim exists," so any id matching no claim is a usage error (exit 2) naming every
 /// unresolved id — a typo must be loud, never a silent no-op. A `--path` matching
 /// zero claims is *not* an error (a path is a filter, not an existence assertion); it
-/// yields an empty selection, which [`report`] renders as "no claims matched."
+/// yields an empty selection, which [`report`] renders as "no claims match."
 fn select<'a>(args: &CheckArgs, claims: &'a [LoadedClaim]) -> Result<Vec<&'a LoadedClaim>> {
     if args.ids.is_empty() && args.path.is_none() {
         return Ok(claims.iter().collect());
@@ -417,7 +417,8 @@ fn human(results: &[ClaimResult], load_errors: &[LoadError], tally: RunTally, ex
     if results.is_empty() && load_errors.is_empty() {
         // Selection matched no claim (an empty `--path`), or the store is empty. Either
         // way nothing was verified — say so plainly, never "all held" (invariant #6).
-        println!("No claims matched.");
+        // Phrased exactly as `claim list`'s empty line, so the two verbs agree.
+        println!("No claims match.");
         return;
     }
 
@@ -656,6 +657,25 @@ mod tests {
         // Nothing selected and nothing skipped still verified nothing: not "all held".
         let nothing = RunTally { ran: 0, skipped: 0 };
         assert!(!exit_meaning(EXIT_OK, nothing).contains("all held"));
+    }
+
+    #[test]
+    fn the_all_skipped_gloss_never_leaks_out_of_the_exit_zero_arm() {
+        // The #17 safety rests on `exit_meaning` branching on `exit` *before* the tally,
+        // so "no checks ran (all skipped)" is reachable only at EXIT_OK. Pin that: a
+        // review or broken finding with zero verdict-bearing checks (every check skipped,
+        // plus an unresolved support or a broken sibling driving the exit) must report
+        // its finding, never mask it behind "all skipped". A future match-reorder that
+        // moved the tally check outward would fail here.
+        let none_ran = RunTally { ran: 0, skipped: 2 };
+        assert_eq!(
+            exit_meaning(EXIT_REVIEW, none_ran),
+            "review needed (drift, unverifiable, or unresolved support)"
+        );
+        assert_eq!(
+            exit_meaning(EXIT_BROKEN, none_ran),
+            "a broken check or an unloadable claim file"
+        );
     }
 
     /// A `LoadedClaim` with the given id and no supports, for exercising `select`

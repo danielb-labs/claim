@@ -83,19 +83,32 @@ a fast, focused verification instead of the whole store:
     # The files this PR changed, against the base branch.
     git fetch origin "$GITHUB_BASE_REF" --depth=1
     changed=$(git diff --name-only "origin/$GITHUB_BASE_REF"...HEAD)
-    # Run claim check once per changed top-level path prefix. A --path that matches
-    # no claim is not an error (exit 0, "no claims matched"), so an unrelated change
-    # simply verifies nothing rather than failing.
+    # Run claim check once per changed top-level path prefix, aggregating the exit
+    # codes so no iteration's finding is lost. A `run:` block is not `set -e` by
+    # default, so a naive loop's step code would be only the LAST iteration's — a
+    # drift (1) or broken check (2) in an earlier prefix would be silently swallowed,
+    # the exact stale-green this tool exists to prevent. `rc` keeps the worst code and
+    # the step exits on it. A --path that matches no claim is not an error (exit 0,
+    # "no claims match"), so an unrelated change simply verifies nothing.
+    rc=0
     for dir in $(echo "$changed" | xargs -n1 dirname | sort -u); do
-      claim check --json --path "$dir"
+      claim check --json --path "$dir" || rc=$?
     done
+    exit $rc
 ```
 
 `--path` matches a claim whose file *or* whose `supports` decision ref lies under the
 prefix — the same match `claim list --path` uses — so "the claims about `src/auth/`"
 means the same thing whether you are listing or checking them. A prefix that matches no
-claim exits `0` and reports "no claims matched," never a false "all held," so a PR that
+claim exits `0` and reports "no claims match," never a false "all held," so a PR that
 touches paths no claim covers is cleanly empty, not a failure.
+
+One caveat on the prefixes: `dirname` of a top-level changed file (e.g. `README.md`) is
+`.`, and `claim check --path .` is the empty prefix, which matches the *whole store* — so
+a change touching a root-level file re-runs every claim. That is a safe over-run (it
+verifies more, never less), and the exit aggregation above keeps it honest — a broader
+run's worst code still propagates; drop the `.` entry if you would rather a root change
+stay a narrow subset.
 
 The scheduled lane drops `--path` and runs `claim check --json` over the whole store, so
 nothing a PR skipped goes unverified over time.

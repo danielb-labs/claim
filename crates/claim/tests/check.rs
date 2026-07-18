@@ -436,7 +436,7 @@ fn check_with_no_claims_reports_the_full_phrase() {
         .arg("check")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("No claims matched."))
+        .stdout(predicate::str::contains("No claims match."))
         .stdout(predicate::str::contains("all held").not());
 }
 
@@ -819,16 +819,16 @@ fn ids_and_path_together_select_the_union() {
 }
 
 #[test]
-fn a_path_matching_zero_claims_is_exit_zero_and_says_no_claims_matched() {
+fn a_path_matching_zero_claims_is_exit_zero_and_says_no_claims_match() {
     // A path glob may legitimately be empty: exit 0, and the report says plainly that
-    // no claims matched — critically NOT "all held", which over zero checks would be a
+    // no claims match — critically NOT "all held", which over zero checks would be a
     // false green (invariant #6).
     let repo = selectable_store();
     repo.claim()
         .args(["check", "--path", "nowhere/"])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("No claims matched."))
+        .stdout(predicate::str::contains("No claims match."))
         .stdout(predicate::str::contains("all held").not());
 }
 
@@ -941,4 +941,41 @@ fn run_level_counts_are_present_and_honest_in_json() {
     assert_eq!(v["checked"], 2, "two claims were evaluated");
     assert_eq!(v["ran"], 1, "one check produced a verdict");
     assert_eq!(v["skipped"], 1, "one check was skipped");
+}
+
+#[test]
+fn a_review_finding_with_a_skipped_check_reads_as_review_not_all_skipped() {
+    // The end-to-end regression guard for #17's ordering: one claim with a real held
+    // check, a skipped check, and an unresolved `supports` target. The unresolved
+    // support drives exit 1, so the summary must say "review needed" — never "all
+    // skipped", which would mask the review finding behind the deferral. The multi-check
+    // shape also locks the counter distinction: `checked` counts claims (1), `ran` and
+    // `skipped` count checks (1 each).
+    let repo = ready_repo();
+    repo.write_claim(
+        "mixed",
+        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n  - kind: cmd\n    run: \"false\"\n    skip:\n      reason: no runner here\nsupports:\n  - deleted-decision.md#anchor\n---\nOne check held, one skipped, and a vanished support.\n",
+    );
+
+    let out = repo
+        .claim()
+        .args(["--json", "check"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["checked"], 1, "one claim was evaluated");
+    assert_eq!(v["ran"], 1, "the held check produced a verdict");
+    assert_eq!(v["skipped"], 1, "the skipped check produced no verdict");
+
+    // The human summary reports the review finding, not the skip.
+    repo.claim()
+        .arg("check")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("review needed"))
+        .stdout(predicate::str::contains("all skipped").not())
+        .stdout(predicate::str::contains("all held").not());
 }
