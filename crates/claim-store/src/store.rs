@@ -4,8 +4,8 @@
 //! There is no committed verdict log: a verdict is telemetry the hub stores, not
 //! source (see `docs/design/CLI-HUB-BOUNDARY.md`), so the store holds only the
 //! claims themselves. This module owns the questions every consumer — the CLI's
-//! read/verify verbs and the MCP server — shares, so they are answered in exactly
-//! one place and the two binaries cannot drift apart:
+//! read/verify verbs — shares, so they are answered in exactly one place, ready to
+//! back another consumer unchanged:
 //!
 //! - **Where is the store?** [`discover`] walks up from a starting directory to
 //!   the nearest ancestor containing a `.claims/`, the same way git finds `.git/`.
@@ -94,8 +94,8 @@ impl Store {
     /// Parse every claim in the store: `.claims/**/*.md`.
     ///
     /// The one place every consumer agrees on what "the store's claims" are, so
-    /// the CLI's `check`, `list`, and `drift` and the MCP server's `query` cannot
-    /// disagree about which files count. Returns them sorted by id for a stable,
+    /// the CLI's `check`, `list`, and `drift` cannot disagree about which files
+    /// count. Returns them sorted by id for a stable,
     /// deterministic order (a directory listing is order-unspecified across
     /// platforms), so a JSON array or a human table reads the same on every run.
     ///
@@ -239,8 +239,7 @@ pub fn discover(start: &Path) -> Result<Store, StoreError> {
 /// loudly (and exit non-zero, or surface them as error entries), yet still act on
 /// the good ones. A store is never silenced by a single bad file. The CLI treats a
 /// non-empty `errors` as an exit-2 condition — loud — while listing/checking
-/// `claims` as usual — useful; the MCP server surfaces the errors alongside the
-/// good matches.
+/// `claims` as usual — useful.
 #[derive(Debug, Clone)]
 pub struct StoreLoad {
     /// The well-formed, unique claims, sorted by id.

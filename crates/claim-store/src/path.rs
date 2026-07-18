@@ -1,11 +1,10 @@
 //! Path-prefix matching for "claims about these paths" queries.
 //!
-//! Both front doors answer the same question — which claims are *about* a given
-//! repo path — and must answer it identically, so the rule lives here once rather
-//! than copied into `claim list` and the MCP `query` tool (the duplication this
-//! crate exists to end). v1 does not trace a check's read-set, so the paths a
-//! claim is about are approximated by its file location plus its `supports`
-//! targets; this is the same best-effort match both consumers use.
+//! "Which claims are *about* a given repo path?" is one rule, so it lives here once
+//! rather than inline in `claim list`, ready to back another consumer unchanged. v1
+//! does not trace a check's read-set, so the paths a claim is about are approximated
+//! by its file location plus its `supports` targets; this is the best-effort match
+//! `claim list` uses.
 
 use claim_core::SupportTarget;
 

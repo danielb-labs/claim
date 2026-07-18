@@ -40,8 +40,8 @@ fi
 
 # This repo dogfoods `claim`: its own load-bearing decisions are recorded as claims
 # in `.claims/`, and the gate runs them so they gate the development that could break
-# them. In particular the docs-coverage claim drifts when a CLI verb or MCP tool ships
-# without a mention in docs/index.html, so this step is what makes that backstop
+# them. In particular the docs-coverage claim drifts when a CLI verb ships without a
+# mention in docs/index.html, so this step is what makes that backstop
 # actually fire on every branch and in CI, not only when someone runs `claim check`
 # by hand. `claim check` reports and sets the exit code but stores nothing (a verdict
 # is telemetry a hub ingests, not source), so the gate never dirties the tree. A

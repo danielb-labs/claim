@@ -8,8 +8,8 @@ reconciled to the **v2 CLI/hub boundary** — see
 now describes.
 
 Decisions locked in before writing: the unit of knowledge is called a
-**claim**. The open format, CLI, and MCP server work standalone forever, with
-a central service on top (the git/GitHub model). Version 1 covers
+**claim**. The open format and CLI work standalone forever, with a central
+service on top (the git/GitHub model). Version 1 covers
 **engineering knowledge** — repos, builds, dependencies, agent context,
 engineering decisions — with company-wide sources added later as opt-in
 connectors. Claims are connected in a **typed knowledge graph**.
@@ -54,7 +54,7 @@ that belief rests on, and what has stopped being true.
 
 ## 2. The shape of the system
 
-![System architecture: the CLI, MCP server, and CI read the claim files and run checks; the hub is a derived layer that ingests the CLI's reported verdicts and, for claims, writes only through commits and PRs](diagrams/architecture.png)
+![System architecture: the CLI and CI read the claim files and run checks; the hub is a derived layer that ingests the CLI's reported verdicts and, for claims, writes only through commits and PRs](diagrams/architecture.png)
 
 Three layers. Each one works without the ones after it.
 
@@ -392,38 +392,24 @@ hole by construction; when a store's checks get too slow for run-everything, a
 CI step will select a subset — once the CLI gains check selection (issue #19) —
 and the hub's scheduler runs the rest.
 
-### The MCP server
+### How agents touch the system
 
-How agents touch the system, a thin shell over the same core the CLI uses. It
-exposes two tools:
+Through the same CLI people use. An in-repo agent already has a checkout, so it
+reads the store with `claim list --json` at session start — "what does the org
+believe about the area I'm touching?" — and re-verifies with `claim check
+--json`, inheriting the store's premises as evidence to weigh and re-check rather
+than instructions to obey (a claims store that agents obey blindly is an
+injection channel with a trust stamp). It authors a claim it just established with
+`claim add`, held to the same birth gate as a human's, and opens a PR like anyone
+else. An agent that finds a fact drifted surfaces it by re-running `claim check`,
+whose `--json` the hub ingests; it records no verdict itself, because a verdict is
+telemetry, never written back to the store.
 
-- **query** — "what does the org believe about the area I'm touching?"
-  Run at session start; returns the recorded claims for the paths or text at
-  hand — the statement, what each supports, and the file. It is a read of the
-  *source*, not a stored-freshness read, so it carries no status or
-  last-verified date: those are the hub's, derived from the verdict stream.
-  Results are presented as evidence to weigh and re-check, never as
-  instructions to obey — a claims store that agents obey blindly is an
-  injection channel with a trust stamp. Read-only; it never writes.
-- **create** — write a *new* claim the agent just established: a statement plus
-  the check that re-verifies it, under the agent's own git identity. This is the
-  MCP counterpart of `claim add`, held to the same birth gate — the check runs
-  against the current tree and the file is written *only* if it held; a drifted
-  or broken/unverifiable check is refused with the evidence, and nothing is
-  written. It commits no verdict (a verdict is telemetry, not source) and does
-  not commit the file, so the new claim is unreviewed until the caller commits
-  it.
-
-There is **no `report` tool**: an agent records no verdict, because a verdict is
-telemetry the hub ingests, never written back to the store. An agent that finds
-a fact drifted surfaces it by re-running `claim check`, whose `--json` the hub
-consumes. (Earlier drafts also cut `propose` — an in-repo agent already has a
-checkout and opens a PR like anyone else — and `flag`, which was `report` with a
-negative verdict.)
-
-The MCP server is also where session-start context comes from: instead of
-a hand-maintained CLAUDE.md paragraph, an agent can pull the current claims for
-the paths it's about to work on, then re-verify them with `claim check`.
+There is no local MCP server: it would only duplicate the CLI over the same local
+store an in-repo agent can already read. The MCP surface worth building is a
+*hub* MCP — an agent reaching the hub's derived status, schedule, and drift stream
+over the network, which the stateless CLI does not hold — and that is deferred
+(issue #32), not part of the single-team product below.
 
 ### CI integration (the per-change run)
 
@@ -578,11 +564,9 @@ quarters. Value lands the first time a CLAUDE.md sentence goes red.
    drift, each fact shown with its supports target, CODEOWNERS mentioned.
 5. **The scheduled run** — a scheduled Action running `claim check --json` and
    maintaining the one standing "claims due & drifted" issue; the hub owns the
-   schedule of what is due.
-6. **The MCP server** — `query` and `create`. This plus the CLI is the
-   complete single-team product. There is no `report` tool: an agent records no
-   verdict.
-7. **Pilot instrumentation** — drifts caught, false alarms, minutes per
+   schedule of what is due. The CLI plus these CI recipes and the hub glue is the
+   complete single-team product; agents use the same CLI (no local MCP server).
+6. **Pilot instrumentation** — drifts caught, false alarms, minutes per
    claim, a hub view derived from the verdict stream (not a CLI verb).
    Thresholds decided in advance: a false-alarm rate above one in three fired
    drifts, or authoring cost well over five minutes a claim, kills or reshapes

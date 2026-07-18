@@ -5,8 +5,7 @@
 //! [`claim_store::render_claim`], then hands that exact text to
 //! [`claim_core::parse_claim_file`] to validate it before writing — so the file the
 //! tool commits is proven to parse, not merely assembled and hoped-correct. The
-//! renderer lives in `claim-store`, shared with the MCP `create` tool, so both front
-//! doors emit byte-identical files and the frontmatter's injection-hardening lives in
+//! renderer lives in `claim-store`, so the frontmatter's injection-hardening lives in
 //! exactly one place. This module keeps only the CLI's own gather structures and the
 //! draft→render→validate glue.
 

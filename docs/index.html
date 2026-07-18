@@ -122,7 +122,6 @@
       <a href="#lifecycle">Lifecycle</a>
       <a href="#architecture">Architecture</a>
       <a href="#ci">CI &amp; the hub</a>
-      <a href="#mcp">The MCP server</a>
       <div class="group">Reference</div>
       <a href="#cli">CLI reference</a>
       <a href="#docs">More docs</a>
@@ -491,7 +490,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     ingests the reported <code>--json</code> and owns the verdict stream, the schedule, and the nag.</p>
     <figure>
       <img src="assets/architecture.png" alt="System architecture diagram">
-      <figcaption>The CLI and the MCP server read the claim files and run checks; a hub ingests the
+      <figcaption>The CLI reads the claim files and runs checks; a hub ingests the
       CLI&rsquo;s reported verdicts and derives status, staleness, and drift routing &mdash; it never
       becomes the source of truth, which stays the git-committed claim.</figcaption>
     </figure>
@@ -527,38 +526,6 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
       duplicate-id claim file, or a tool error. A broken check is the loudest condition, never the
       quietest.</p>
     </div>
-  </section>
-
-  <section id="mcp">
-    <h2>The MCP server</h2>
-    <p>The <code>claim-mcp</code> server is how agents touch the store over the Model Context Protocol. It
-    is a thin shell over the same core the CLI uses, discovering the store from the working directory per
-    call, and exposes two tools:</p>
-    <ul>
-      <li><strong>query</strong> &mdash; return the claims recorded for the paths or text at hand, as
-      <em>evidence to weigh</em>: the statement, what each supports, and the file. Run it at the start of
-      work to inherit what the store already believes, then re-verify with <code>claim check</code> &mdash;
-      the query is a read of the source, not a stored-freshness read, so it carries no status,
-      last-verified, or stale-at (those are the hub&rsquo;s, derived from the verdict stream). Results are
-      framed as observations to weigh and re-check, never as instructions to obey &mdash; a claims store
-      agents obeyed blindly would be an injection channel with a trust stamp. Read-only; it never writes.</li>
-      <li><strong>create</strong> &mdash; write a <em>new</em> claim the agent just established: a statement
-      plus the check that re-verifies it, verified against reality now, under the agent&rsquo;s own git
-      identity. This is the MCP counterpart of <code>claim add</code>, held to the same birth gate &mdash;
-      the check is run against the current tree and the claim file is written <em>only</em> if it
-      <span class="chip green">held</span>; a <span class="chip red">drifted</span> (the fact is already
-      false) or <span class="chip amber">broken</span>/<span class="chip amber">unverifiable</span> (the
-      check could not run) is refused with the evidence and nothing is written. It writes <em>no</em>
-      verdict &mdash; a verdict is telemetry, not committed source. Its inputs carry no <code>when</code>,
-      and <code>max_age</code> is optional. The server writes the claim file to the working tree with a
-      commit hint and does <em>not</em> commit, so the new claim is unreviewed until the caller commits it
-      (where a human reviews the commit or PR). An <code>instruction</code> (agent) check needs a runner
-      (<a href="#agent"><code>CLAIM_AGENT_CMD</code></a>); with none it is unverifiable and the create is
-      refused.</li>
-    </ul>
-    <p>There is no <code>report</code> tool: an agent records no verdict, because a verdict is telemetry the
-    <a href="#hub">hub</a> ingests, never something written back to the store. An agent that finds a fact
-    drifted surfaces it by re-running <code>claim check</code>, whose <code>--json</code> the hub consumes.</p>
   </section>
 
   <hr>
@@ -677,8 +644,8 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     <h2>FAQ</h2>
     <h3>Is this meant for AI agents or people?</h3>
     <p>Both. People read claims to understand what the team believes and why; agents read them at the
-    start of a session (through the <a href="#mcp">MCP <code>query</code> tool</a> or <code>--json</code>)
-    to inherit premises instead of re-deriving the world, then re-verify them with <code>claim check</code>.
+    start of a session (through <code>claim list --json</code> or <code>claim check --json</code>) to
+    inherit premises instead of re-deriving the world, then re-verify them with <code>claim check</code>.
     The tool is headless by default and never prompts unless a person opts in with
     <code>-i</code>/<code>--interactive</code> on <code>claim add</code>, so an agent never hits a prompt.</p>
     <h3>Is a drifted claim a build failure?</h3>

@@ -1,10 +1,10 @@
 //! Rendering a claim's fields to the on-disk `.claims/*.md` text.
 //!
-//! Both front doors that author a claim — the CLI's `claim add` and the MCP `create`
-//! tool — turn a small set of fields into frontmatter, then round-trip the text
-//! through [`claim_core::parse_claim_file`] to validate it before writing. Keeping the
-//! renderer here, once, means the two cannot drift: a `supports` target or a check
-//! command renders byte-identically whichever door authored it.
+//! The CLI's `claim add` turns a small set of fields into frontmatter, then
+//! round-trips the text through [`claim_core::parse_claim_file`] to validate it before
+//! writing. Keeping the renderer here, once — over in `claim-store` rather than inline
+//! in the CLI — means the `.claims/*.md` shape and its injection-hardening have a
+//! single owner, ready to back another author unchanged.
 //!
 //! This is deliberately *not* a general YAML emitter. It emits exactly the v2 schema,
 //! the minimal set of fields the tool understands, in a stable, predictable shape a

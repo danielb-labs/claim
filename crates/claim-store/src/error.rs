@@ -1,21 +1,19 @@
 //! Errors raised while locating a store or resolving git provenance.
 //!
-//! These are library errors ([`thiserror`]), not binary errors: a store is
-//! shared by the CLI and the MCP server, and each maps a failure to its own
-//! surface — the CLI to a `--json` error object with a stable `kind`, the MCP
-//! server to a protocol error. Raising a typed enum here (rather than an
-//! `anyhow` string) is what lets both recover the *reason* a store could not be
-//! opened, above all "no store found", without matching on English prose.
+//! These are library errors ([`thiserror`]), not binary errors: the CLI maps a
+//! failure to its own surface — a `--json` error object with a stable `kind`.
+//! Raising a typed enum here (rather than an `anyhow` string) is what lets the
+//! caller recover the *reason* a store could not be opened, above all "no store
+//! found", without matching on English prose.
 
 use std::path::PathBuf;
 
 /// A failure to locate or read a claim store.
 ///
-/// The variant a consumer branches on most is [`StoreError::NoStore`]: both
-/// binaries turn it into a distinct, machine-readable signal (the CLI's
-/// `no-store` `kind`, the MCP server's own not-found error) so an agent knows to
-/// suggest `claim init` rather than retrying. Every other failure is an
-/// environment fault the caller reports verbatim.
+/// The variant a consumer branches on most is [`StoreError::NoStore`]: the CLI
+/// turns it into a distinct, machine-readable signal (the `no-store` `kind`) so an
+/// agent knows to suggest `claim init` rather than retrying. Every other failure is
+/// an environment fault the caller reports verbatim.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StoreError {
