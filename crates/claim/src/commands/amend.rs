@@ -58,8 +58,7 @@ use crate::apperror::{app, ErrorKind};
 use crate::claimfile::{render_and_validate, CheckDraft, CheckDraftKind, ClaimDraft};
 use crate::cli::AmendArgs;
 use crate::output::{emit, note, relative_to, trigger_label, Format};
-use claim_store as git;
-use claim_store::{discover, LoadedClaim, Store};
+use claim_store::{discover, git, LoadedClaim, Store};
 
 /// The machine form of `claim amend`.
 #[derive(Debug, Serialize)]

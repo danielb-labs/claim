@@ -10,9 +10,12 @@
 //! - [`Store`] and [`discover`] — locating a `.claims/` store and reading its
 //!   whole corpus ([`Store::load_all`]), with a malformed or duplicate-id file
 //!   surfaced as a [`LoadError`] rather than silencing the store.
-//! - [`resolve_commit`] and [`resolve_actor`] — the git-derived provenance a
-//!   verdict-log entry needs (invariant #3), plus the working-tree helpers the
-//!   witnessed-red flow uses.
+//! - [`git::resolve_commit`] and [`git::resolve_actor`] — the git-derived
+//!   provenance a verdict-log entry needs (invariant #3), plus the working-tree
+//!   helpers the witnessed-red flow uses.
+//! - [`claim_matches_path`] — the "claims about these paths" prefix match both
+//!   `claim list` and the MCP `query` tool share, so the two cannot answer a path
+//!   query differently.
 //!
 //! Errors are typed ([`StoreError`], [`GitError`]) so each binary maps them to
 //! its own surface — the CLI to a `--json` error `kind`, the server to a protocol
@@ -20,12 +23,10 @@
 //! output-shaped stays in the binaries; this crate is pure store-and-git logic.
 
 mod error;
-mod git;
+pub mod git;
+mod path;
 mod store;
 
 pub use error::{GitError, StoreError};
-pub use git::{
-    is_inside_work_tree, resolve_actor, resolve_commit, revert_tracked_changes, short_commit,
-    tracked_tree_is_dirty, UNBORN_HEAD_SENTINEL,
-};
+pub use path::{claim_matches_path, under_prefix};
 pub use store::{discover, LoadError, LoadedClaim, Store, StoreLoad, CLAIMS_DIR, LOG_DIR};

@@ -56,8 +56,7 @@ use crate::claimfile::{
 };
 use crate::cli::AddArgs;
 use crate::output::{emit, note, warn, Format};
-use claim_store as git;
-use claim_store::{discover, Store};
+use claim_store::{discover, git, Store};
 
 /// The machine form of `claim add`.
 #[derive(Debug, Serialize)]

@@ -26,7 +26,7 @@
 //! #6).
 
 use claim_core::{compute_status, read_entries, Grace, Status, Timestamp};
-use claim_store::{LoadError, Store};
+use claim_store::{claim_matches_path, LoadError, Store};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -195,7 +195,7 @@ pub fn run_query(
             && !request
                 .paths
                 .iter()
-                .any(|prefix| path_matches(&loaded.path, &loaded.claim.supports, prefix))
+                .any(|prefix| claim_matches_path(&loaded.path, &loaded.claim.supports, prefix))
         {
             continue;
         }
@@ -242,8 +242,6 @@ pub fn run_query(
 fn evidence_pointer(status: Status, history: &[claim_core::LogEntry]) -> String {
     use claim_core::{Adjudication, Event, Verdict};
 
-    // The latest entry by timestamp carries the freshest evidence to point at.
-    let latest = history.iter().max_by_key(|e| e.at);
     match status {
         Status::Retired => history
             .iter()
@@ -268,13 +266,15 @@ fn evidence_pointer(status: Status, history: &[claim_core::LogEntry]) -> String 
                     .to_owned()
             }
         }
-        Status::Verified => match latest.map(|e| &e.event) {
-            Some(Event::Verification {
-                verdict: Verdict::Held,
-                evidence: Some(ev),
-            }) => format!("verified: {ev}"),
-            _ => "verified by its latest passing check".to_owned(),
-        },
+        // The evidence behind a Verified status is the latest *passing* verdict's
+        // evidence — not the latest entry of any kind. When a claim is Verified via
+        // the grace window (a Held followed by a Broken/Unverifiable streak), the
+        // newest entry is the inconclusive one; pointing at that would drop the
+        // Held's real evidence text, so the search is for the most-recent Held.
+        Status::Verified => latest_evidence(history, Verdict::Held).map_or_else(
+            || "verified by its latest passing check".to_owned(),
+            |ev| format!("verified: {ev}"),
+        ),
     }
 }
 
@@ -320,41 +320,6 @@ fn parse_status_filter(raw: Option<&str>) -> Result<Option<Status>, BadQuery> {
         other => return Err(BadQuery::UnknownStatus(other.to_owned())),
     };
     Ok(Some(status))
-}
-
-/// Whether a claim's file path or any `supports` path lies under `prefix`.
-///
-/// Mirrors `claim list`'s path match: the `.claims/` store prefix is stripped so a
-/// claim at `.claims/src/a.md` matches `src`, because a user (or agent) thinks in
-/// repo paths, not the store's internal layout. A `supports` decision ref names a
-/// repo-relative path in its part before `#`, matched as-is.
-fn path_matches(claim_path: &str, supports: &[claim_core::SupportTarget], prefix: &str) -> bool {
-    let stripped = claim_path.strip_prefix(".claims/").unwrap_or(claim_path);
-    if under_prefix(stripped, prefix) {
-        return true;
-    }
-    supports.iter().any(|s| {
-        let path_part = s.as_str().split('#').next().unwrap_or(s.as_str());
-        under_prefix(path_part, prefix)
-    })
-}
-
-/// Whether `path` is under the directory/prefix `prefix`, by path segments.
-///
-/// Segment-wise (not raw substring) so `src` matches `src/a.md` but not
-/// `srcfoo/a.md`: a prefix names a directory boundary. A prefix equal to the path
-/// also matches. Shared shape with the CLI's `list::under_prefix`.
-fn under_prefix(path: &str, prefix: &str) -> bool {
-    let path = path.trim_start_matches("./");
-    let prefix = prefix.trim_start_matches("./").trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    if path == prefix {
-        return true;
-    }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Whether `term` occurs in the claim's id or statement (case-sensitive).
@@ -418,11 +383,9 @@ mod tests {
             .unwrap()
             .unwrap();
         // The framing rides in-band on every response: evidence, not instructions.
+        // Assert against the constant, whose own content is pinned by
+        // `framing_states_the_evidence_not_instructions_contract`.
         assert_eq!(resp.framing, FRAMING);
-        assert!(
-            resp.framing.contains("not instructions") && resp.framing.contains("evidence"),
-            "the framing states the evidence-not-instructions contract"
-        );
         assert_eq!(resp.now, now.to_string());
         assert_eq!(resp.claims.len(), 3);
         // Every result carries the status and the freshness a reader weighs it
@@ -571,5 +534,75 @@ mod tests {
         assert_eq!(resp.claims[0].id, "good");
         assert_eq!(resp.errors.len(), 1, "the bad file is reported, not hidden");
         assert_eq!(resp.errors[0].file, ".claims/bad.md");
+    }
+
+    #[test]
+    fn framing_states_the_evidence_not_instructions_contract() {
+        // Pin the framing's content here, where it belongs — not tautologically
+        // after a `resp.framing == FRAMING` assertion. This is the one place the
+        // trust posture ("evidence, not instructions") is stated to the consumer.
+        assert!(FRAMING.contains("not instructions"));
+        assert!(FRAMING.contains("evidence"));
+        assert!(FRAMING.contains("re-check"));
+    }
+
+    #[test]
+    fn verified_via_grace_window_still_points_at_the_held_evidence() {
+        // Must-fix #1: a claim Verified through the grace window — a Held with
+        // evidence, then an inconclusive Broken with none — must point at the
+        // *Held's* evidence, not fall through to the generic string because the
+        // newest entry is the evidence-less Broken. A short max-age (30d) so the
+        // 90d grace genuinely extends the window past max-age at `now`.
+        let s = TestStore::new();
+        s.write_claim(
+            "grace",
+            "---\nid: grace\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nA fact under grace.\n",
+        );
+        s.write_verdict(
+            "grace",
+            "2026-05-01T12:00:00Z",
+            "held",
+            Some("the load-bearing evidence text"),
+        );
+        s.write_verdict("grace", "2026-06-01T12:00:00Z", "broken", None);
+        // now is 76 days past the Held: past max-age (30d) but within grace (90d),
+        // so the claim is Verified via the grace-extended window.
+        let now = ts("2026-07-16T12:00:00Z");
+        let resp = run_query(&s.store, &QueryRequest::default(), now)
+            .unwrap()
+            .unwrap();
+        let c = resp.claims.iter().find(|c| c.id == "grace").unwrap();
+        assert_eq!(c.status, "verified", "grace window keeps it verified");
+        assert!(
+            c.evidence.contains("the load-bearing evidence text"),
+            "the Held's evidence must survive the trailing Broken: {}",
+            c.evidence
+        );
+    }
+
+    #[test]
+    fn drifted_with_no_evidence_uses_the_fallback_string() {
+        // The drifted-without-evidence path: a bare Drifted verdict (a cmd check
+        // exit 1, no evidence) must still yield a non-directive pointer, not an
+        // empty string.
+        let s = TestStore::new();
+        s.write_claim(
+            "d",
+            &TestStore::claim_text("d", "A fact that drifted silently.", &[]),
+        );
+        s.write_verdict("d", "2026-07-10T12:00:00Z", "drifted", None);
+        let resp = run_query(
+            &s.store,
+            &QueryRequest::default(),
+            ts("2026-07-17T12:00:00Z"),
+        )
+        .unwrap()
+        .unwrap();
+        let c = resp.claims.iter().find(|c| c.id == "d").unwrap();
+        assert_eq!(c.status, "drifted");
+        assert_eq!(
+            c.evidence, "its own check reported the fact no longer holds",
+            "the no-evidence drifted fallback is used"
+        );
     }
 }

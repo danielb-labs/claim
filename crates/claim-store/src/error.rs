@@ -65,7 +65,7 @@ pub enum StoreError {
 pub enum GitError {
     /// `HEAD` could not be resolved and the repository is not merely unborn — it
     /// is not a git repository, or `HEAD` is corrupt. An unborn HEAD is *not* an
-    /// error: it resolves to [`crate::UNBORN_HEAD_SENTINEL`].
+    /// error: it resolves to [`crate::git::UNBORN_HEAD_SENTINEL`].
     #[error(
         "could not resolve HEAD in {dir} (not a git repository, or HEAD is corrupt); \
          a claim store lives in a git repo — run `git init` or `claim` from inside \

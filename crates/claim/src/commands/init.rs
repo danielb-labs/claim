@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use crate::cli::InitArgs;
 use crate::output::{emit, warn, Format};
-use claim_store::{is_inside_work_tree, Store};
+use claim_store::git::is_inside_work_tree;
+use claim_store::Store;
 
 /// The machine form of `claim init`, stable across runs.
 ///

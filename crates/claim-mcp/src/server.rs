@@ -83,9 +83,10 @@ impl ClaimServer {
     /// truth is a commit the caller makes. Evidence is required; an unknown id is
     /// rejected loudly.
     #[tool(
-        description = "Record a verdict this agent reached about a claim it verified in the course \
-                       of its work, with evidence, under the agent's own git identity. Inputs: id \
-                       (an existing claim), verdict (held | drifted | unverifiable), and evidence \
+        description = "Record a verdict this agent reached about a claim it investigated in the \
+                       course of its work, with evidence, under the agent's own git identity. \
+                       Inputs: id (an existing claim), verdict (held | drifted | unverifiable — \
+                       use unverifiable when you tried but could not determine), and evidence \
                        (required, non-empty). Appends one entry to the claim's verdict log in the \
                        working tree and returns the file to commit — the server does NOT commit; a \
                        write to the truth is a commit you make, so every reported verdict is \
@@ -129,20 +130,31 @@ impl ServerHandler for ClaimServer {
     }
 }
 
-/// Discover the store from the process's working directory, mapping a missing
-/// store to a clear MCP error that names the fix.
-///
-/// A [`StoreError::NoStore`] becomes an invalid-request error pointing at `claim
-/// init`, the same "run init" signal the CLI reports, so an agent knows the
-/// working directory has no store rather than retrying. Any other store fault is
-/// an internal error.
+/// Discover the store from the process's working directory, mapping a failure to
+/// the right MCP error via [`store_error_to_mcp`].
 fn discover_store() -> Result<Store, ErrorData> {
     let cwd = std::env::current_dir()
         .map_err(|e| internal(anyhow::anyhow!("could not read the current directory: {e}")))?;
-    discover(&cwd).map_err(|e| match e {
+    discover(&cwd).map_err(|e| store_error_to_mcp(&e))
+}
+
+/// Map a [`StoreError`] onto the right MCP error.
+///
+/// A [`StoreError::NoStore`] becomes an *invalid-request* error pointing at `claim
+/// init` — the same "run init" signal the CLI reports — so an agent knows the
+/// working directory has no store and acts on it (run init) rather than retrying
+/// or treating it as a server fault. Any other store fault (a `.claims` that is a
+/// file, an unreadable corpus) is an internal error: the environment is broken,
+/// not the request. Keeping this a separate function makes the distinction the
+/// agent branches on directly testable, since `discover_store` itself reads the
+/// process-global working directory.
+fn store_error_to_mcp(e: &StoreError) -> ErrorData {
+    match e {
         StoreError::NoStore { .. } => ErrorData::invalid_request(e.to_string(), None),
-        other => internal(anyhow::Error::new(other)),
-    })
+        // A `.claims` that is a file, an unreadable corpus, or any future variant
+        // is an environment fault, not a request the agent can fix by resending.
+        _ => ErrorData::internal_error(e.to_string(), None),
+    }
 }
 
 /// The ids of every well-formed claim in the store, for `report`'s existence
@@ -246,5 +258,36 @@ mod tests {
             "message: {}",
             data.message
         );
+    }
+
+    #[test]
+    fn a_missing_store_maps_to_invalid_request_not_internal_error() {
+        // The path an agent acts on: NoStore means "run `claim init`", not "retry"
+        // or "the server broke". It must be invalid_request; swapping this arm with
+        // the internal-error arm would send the agent down the wrong branch, so pin
+        // it. Driven through the same `discover` a real no-store directory yields,
+        // then the exact mapping `discover_store` applies.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let err = discover(dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::NoStore { .. }));
+        let mapped = store_error_to_mcp(&err);
+        assert_eq!(mapped.code, ErrorCode::INVALID_REQUEST);
+        assert!(
+            mapped.message.contains("claim init"),
+            "the message names the fix: {}",
+            mapped.message
+        );
+    }
+
+    #[test]
+    fn a_broken_store_maps_to_internal_error() {
+        // A `.claims` that is a file (not a directory) is an environment fault, not
+        // a request the agent can fix by resending — internal error, distinct from
+        // the missing-store case.
+        let e = StoreError::NotADirectory {
+            path: ".claims".into(),
+        };
+        assert_eq!(store_error_to_mcp(&e).code, ErrorCode::INTERNAL_ERROR);
     }
 }

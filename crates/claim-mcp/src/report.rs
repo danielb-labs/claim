@@ -13,9 +13,9 @@
 //!   typo or a stale reference, never a silent no-op. Existence is checked against
 //!   the loaded store, so a malformed sibling cannot mask a real id.
 //! - **The verdict is attributed.** The commit and actor come from git
-//!   ([`claim_store::resolve_commit`]/[`resolve_actor`]) — the agent's own
-//!   identity — never from the request, so a reported verdict is auditable as a
-//!   commit and cannot be forged in the payload (invariant #3).
+//!   ([`resolve_commit`]/[`resolve_actor`]) — the agent's own identity — never
+//!   from the request, so a reported verdict is auditable as a commit and cannot
+//!   be forged in the payload (invariant #3).
 //! - **The server does not commit.** [`run_report`] appends the entry to the
 //!   working-tree verdict log via [`claim_core::append_entry`] and returns its
 //!   path; committing it is the caller's job (invariant #4, a write to the truth
@@ -27,7 +27,8 @@
 //! an agent reports about the world.
 
 use claim_core::{append_entry, ClaimId, Event, LogEntry, Timestamp, Verdict};
-use claim_store::{resolve_actor, resolve_commit, short_commit, Store};
+use claim_store::git::{resolve_actor, resolve_commit, short_commit};
+use claim_store::Store;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -430,5 +431,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.log_count("pin"), 2, "append-only: both verdicts survive");
+        // Both entries carry their own distinct content — verdict, timestamp, and
+        // evidence — so writing one entry twice (or the second clobbering the
+        // first) could not pass. The helper returns them in filename order, which
+        // is chronological.
+        let entries = s.log_entries("pin");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["at"], "2026-07-17T12:00:00Z");
+        assert_eq!(entries[0]["event"]["verdict"], "held");
+        assert_eq!(entries[0]["event"]["evidence"], "first");
+        assert_eq!(entries[1]["at"], "2026-07-18T12:00:00Z");
+        assert_eq!(entries[1]["event"]["verdict"], "drifted");
+        assert_eq!(entries[1]["event"]["evidence"], "second");
     }
 }

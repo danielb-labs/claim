@@ -24,8 +24,7 @@ use serde::Serialize;
 use crate::apperror::{app, ErrorKind};
 use crate::cli::RetireArgs;
 use crate::output::{emit, relative_to, Format};
-use claim_store as git;
-use claim_store::{discover, Store};
+use claim_store::{discover, git, Store};
 
 /// The machine form of `claim retire`.
 #[derive(Debug, Serialize)]

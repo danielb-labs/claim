@@ -13,7 +13,8 @@ use serde::Serialize;
 use crate::apperror::{app, ErrorKind};
 use crate::cli::LogArgs;
 use crate::output::{emit, trigger_label, verdict_label, Format};
-use claim_store::{discover, short_commit};
+use claim_store::discover;
+use claim_store::git::short_commit;
 
 /// Run `claim log`.
 ///

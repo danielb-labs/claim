@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use crate::cli::ListArgs;
 use crate::output::{emit, status_label, Format};
-use claim_store::{discover, LoadError, LoadedClaim};
+use claim_store::{claim_matches_path, discover, LoadError, LoadedClaim};
 
 /// Run `claim list`.
 ///
@@ -100,7 +100,7 @@ fn keep(
     }
 
     if let Some(prefix) = &args.path {
-        if !path_matches(loaded, prefix) {
+        if !claim_matches_path(&loaded.path, &loaded.claim.supports, prefix) {
             return false;
         }
     }
@@ -165,52 +165,6 @@ fn evidence_admits_unwitnessed(entry: &LogEntry) -> bool {
             ..
         } if note.starts_with("unwitnessed:")
     )
-}
-
-/// Whether a claim's file path or any watched path lies under `prefix`.
-///
-/// The claim file's path is matched *inside* the `.claims/` store, not with the
-/// store prefix: a claim at `.claims/src/a.md` matches `--path src`, because the
-/// user thinks in repo paths (`src/…`), not in the store's internal layout. The
-/// `.claims/` prefix is stripped before matching. A `supports` decision ref, by
-/// contrast, already names a repo-relative path (`requirements.txt#libfoo`) and is
-/// matched as-is.
-///
-/// "Watched paths" are best-effort: v1 does not trace a check's read-set, so the
-/// paths a claim is *about* are approximated by its `supports` targets plus the
-/// claim file's own location. This catches the common "claims under src/payments/"
-/// query without read-set tracing, which is deferred.
-fn path_matches(loaded: &LoadedClaim, prefix: &str) -> bool {
-    let claim_path = loaded.path.strip_prefix(".claims/").unwrap_or(&loaded.path);
-    if under_prefix(claim_path, prefix) {
-        return true;
-    }
-    loaded.claim.supports.iter().any(|s| {
-        // A decision ref `path#anchor` names a file in its path part; a bare claim
-        // id has no path meaning, but comparing it as a path is harmless (it will
-        // not match a real prefix a user would type).
-        let path_part = s.as_str().split('#').next().unwrap_or(s.as_str());
-        under_prefix(path_part, prefix)
-    })
-}
-
-/// Whether `path` is under the directory/prefix `prefix`, by path segments.
-///
-/// Segment-wise (not raw substring) so `--path src` matches `src/a.md` but not
-/// `srcfoo/a.md`: a prefix names a directory boundary, and a substring match would
-/// wrongly pull in a sibling whose name merely starts with the same letters. A
-/// prefix that exactly equals the path also matches (a claim can be named directly).
-fn under_prefix(path: &str, prefix: &str) -> bool {
-    let path = path.trim_start_matches("./");
-    let prefix = prefix.trim_start_matches("./").trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    if path == prefix {
-        return true;
-    }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Whether the term occurs in the claim's id or statement (case-sensitive
@@ -397,27 +351,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn under_prefix_matches_on_segment_boundaries() {
-        assert!(under_prefix(".claims/src/a.md", ".claims/src"));
-        assert!(under_prefix("src/a.md", "src"));
-        assert!(under_prefix("src/a.md", "src/"));
-        // A prefix that equals the path matches (a claim named directly).
-        assert!(under_prefix("src/a.md", "src/a.md"));
-        // An empty prefix matches everything.
-        assert!(under_prefix("anything", ""));
-        // A leading ./ on either side is normalized away.
-        assert!(under_prefix("./src/a.md", "src"));
-    }
-
-    #[test]
-    fn under_prefix_rejects_a_sibling_with_a_shared_name_start() {
-        // The bug a raw substring match would introduce: `src` must not match
-        // `srcfoo/`.
-        assert!(!under_prefix("srcfoo/a.md", "src"));
-        assert!(!under_prefix("other/a.md", "src"));
-    }
-
-    #[test]
     fn parse_status_filter_rejects_an_unknown_status() {
         assert!(parse_status_filter(Some("bogus")).is_err());
         assert_eq!(
@@ -482,23 +415,5 @@ mod tests {
         assert!(!is_unverified(&[held(Some(
             "this claim was previously unwitnessed but is now witnessed"
         ))]));
-    }
-
-    #[test]
-    fn path_matches_strips_the_claims_prefix() {
-        // A claim at `.claims/src/a.md` matches `--path src`, because the user
-        // thinks in repo paths, not the store's internal layout (m1).
-        let claim = claim_core::parse_claim_file(
-            ".claims/src/a.md",
-            "---\nid: a\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nS.\n",
-        )
-        .unwrap();
-        let loaded = LoadedClaim {
-            claim,
-            path: ".claims/src/a.md".to_owned(),
-        };
-        assert!(path_matches(&loaded, "src"));
-        assert!(path_matches(&loaded, "src/a.md"));
-        assert!(!path_matches(&loaded, "other"));
     }
 }
