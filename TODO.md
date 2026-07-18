@@ -98,6 +98,50 @@ previously-uncheckable facts (world-facts, "a fix shipped") checkable — and it
 the honest home for the facts witnessed-red can't stage. Build-signal: when
 proxy-only or checkless claims are a real share of a live corpus.
 
+**Verdict protocol (how an agent check communicates its findings).** A `cmd`
+check yields its verdict through the exit code (0 held, 1 drifted, anything else
+broken) and its evidence through stdout. An agent check needs a richer channel,
+because the verdict is a judgment and the *evidence* is the point. So an agent
+check returns structured output — `{ verdict: held | drifted | unverifiable,
+evidence, citations }` — and the runner maps `verdict` onto the `Verdict` enum and
+appends the evidence and citations to the log. The agent process's own exit is
+kept as the honesty backstop: a crash, a timeout, an API error, or malformed /
+missing verdict output all map to `Broken`, never a fake `Held` — the same
+"couldn't run ⇒ not a pass" contract as `cmd`. `Unverifiable` is the honest state
+for "ran, but the evidence was conflicting or insufficient to conclude" — which is
+exactly why the verdict model has four states, not two. So yes, an agent check can
+land on held-vs-drifted by what it finds, just like a `cmd`'s exit 0 vs 1 — but it
+carries its reasoning with it rather than collapsing to a bit, and it has an honest
+"I couldn't tell" it can return instead of guessing.
+
+### Capture the expensive derivation (the memoization framing)
+
+A claim is best understood as a **verified cache of an expensive derivation**. The
+statement is the cached result; the expensive work an agent already did — the
+investigation, the evidence, the reasoning — is what a future agent inherits
+instead of re-deriving; the check is the cache-invalidation function. That
+asymmetry (deriving is expensive, re-checking is cheap) is what makes the whole
+system pay off, and it reframes the product from "continuous verification" to
+"verified memoization of expensive derivations" — the ledger is the accumulated
+cognitive work of an org's agents and people, kept from rotting.
+
+The model already has the slots — the Markdown body can hold the full derivation,
+and every verdict carries an evidence note — but two things are under-designed:
+
+1. **The original derivation has no first-class home.** Today it goes in the prose
+   body or the establishing verdict's evidence. For a tool whose value is
+   *inheriting expensive work*, "how this was established / what you're inheriting"
+   probably deserves to be distinct from the one-line statement that shows in
+   lists. Decide whether the Markdown body genuinely suffices or a dedicated
+   evidence/derivation field is warranted. Sketch a real agent-derived claim on
+   disk before deciding.
+2. **Two roles for a prompt, worth separating.** The *derivation prompt* (what
+   discovered the fact — captured once as evidence) versus the *verification
+   prompt* (a usually-cheaper recurring re-check — the `kind: agent` check). Prefer
+   a check that watches a cheap proxy of the premise over one that re-runs the whole
+   derivation; when no proxy exists, the recurring check simply is a rarer
+   re-investigation on the clock. This is the "tiered checks" idea.
+
 ### Windowed / SLO-style claims
 
 Some recorded facts are recurring predictions, not static facts — "the vendor file
