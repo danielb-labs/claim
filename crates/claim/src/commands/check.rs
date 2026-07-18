@@ -10,7 +10,7 @@
 //!
 //! - **`--report-only` writes nothing.** It runs and reports and sets the exit
 //!   code, but never touches the verdict log or resolves git provenance. This is
-//!   the untrusted-runner mode (PRODUCT.md section 3: a fork PR's CI reports in its
+//!   the untrusted-runner mode (docs/design/PRODUCT.md section 3: a fork PR's CI reports in its
 //!   output; trusted runs persist). The write path is only ever entered when
 //!   `--report-only` is absent.
 //! - **Every non-passing outcome pushes the exit code up, never down.** A drifted

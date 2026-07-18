@@ -173,12 +173,12 @@ pub struct StatusReport {
 /// first failure. But the streak cannot mask indefinitely, or a check that breaks
 /// and stays broken becomes a permanent false-fresh. Once the streak has run
 /// `grace` past the last real `Held`, the claim goes [`Status::Stale`] regardless.
-/// Per PRODUCT.md section 3.
+/// Per docs/design/PRODUCT.md section 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Grace(pub Days);
 
 impl Grace {
-    /// The default grace window, 90 days, per PRODUCT.md section 3.
+    /// The default grace window, 90 days, per docs/design/PRODUCT.md section 3.
     ///
     /// A usable compile-time constant: `const` all the way down, so a caller can
     /// pass `Grace::DEFAULT` without parsing a string at runtime.

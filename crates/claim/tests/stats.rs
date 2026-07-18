@@ -114,7 +114,7 @@ fn stats_does_not_fabricate_the_kill_metrics() {
     let far = &v["needs_human_input"]["false_alarm_rate"];
     // The rate itself is absent — never a number. Its denominator is *fired drift
     // events* (M3): `gone` flapped twice, so 2 — not `drifts_caught` (1 unique
-    // claim), which is reported separately. This is the unit PRODUCT.md section 9
+    // claim), which is reported separately. This is the unit docs/design/PRODUCT.md section 9
     // measures the false-alarm rate over.
     assert_eq!(far["available"], false);
     assert!(far.get("rate").is_none(), "no fabricated rate field");

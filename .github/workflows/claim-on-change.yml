@@ -7,7 +7,7 @@
 # build on a finding — invariant #6: drift routes, it does not block the changer.
 #
 # The checks run under `claim check --report-only`, which writes nothing and needs no
-# git identity, so this is safe on fork PRs with no write token (PRODUCT.md section 3:
+# git identity, so this is safe on fork PRs with no write token (docs/design/PRODUCT.md section 3:
 # a fork PR's CI reports in its output only; trusted runs persist). The comment step
 # is gated on the PR not coming from a fork, so a fork PR still gets its checks and
 # its advisory job summary without ever handling a write token.

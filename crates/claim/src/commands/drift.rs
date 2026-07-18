@@ -2,7 +2,7 @@
 //! [`claim_core::Status::Drifted`], with what it supports and where it lives.
 //!
 //! A human scanning this sees, for each broken fact, the decision(s) that rested
-//! on it (its `supports`) and the file to open (PRODUCT.md section 5: "drifted +
+//! on it (its `supports`) and the file to open (docs/design/PRODUCT.md section 5: "drifted +
 //! due claims, each with what it supports"). Owner routing via CODEOWNERS and
 //! cause-grouping are the CI/hub lane and out of scope here.
 //!

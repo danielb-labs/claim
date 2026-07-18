@@ -7,7 +7,7 @@
 //! with pinned timestamps rather than the wall clock, and so `check` stays a thin
 //! shell over one clear rule.
 //!
-//! The rule, per the item's design and PRODUCT.md section 5's two lanes:
+//! The rule, per the item's design and docs/design/PRODUCT.md section 5's two lanes:
 //!
 //! - An **`on-change`** check is *always* due. v1 runs repo-triggered checks on
 //!   every invocation (the on-change lane runs every cmd check on every PR):

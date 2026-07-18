@@ -6,7 +6,7 @@
 //! verb, present and future:
 //!
 //! - **A global `--json` flag** ([`Cli::json`]). Agents are the heaviest readers
-//!   (PRODUCT.md section 5), so every command owes a stable machine form. The flag
+//!   (docs/design/PRODUCT.md section 5), so every command owes a stable machine form. The flag
 //!   is parsed once at the top level and threaded to each command.
 //! - **One args struct per verb** ([`Command`]). The full v1 verb list is declared
 //!   so `claim --help` shows the real surface, and each verb carries its own typed
@@ -39,7 +39,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The `claim` verbs. The full v1 set (PRODUCT.md section 5).
+/// The `claim` verbs. The full v1 set (docs/design/PRODUCT.md section 5).
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scaffold a `.claims/` store in the current directory.
@@ -206,7 +206,7 @@ pub struct CheckArgs {
 
     /// Run and report the checks but write nothing to the verdict log.
     ///
-    /// The untrusted-runner mode (PRODUCT.md section 3: a fork PR's CI reports
+    /// The untrusted-runner mode (docs/design/PRODUCT.md section 3: a fork PR's CI reports
     /// verdicts in its output only; trusted runs persist). The exit code is still
     /// set from the verdicts, so CI can gate on it — only the persistence is
     /// suppressed. Because nothing is written, no git identity or commit is needed.
@@ -345,7 +345,7 @@ pub struct AmendArgs {
     pub supports: Vec<String>,
 }
 
-/// Arguments to `claim stats`: the pilot instrumentation (PRODUCT.md section 9).
+/// Arguments to `claim stats`: the pilot instrumentation (docs/design/PRODUCT.md section 9).
 ///
 /// A read-only rollup over the whole store; no selection flags in v1, because the
 /// pilot wants the corpus-wide picture. `--json` (global) is the structured form.

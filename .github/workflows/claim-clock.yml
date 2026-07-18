@@ -2,7 +2,7 @@
 #
 # A consumer repo calls this from its own scheduled workflow (see examples/consumer/).
 # On a cron it runs `claim check --due` against the trusted default branch, persists
-# the verdicts (this is the trusted context — PRODUCT.md section 3: main-branch and
+# the verdicts (this is the trusted context — docs/design/PRODUCT.md section 3: main-branch and
 # clock-lane runs persist), commits the new verdict-log files back, and maintains ONE
 # standing issue titled "claim: due & drifted". The issue is created when there is
 # anything to report, its body is updated to the current queue, and it is closed when
