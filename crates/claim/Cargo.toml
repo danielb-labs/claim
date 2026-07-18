@@ -14,3 +14,23 @@ path = "src/main.rs"
 [dependencies]
 claim-core = { path = "../claim-core" }
 anyhow = { workspace = true }
+# CLI argument parsing (derive API), per CLAUDE.md's approved dependency list.
+clap = { version = "4", features = ["derive"] }
+# Structured `--json` output on every command; the same models core serializes.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The approved CLI integration-test stack (CLAUDE.md): drive the built binary,
+# assert on its exit code and streams, against a real temp store.
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+# Parse the RFC 3339 timestamps a test reads back from the verdict log, so the
+# birth-order assertion compares instants (not lexical strings, which jiff's
+# trailing-zero trimming would make wrong).
+claim-core = { path = "../claim-core" }
+# Snapshot tests (CLAUDE.md) so a change to a stable rendered surface — the claim
+# file text — is a deliberate, reviewable diff. Applied only to dynamic-content-free
+# output; timestamp/temp-path-laden CLI stdout keeps structural JSON assertions.
+insta = "1"
