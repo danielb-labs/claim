@@ -71,6 +71,7 @@ jobs:
         uses: ./_claim_tool/.github/actions/install-claim
         with:
           source-path: _claim_tool/crates/claim
+          workspace-root: _claim_tool
 
       # Run every check, persist nothing. `|| true` keeps the job green regardless of
       # the exit code: the finding is advisory and must never fail the PR.
@@ -86,18 +87,22 @@ jobs:
       - name: Render the comment body
         id: render
         working-directory: ${{ inputs.working-directory }}
+        env:
+          CODEOWNERS_PATH: ${{ inputs.codeowners }}
         run: |
           body_file="$RUNNER_TEMP/comment.md"
           node "$GITHUB_WORKSPACE/_claim_tool/ci/render.mjs" \
             --mode comment \
-            --codeowners "$GITHUB_WORKSPACE/${{ inputs.codeowners }}" \
+            --codeowners "$GITHUB_WORKSPACE/$CODEOWNERS_PATH" \
             --root . \
             --report "$RUNNER_TEMP/report.json" > "$body_file" || true
           echo "body_file=$body_file" >> "$GITHUB_OUTPUT"
 
       # The job summary is the surface a fork PR (which cannot comment) still sees.
       - name: Publish job summary
-        run: cat "${{ steps.render.outputs.body_file }}" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          BODY_FILE: ${{ steps.render.outputs.body_file }}
+        run: cat "$BODY_FILE" >> "$GITHUB_STEP_SUMMARY"
 
       # Find-or-create the single comment, keyed by the hidden marker in the body.
       # Skipped for fork PRs (whose token is read-only): the checks still ran and the
@@ -118,7 +123,12 @@ jobs:
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number,
             });
-            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            // Only ever edit OUR comment: match the marker AND require a Bot author, so
+            // a same-repo actor cannot pre-seed a marker-bearing comment and redirect
+            // the upsert into editing arbitrary content.
+            const existing = comments.find(
+              (c) => c.body && c.body.includes(marker) && c.user && c.user.type === 'Bot',
+            );
             if (existing) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
             } else {

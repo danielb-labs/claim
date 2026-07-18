@@ -16,15 +16,30 @@ inputs:
   source-path:
     description: Path to the claim CLI crate to build (the directory with its Cargo.toml).
     required: true
+  workspace-root:
+    description: >
+      The cargo workspace root, for the build cache. Defaults to source-path, but a
+      crate inside a workspace should pass the workspace directory so the cache keys on
+      the right lockfile.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: Cache the cargo build
-      uses: Swatinem/rust-cache@v2
+      # SHA-pinned (v2.9.1): a mutable tag on a trust tool's supply chain is the exact
+      # rot this product exists to prevent. Bump the SHA and the version comment together.
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
       with:
-        workspaces: ${{ inputs.source-path }}
+        # rust-cache keys on the workspace's Cargo.lock, so this must be the workspace
+        # root, not a member crate dir — otherwise the cache never hits.
+        workspaces: ${{ inputs.workspace-root != '' && inputs.workspace-root || inputs.source-path }}
 
     - name: Build and install
       shell: bash
-      run: cargo install --path "${{ inputs.source-path }}" --locked
+      # The path is interpolated via env, not directly into the shell, to keep untrusted
+      # input off the command line (the Actions injection footgun).
+      env:
+        SOURCE_PATH: ${{ inputs.source-path }}
+      run: cargo install --path "$SOURCE_PATH" --locked

@@ -75,6 +75,19 @@ test("ownersFor: comments and blank lines are ignored", () => {
   assert.deepEqual(ownersFor("x", co), ["@fallback"]);
 });
 
+test("ownersFor: an un-anchored dir pattern matches at any depth (GitHub semantics)", () => {
+  // The bug this guards: `payments/` was matched anchored-to-root, so a store under
+  // `.claims/` misrouted every payments claim to the catch-all. GitHub matches a
+  // bare `payments/` at any depth.
+  const co = "* @eng\npayments/ @pay\n";
+  assert.deepEqual(ownersFor(".claims/payments/libfoo.md", co), ["@pay"]);
+  assert.deepEqual(ownersFor("payments/x.md", co), ["@pay"]);
+  // A leading-slash dir pattern stays anchored to root.
+  const anchored = "* @eng\n/payments/ @pay\n";
+  assert.deepEqual(ownersFor(".claims/payments/libfoo.md", anchored), ["@eng"]);
+  assert.deepEqual(ownersFor("payments/x.md", anchored), ["@pay"]);
+});
+
 // --- statementFromFile: pull the plain-language fact from a claim file ------------
 
 test("statementFromFile: extracts the body after standalone frontmatter", () => {
@@ -158,6 +171,16 @@ test("classify: a load error alone is never clean", () => {
   assert.equal(c.errors.length, 1);
 });
 
+test("classify: a note fault alone is never clean (held check, unreadable log)", () => {
+  // C1 regression: the claim's own check HELD, but its verdict log could not be read,
+  // so the tool floored exit at 2 and cannot say the fact holds. Rendering this clean
+  // would let the clock lane close its nag on a false green (invariant #6).
+  const c = classify(fixture("note-fault.json"), CODEOWNERS);
+  assert.equal(c.clean, false);
+  assert.equal(c.items.length, 0);
+  assert.equal(c.notes.length, 1);
+});
+
 test("classify: the mixed report yields one item per non-clean claim, owners resolved", () => {
   const c = classify(fixture("mixed.json"), CODEOWNERS);
   assert.equal(c.clean, false);
@@ -238,19 +261,66 @@ test("renderComment: the mixed report groups broken, then drifted, then unresolv
     "  - owner: @acme/platform",
     "",
     "---",
-    "A **broken** check or unloadable file means the tool could not tell whether the fact holds — treat it as failing, not passing.",
+    "A **broken** check, an unloadable file, or an unreadable verdict log means the tool could not tell whether the fact holds — treat it as failing, not passing.",
     "Resolve by fixing the claim (`claim amend`) or closing it (`claim retire`).",
     "",
   ].join("\n");
   assert.equal(body, expected);
 });
 
-test("renderComment: a load error is surfaced under its own heading", () => {
+test("renderComment: a load error is surfaced under the faults heading", () => {
   const body = renderComment(fixture("load-error.json"), CODEOWNERS);
-  assert.match(body, /### Unloadable claim files/);
+  assert.match(body, /### Unresolved faults \(the tool could not determine status\)/);
   assert.match(body, /broken-malformed\.md.*missing required field 'checks'/);
-  // A load error triggers the broken-means-failing footer note.
+  // A load error triggers the "could not tell" footer note.
   assert.match(body, /could not tell whether the fact holds/);
+});
+
+test("renderComment: a note fault (unreadable log) is never a false green", () => {
+  // C1: the check held, but the store is NOT clean, and the faults section + the
+  // "could not tell" footer fire so the finding is treated as failing.
+  const body = renderComment(fixture("note-fault.json"), CODEOWNERS);
+  assert.doesNotMatch(body, /all checks held/);
+  assert.match(body, /### Unresolved faults \(the tool could not determine status\)/);
+  assert.match(body, /could not read the verdict log/);
+  assert.match(body, /could not tell whether the fact holds/);
+});
+
+test("renderIssue: a note fault keeps the issue open, not closed", () => {
+  // C1 on the clock lane: the render must NOT be the clean/close body when a note
+  // fault is present, or the standing issue closes while the tool is saying "I can't
+  // tell whether these facts hold."
+  const body = renderIssue(fixture("note-fault.json"), CODEOWNERS);
+  assert.doesNotMatch(body, /store is clean/);
+  assert.doesNotMatch(body, /will be closed/);
+  assert.match(body, /### Unresolved faults \(the tool could not determine status\)/);
+});
+
+test("render: free-text is defanged so it cannot mention people or forge links", () => {
+  // S3: a tool error / statement carrying an @handle or a URL must render inert, since
+  // this content can quote fragments of the offending file.
+  const hostile = {
+    exit: 2,
+    report_only: true,
+    claims: [
+      {
+        id: "x/y",
+        file: ".claims/x/y.md",
+        checks: [{ verdict: "drifted", detail: "exit 1" }],
+        supports: [{ target: "@evil/team see http://x.test", resolved: false }],
+      },
+    ],
+    errors: [{ file: ".claims/bad.md", message: "blame @security or see https://phish.test now" }],
+    notes: [],
+  };
+  const body = renderComment(hostile, "");
+  // No live mention: every '@' immediately followed by a word char has been broken.
+  assert.doesNotMatch(body, /@(?=[A-Za-z0-9])/);
+  // No live autolink: no bare '://' survives.
+  assert.doesNotMatch(body, /:\/\//);
+  // The content is still shown, just neutralized.
+  assert.match(body, /evil/);
+  assert.match(body, /security/);
 });
 
 // --- the advisory-never-blocks invariant, asserted directly -----------------------
@@ -293,4 +363,40 @@ test("renderIssue: the mixed report renders the queue with grouping and owners",
   // The two markers are distinct so the two lanes never edit each other's surface.
   assert.notEqual(COMMENT_MARKER, ISSUE_MARKER);
   assert.ok(!body.includes(COMMENT_MARKER));
+});
+
+test("renderIssue: a single drift renders the exact expected body", () => {
+  const body = renderIssue(fixture("one-drift.json"), CODEOWNERS, readStatement);
+  const expected = [
+    ISSUE_MARKER,
+    "### Claims due & drifted",
+    "",
+    "The scheduled run found claims that need a human. Each is grouped by what went wrong and tagged with its CODEOWNERS owner.",
+    "",
+    "### Drifted claims",
+    "",
+    "- **`payments/libfoo-pin`** — `.claims/payments/libfoo-pin.md`",
+    "  - > We pin libfoo at 4.2; 5.x corrupts CJK PDF export.",
+    "  - supports:",
+    "    - `requirements.txt#libfoo`",
+    "  - owner: @acme/payments",
+    "",
+    "---",
+    "Resolve by fixing the claim (`claim amend`) or closing it (`claim retire`).",
+    "",
+  ].join("\n");
+  assert.equal(body, expected);
+});
+
+test("renderIssue: a load error is surfaced under the faults heading", () => {
+  const body = renderIssue(fixture("load-error.json"), CODEOWNERS);
+  assert.match(body, /### Unresolved faults \(the tool could not determine status\)/);
+  assert.match(body, /broken-malformed\.md/);
+});
+
+test("renderIssue: never uses blocking language", () => {
+  const body = renderIssue(fixture("mixed.json"), CODEOWNERS);
+  assert.doesNotMatch(body, /\bblocking\b/i);
+  assert.doesNotMatch(body, /merge is blocked/i);
+  assert.doesNotMatch(body, /required check/i);
 });

@@ -102,17 +102,31 @@ function matchesPattern(path, pattern) {
   // A pattern with no `/` (other than a possible trailing one) matches the basename
   // anywhere in the tree: `*.md` matches `docs/x.md`.
   const hasInteriorSlash = pattern.replace(/\/$/, "").includes("/");
+  const anchored = pattern.startsWith("/");
 
   if (pattern.endsWith("/")) {
-    // Directory prefix: match the directory and everything beneath it.
+    // Directory prefix. GitHub anchors it to the repo root ONLY when it has a leading
+    // slash or an interior slash (`/payments/`, `.claims/payments/`); a bare
+    // `payments/` matches a `payments` directory at ANY depth. Anchoring a bare
+    // directory pattern to root — the earlier bug — misroutes every claim in a store
+    // that lives under `.claims/` when an org writes the natural `payments/` rule.
     const dir = pattern.replace(/^\//, "").replace(/\/$/, "");
-    return path === dir || path.startsWith(dir + "/");
+    if (anchored || hasInteriorSlash) {
+      return path === dir || path.startsWith(dir + "/");
+    }
+    // Unanchored: match `dir/…` at any depth, i.e. a path segment equal to `dir`
+    // followed by more path.
+    return new RegExp("(^|/)" + escapeRegExp(dir) + "/").test(path);
   }
 
-  const anchored = pattern.startsWith("/");
   const glob = pattern.replace(/^\//, "");
   const re = globToRegExp(glob, anchored || hasInteriorSlash);
   return re.test(path);
+}
+
+/** Escape a literal string for embedding in a RegExp. */
+function escapeRegExp(s) {
+  return s.replace(/[.+*?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -162,13 +176,20 @@ export function statementFromFile(text) {
 
 /**
  * The full classification of a `claim check --json` report: the reportable claims
- * (broken/drifted/unresolved) with their owners resolved, the load errors, and a
- * single `clean` flag the caller keys the whole decision on.
+ * (broken/drifted/unresolved) with their owners resolved, the load errors, the
+ * per-claim faults, and a single `clean` flag the caller keys the whole decision on.
  *
- * `clean` is true only when there is nothing to route: no reportable claim AND no
- * load error. A load error (a malformed or duplicate-id claim file) is never clean —
- * it floors the exit at 2 in the tool and is surfaced here too, because a claim file
- * that will not parse is exactly the silent gap the tool exists to make loud.
+ * `clean` is true only when there is nothing to route: no reportable claim, AND no
+ * load error, AND no per-claim fault. Each of the latter two is never clean —
+ *
+ * - A load error (`errors[]`: a malformed or duplicate-id claim file) floors the
+ *   tool's exit at 2, because a claim file that will not parse is a silent gap.
+ * - A fault (`notes[]`: a claim whose own check ran, but whose verdict log could not
+ *   be read) *also* floors the tool's exit at 2. The check may have held, but the tool
+ *   cannot compute the claim's status from an unreadable log — so it does not know the
+ *   fact holds. Ignoring `notes[]` here would render "the store is clean" and let the
+ *   clock lane CLOSE its nag while the tool is saying "I can't tell." That is a false
+ *   green, invariant #6, in the CI layer; the fault keeps the store dirty.
  */
 export function classify(report, codeownersText, readStatement) {
   const items = [];
@@ -186,10 +207,12 @@ export function classify(report, codeownersText, readStatement) {
     });
   }
   const errors = report.errors || [];
+  const notes = report.notes || [];
   return {
-    clean: items.length === 0 && errors.length === 0,
+    clean: items.length === 0 && errors.length === 0 && notes.length === 0,
     items,
     errors,
+    notes,
     exit: report.exit,
     reportOnly: report.report_only === true,
   };
@@ -215,13 +238,16 @@ function ownersLine(owners) {
 
 /** Render one classified claim: id, file, statement, why it fired, supports, owner. */
 function claimBlock(item) {
+  // `id` and `file` come from claim files, so defang them too before they land in a
+  // code span, even though the schema constrains them.
   const lines = [];
-  lines.push(`- **\`${item.id}\`** — \`${item.file}\``);
+  lines.push(`- **${code(item.id)}** — ${code(item.file)}`);
 
   // The statement is the fact in plain language — "what your change broke". Show it
   // when we could read it; omit the line entirely rather than print an empty quote.
+  // Defanged: a statement is prose a person wrote and can contain an @handle.
   if (item.statement) {
-    lines.push(`  - > ${item.statement}`);
+    lines.push(`  - > ${defang(item.statement)}`);
   }
 
   // The broken check's evidence is the single most useful thing to show: it says
@@ -231,7 +257,7 @@ function claimBlock(item) {
     if (broken) {
       lines.push(`  - check ${detailFor(broken)}`);
       const ev = firstLine(broken.evidence);
-      if (ev) lines.push(`  - \`${ev}\``);
+      if (ev) lines.push(`  - ${code(ev)}`);
     }
   }
 
@@ -241,7 +267,7 @@ function claimBlock(item) {
     lines.push("  - supports:");
     for (const s of item.supports) {
       const mark = s.resolved === false ? " — **unresolved** (target is gone)" : "";
-      lines.push(`    - \`${s.target}\`${mark}`);
+      lines.push(`    - ${code(s.target)}${mark}`);
     }
   } else {
     lines.push("  - supports: _(nothing declared)_");
@@ -266,12 +292,43 @@ function firstLine(text) {
   return null;
 }
 
-/** Render the load-errors section (malformed / duplicate-id claim files). */
-function errorsSection(errors) {
-  if (errors.length === 0) return null;
-  const lines = ["### Unloadable claim files", ""];
+/**
+ * Neutralize free-text that came from a claim file, a tool error, or evidence before
+ * it goes into markdown, so it cannot address people or forge links in the comment or
+ * issue. This text can carry fragments of the offending file — an error message
+ * quoting a path, a statement someone wrote — so an `@mention` or a bare URL in it
+ * would otherwise render live and ping unrelated users or autolink. We defang the
+ * `@` that starts a mention (`@team` -> `@​team`) and the `://` that starts an
+ * autolink, and collapse backticks so the text cannot break out of a code span. This
+ * is display hygiene, not a security boundary: the content is still shown, just inert.
+ */
+function defang(text) {
+  return String(text)
+    .replace(/`/g, "'")
+    .replace(/@(?=[A-Za-z0-9])/g, "@​")
+    .replace(/:\/\//g, ":/​/");
+}
+
+/** Wrap defanged free-text in a code span, collapsing newlines so it stays one line. */
+function code(text) {
+  return "`" + defang(text).replace(/\s*\n\s*/g, " ").trim() + "`";
+}
+
+/**
+ * Render the faults section: unloadable claim files (`errors[]`) and per-claim
+ * verdict-log read faults (`notes[]`). Both mean the tool could not determine a
+ * fact's status, so both are surfaced under one loud heading and both keep the store
+ * dirty (see `classify`). Free-text (`e.message`, a note) is defanged so a path or
+ * message it quotes cannot mention people or forge links.
+ */
+function faultsSection(errors, notes) {
+  if (errors.length === 0 && notes.length === 0) return null;
+  const lines = ["### Unresolved faults (the tool could not determine status)", ""];
   for (const e of errors) {
-    lines.push(`- \`${e.file}\`: ${e.message}`);
+    lines.push(`- \`${defang(e.file)}\`: ${defang(e.message)}`);
+  }
+  for (const note of notes) {
+    lines.push(`- ${defang(note)}`);
   }
   return lines.join("\n");
 }
@@ -288,9 +345,9 @@ function findingsBody(classified) {
     sections.push(group.items.map(claimBlock).join("\n"));
     sections.push("");
   }
-  const errs = errorsSection(classified.errors);
-  if (errs) {
-    sections.push(errs);
+  const faults = faultsSection(classified.errors, classified.notes);
+  if (faults) {
+    sections.push(faults);
     sections.push("");
   }
   return sections.join("\n").trimEnd();
@@ -307,7 +364,11 @@ function findingsBody(classified) {
  * loses that signal).
  */
 export function renderComment(report, codeownersText, readStatement) {
-  const classified = classify(report, codeownersText, readStatement);
+  return commentFrom(classify(report, codeownersText, readStatement));
+}
+
+/** Render the comment body from an already-classified report (classify once). */
+function commentFrom(classified) {
   const out = [COMMENT_MARKER];
   if (classified.clean) {
     out.push("### claim: all checks held");
@@ -336,7 +397,11 @@ export function renderComment(report, codeownersText, readStatement) {
  * issue when `classified.clean`; this still renders a clean body for the transition.
  */
 export function renderIssue(report, codeownersText, readStatement) {
-  const classified = classify(report, codeownersText, readStatement);
+  return issueFrom(classify(report, codeownersText, readStatement));
+}
+
+/** Render the issue body from an already-classified report (classify once). */
+function issueFrom(classified) {
   const out = [ISSUE_MARKER];
   if (classified.clean) {
     out.push("### The claim store is clean");
@@ -361,9 +426,10 @@ function footer(classified) {
   const parts = [];
   parts.push("---");
   const broken = classified.items.some((it) => it.category === "broken");
-  if (broken || classified.errors.length > 0) {
+  const cannotTell = broken || classified.errors.length > 0 || classified.notes.length > 0;
+  if (cannotTell) {
     parts.push(
-      "A **broken** check or unloadable file means the tool could not tell whether the fact holds — treat it as failing, not passing.",
+      "A **broken** check, an unloadable file, or an unreadable verdict log means the tool could not tell whether the fact holds — treat it as failing, not passing.",
     );
   }
   parts.push("Resolve by fixing the claim (`claim amend`) or closing it (`claim retire`).");
@@ -420,12 +486,10 @@ function main() {
     }
   };
 
-  const body =
-    mode === "issue"
-      ? renderIssue(report, codeownersText, readStatement)
-      : renderComment(report, codeownersText, readStatement);
-  process.stdout.write(body);
+  // Classify once, then both the body and the exit code derive from it.
   const classified = classify(report, codeownersText, readStatement);
+  const body = mode === "issue" ? issueFrom(classified) : commentFrom(classified);
+  process.stdout.write(body);
   // Exit 0 clean, 1 dirty. The on-change workflow does not gate on this (it only uses
   // the body); the clock workflow uses it to decide open-vs-close the standing issue.
   process.exitCode = classified.clean ? 0 : 1;

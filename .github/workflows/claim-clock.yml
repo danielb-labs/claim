@@ -71,6 +71,7 @@ jobs:
         uses: ./_claim_tool/.github/actions/install-claim
         with:
           source-path: _claim_tool/crates/claim
+          workspace-root: _claim_tool
 
       # Give the persisting run a git identity so `claim check` can stamp verdicts.
       # A report-only run (`persist: false`) does not need one, but setting it is
@@ -80,22 +81,33 @@ jobs:
           git config user.name "claim-bot"
           git config user.email "claim-bot@users.noreply.github.com"
 
-      # Run the due claims. Persisting (`--due` alone) records verdicts to the log;
-      # report-only (`persist: false`) writes nothing. `|| true` keeps the job green:
-      # a drift or broken check is a finding to route via the issue, not a CI failure.
+      # Persisting (`--due` alone) records verdicts to the log; report-only
+      # (`persist: false`) writes nothing. `|| true` keeps the job green: a drift or
+      # broken check is a finding to route via the issue, not a CI failure.
       - name: Run due claims
         working-directory: ${{ inputs.working-directory }}
+        env:
+          PERSIST: ${{ inputs.persist }}
         run: |
-          if [ "${{ inputs.persist }}" = "true" ]; then
+          if [ "$PERSIST" = "true" ]; then
             claim --json check --due > "$RUNNER_TEMP/report.json" || true
           else
             claim --json check --due --report-only > "$RUNNER_TEMP/report.json" || true
           fi
 
-      # Commit any new verdict-log files. `git diff --quiet` skips the commit and push
-      # when nothing changed (every check held, or report-only), so a quiet day makes
-      # no commit. This is the "a write to the truth is a commit" invariant (#4): the
-      # only way a verdict reaches the store is a committed file, no side channel.
+      # Commit any new verdict-log files. `git diff --cached --quiet` skips the commit
+      # and push when nothing changed (every check held, or report-only), so a quiet
+      # day makes no commit. This is the "a write to the truth is a commit" invariant
+      # (#4): the only way a verdict reaches the store is a committed file.
+      #
+      # The push is retried under `pull --rebase` because a concurrent push (a merge
+      # landing between checkout and here) would otherwise reject it non-fast-forward,
+      # fail the job, and — worse — SKIP the issue step, so the nag would miss this
+      # cycle. Verdict-log files are append-only under distinct per-verdict paths, so a
+      # rebase never conflicts. If every attempt loses the race the step still exits 0
+      # so the always-run issue step maintains the nag from this run's report; the
+      # unpushed verdicts are re-recorded next cycle (a claim stays due until a verdict
+      # is committed).
       - name: Commit recorded verdicts
         if: ${{ inputs.persist }}
         working-directory: ${{ inputs.working-directory }}
@@ -103,20 +115,32 @@ jobs:
           git add .claims/log
           if git diff --cached --quiet; then
             echo "No new verdicts to commit."
-          else
-            git commit -m "chore(claim): record scheduled verdicts"
-            git push
+            exit 0
           fi
+          git commit -m "chore(claim): record scheduled verdicts"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing on the remote and retrying."
+            git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" || true
+          done
+          echo "Could not push after 3 attempts; the nag will still be maintained and the verdicts re-recorded next run." >&2
 
+      # Runs even if the commit step failed (a lost push race), so the nag reflects
+      # this run's report regardless.
       - name: Render the issue body
         id: render
+        if: always()
         working-directory: ${{ inputs.working-directory }}
+        env:
+          CODEOWNERS_PATH: ${{ inputs.codeowners }}
         run: |
           body_file="$RUNNER_TEMP/issue.md"
           set +e
           node "$GITHUB_WORKSPACE/_claim_tool/ci/render.mjs" \
             --mode issue \
-            --codeowners "$GITHUB_WORKSPACE/${{ inputs.codeowners }}" \
+            --codeowners "$GITHUB_WORKSPACE/$CODEOWNERS_PATH" \
             --root . \
             --report "$RUNNER_TEMP/report.json" > "$body_file"
           # The renderer exits 0 when the store is clean, non-zero when there is a
@@ -128,8 +152,10 @@ jobs:
 
       # Maintain the single standing issue. Found by its marker (in the body) and its
       # label. Open/update when there is a queue; close when clean. Idempotent: at most
-      # one open "claim: due & drifted" issue exists at any time.
+      # one open "claim: due & drifted" issue exists at any time. `if: always()` so a
+      # failed push (lost race) never skips the nag — the whole point of this lane.
       - name: Maintain the standing issue
+        if: always() && steps.render.outputs.body_file != ''
         uses: actions/github-script@v7
         with:
           script: |
@@ -175,7 +201,7 @@ jobs:
               } catch {
                 await github.rest.issues.createLabel({
                   owner, repo, name: label, color: 'b60205',
-                  description: 'Tracks the claim clock lane’s due & drifted queue.',
+                  description: "Tracks the claim clock lane's due & drifted queue.",
                 });
               }
               await github.rest.issues.create({ owner, repo, title, body, labels: [label] });

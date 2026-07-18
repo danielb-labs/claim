@@ -24,7 +24,7 @@ mapping — the highest applicable code wins, so a mixed store reports its worst
 |------|---------|
 | `0`  | Every check held and every `supports` target resolved. |
 | `1`  | At least one drifted or unverifiable verdict, or an unresolved support — review needed. |
-| `2`  | At least one broken check, an unloadable/duplicate-id claim file, or a tool error. |
+| `2`  | At least one broken check, an unloadable/duplicate-id claim file, an unreadable verdict log, or a tool error. |
 
 The rule that matters most: **a broken check is exit 2, never a pass** (golden
 invariant #1). A check that could not run tells us nothing, so it is the loudest
@@ -108,19 +108,24 @@ The transformation from `claim check --json` to a markdown comment or issue body
 grouping, the supports and statement rendering, the CODEOWNERS-owner lookup, and the
 clean-vs-dirty decision — is not in the workflow YAML. It lives in `ci/render.mjs`
 (Node, no dependencies) and is unit-tested in `ci/render.test.mjs` against real
-`claim check` JSON fixtures in `ci/fixtures/` (a clean store, one drift with supports,
-a mixed store grouped by severity, a broken check, an unresolved support, and a load
-error). The workflow only runs `claim`, calls the renderer, and hands its output to
-the GitHub API — so the part a reviewer might get wrong is the part covered by tests.
+`claim check` JSON fixtures in `ci/fixtures/`: `clean.json`, `one-drift.json` (a drift
+with a support), `mixed.json` (a broken check, a drift, and an unresolved support in
+one store, grouped by severity), `load-error.json` (an unloadable claim file in
+`errors[]`), and `note-fault.json` (a held check whose verdict log could not be read —
+a `notes[]` fault, which must not render as clean). The workflow only runs `claim`,
+calls the renderer, and hands its output to the GitHub API — so the part a reviewer
+might get wrong is the part covered by tests.
 
 The tests run in the repo's own gate (`scripts/check.sh`), so a change to the CLI's
 JSON shape or the renderer breaks the build rather than silently mis-rendering in
 production.
 
 The CODEOWNERS lookup implements GitHub's rule that the **last matching pattern wins**,
-over the subset a claims store needs: a catch-all `*`, directory prefixes
-(`.claims/payments/`), anchored paths, and basename globs (`*.md`). An unowned claim is
-rendered as a visible routing dead-letter, never silently dropped.
+over the subset a claims store needs: a catch-all `*`, directory patterns (a bare
+`payments/` matches at any depth, a leading-slash `/payments/` anchors to the repo
+root — matching GitHub, so a store under `.claims/` routes correctly), and basename
+globs (`*.md`). An unowned claim is rendered as a visible routing dead-letter, never
+silently dropped.
 
 The statement — the plain-language fact — is not carried in `claim check --json`, so the
 renderer reads it from the claim file the checkout already has (the markdown body after
