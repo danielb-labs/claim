@@ -14,8 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain
-        run: rustup toolchain install stable --component rustfmt clippy
+      # No explicit toolchain install: rust-toolchain.toml is the single source of
+      # truth for the channel and components (rustfmt, clippy), and rustup installs
+      # them from it on the first cargo/rustc invocation in the repo. A second copy
+      # of the channel/component list here is exactly the kind of drift this tool
+      # exists to catch — and an earlier one already broke every run when rustup
+      # stopped accepting `--component rustfmt clippy` as two components.
       # SHA-pinned (v2.9.1): a mutable tag on the supply chain is the rot this tool
       # exists to prevent. Bump the SHA and the version comment together.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
