@@ -47,12 +47,16 @@ persisted.
 
 ## What is claimed
 
-Run `claim list` for the current set. As of this writing the store records seven
+Run `claim list` for the current set. As of this writing the store records eight
 claims about: the archived `serde_yaml` staying out of the dependency graph
 (`serde_norway` is the chosen fork), `jiff` as the time library, the gate denying
 clippy warnings, CI running the same `scripts/check.sh` as local, the workspace
 being exactly four crates, the exit-code→verdict mapping living in `verdict.rs`,
-and the CI action being pinned to a full commit SHA rather than a mutable tag.
+the CI action being pinned to a full commit SHA rather than a mutable tag, and the
+docs site (`docs/index.html`) documenting every CLI verb and MCP tool the tool
+ships — that last one drifts if a verb or tool is added to the code without a
+mention in the site, the mechanical backstop for the same-branch docs rule in
+CLAUDE.md.
 
 ## How the store is laid out
 

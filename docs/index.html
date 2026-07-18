@@ -499,7 +499,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     <h2>The MCP server</h2>
     <p>The <code>claim-mcp</code> server is how agents touch the store over the Model Context Protocol. It
     is a thin shell over the same core the CLI uses, discovering the store from the working directory per
-    call, and exposes two tools:</p>
+    call, and exposes three tools:</p>
     <ul>
       <li><strong>query</strong> &mdash; return the claims recorded for the paths or text at hand, as
       <em>dated evidence</em>: the statement, its computed status, when it was last verified, what it
@@ -508,14 +508,27 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
       to obey &mdash; a claims store agents obeyed blindly would be an injection channel with a trust
       stamp. Read-only; it never writes.</li>
       <li><strong>report</strong> &mdash; record a verdict the agent reached (<code>held</code>,
-      <code>drifted</code>, or <code>unverifiable</code>) with required evidence, under the agent&rsquo;s
-      own git identity. It appends one entry to the verdict log in the working tree and returns the file
-      to commit &mdash; the server does <em>not</em> commit, because a write to the truth is a commit the
-      caller makes.</li>
+      <code>drifted</code>, or <code>unverifiable</code>) with required evidence about an <em>existing</em>
+      claim, under the agent&rsquo;s own git identity. It appends one entry to the verdict log in the
+      working tree and returns the file to commit &mdash; the server does <em>not</em> commit, because a
+      write to the truth is a commit the caller makes.</li>
+      <li><strong>create</strong> &mdash; record a <em>new</em> claim the agent just established: a
+      statement plus the check that re-verifies it, verified against reality now, under the agent&rsquo;s
+      own git identity. This is the MCP counterpart of <code>claim add</code>, held to the same rule &mdash;
+      the check is run against the current tree and the claim is written <em>only</em> if it
+      <span class="chip green">held</span>; a <span class="chip red">drifted</span> (the fact is already
+      false) or <span class="chip amber">broken</span>/<span class="chip amber">unverifiable</span> (the
+      check could not run) is refused with the evidence and nothing is written. Like <code>report</code>,
+      it writes the claim file and its establishing verdict to the working tree with a commit hint and does
+      <em>not</em> commit, so the new claim is unreviewed until the caller commits it (where a human reviews
+      the commit or PR). An <code>instruction</code> (agent) check needs a runner
+      (<a href="#agent"><code>CLAIM_AGENT_CMD</code></a>); with none it is unverifiable and the create is
+      refused.</li>
     </ul>
-    <p>(<code>propose</code> and <code>flag</code> from earlier drafts were cut: an in-repo agent already
-    has a checkout, so it writes the file or runs <code>claim add</code>, and <code>flag</code> is just
-    <code>report</code> with a negative verdict.)</p>
+    <p>(<code>propose</code> and <code>flag</code> from earlier drafts were cut: <code>propose</code>&rsquo;s
+    role &mdash; an agent authoring a claim &mdash; is filled by <code>create</code> writing a file the
+    caller commits as a reviewable PR, and <code>flag</code> is just <code>report</code> with a negative
+    verdict.)</p>
   </section>
 
   <hr>
@@ -537,6 +550,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
         <tr><td><code>claim amend</code></td><td>Resolve drift by fixing a claim&rsquo;s statement and check, keeping its history <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim retire</code></td><td>Close a claim on purpose with a note; its status becomes <code>retired</code> <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim stats</code></td><td>Pilot metrics: status and verdict counts, drifts caught, staleness <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim docs</code></td><td>Open the documentation bundled into this binary (version-locked to the tool you ran) <span class="chip done">shipped</span></td></tr>
       </tbody>
     </table>
 
@@ -597,6 +611,18 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     oldest last-verified time. The two &ldquo;kill metrics&rdquo; from the product design &mdash;
     false-alarm rate and minutes per claim &mdash; are reported as needing human input rather than
     fabricated, because the store does not observe them.</p>
+
+    <h3>claim docs</h3>
+    <p>Opens this documentation site &mdash; the very page you are reading &mdash; from a copy
+    <em>bundled into the binary</em>, so an installed user with no checkout of this repository can still
+    read the docs, and the docs they read are version-locked to the tool they ran (an old binary never
+    shows a newer site than it was built from). It writes the site to a per-version cache directory and
+    hands it to the platform opener (<code>open</code>, <code>xdg-open</code>, or <code>start</code>),
+    printing the path too. <code>claim docs --path</code> prints the path without opening &mdash; for a
+    headless box or scripting (<code>open "$(claim docs --path)"</code>); a box with no opener degrades to
+    the same, printing the path and exiting <code>0</code> rather than failing. <code>claim docs
+    &lt;topic&gt;</code> opens a deeper page: <code>ci</code>, <code>agent-checks</code>, or
+    <code>dogfooding</code>.</p>
   </section>
 
   <section id="docs">

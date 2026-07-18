@@ -126,7 +126,9 @@ merged.
 4. **Review.** Two independent adversarial reviewers read the diff, with
    different mandates (one hunts correctness and broken invariants, one hunts
    design, test adequacy, security, and slop). Their findings come back
-   classified by severity.
+   classified by severity. **Docs are part of the diff, not a follow-up:** a
+   reviewer rejects a branch that changes user-facing behavior without updating
+   the docs it affects (see "Docs ship with the behavior they describe").
 5. **Adjudicate and fix.** The orchestrator decides which findings are real.
    Every accepted finding is fixed on the same branch, and the gate runs again.
 6. **Merge.** `git switch main && git merge --no-ff item-NN-short-name` with a
@@ -177,6 +179,31 @@ Write for the next engineer, who is as smart as you and has none of your context
 
 Match the style of the code already here. When you change behavior, update the
 docs and design files that describe it in the same commit.
+
+### Docs ship with the behavior they describe
+
+A branch that changes user-facing behavior — a verb, a flag, an exit code, an MCP
+tool, an output shape — MUST update, add, or remove the docs it affects **in the
+same branch**, as part of the definition of done: the `docs/index.html` site, the
+topic docs under `docs/`, and the `--help`/`--long-help` text. This is checked in
+review (see step 4 of "How we work"): an unaccompanied behavior change is not
+mergeable, however correct the code is.
+
+Docs are **never** a separate batch item. Batching documentation into its own later
+item is exactly what let item 14's MCP `create` tool ship while the site still said
+the server "exposes two tools" — the drift was structural, not an oversight, because
+the item that added the tool had no obligation to touch the docs. Removing that
+structure removes the drift: the item that changes the behavior owns its docs.
+
+The mechanical backstop is the self-checking docs claim in this repo's own store
+(`docs/index-covers-cli-and-mcp`): its check (`scripts/docs-cover-cli.sh`) reads the
+shipped verb list from `claim --help` and the MCP tool list from the server source,
+and **drifts** when either names something `docs/index.html` does not, so `claim
+check`/CI catches an undocumented verb or tool even if a reviewer misses it. Had that
+claim existed at item 14, it would have failed the moment `create` landed. It is a
+backstop, not a substitute for writing the docs with the change — it proves *coverage*
+(every verb and tool is mentioned), not *accuracy* (that what is written is true),
+which stays a human obligation.
 
 ## Commits
 
