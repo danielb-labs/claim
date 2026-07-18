@@ -51,9 +51,9 @@ impl TestRepo {
         TestRepo { dir }
     }
 
-    /// A git repo with a commit but *no* `user.name`/`user.email`, so resolving a
-    /// verdict's actor fails. For proving `claim check --report-only` needs no
-    /// identity while a persisting run does.
+    /// A git repo with a commit but *no* `user.name`/`user.email`, so resolving an
+    /// authored claim's actor fails. For proving `claim add` needs an identity to
+    /// attribute a claim.
     ///
     /// `commit.gpgsign` is disabled and identity is passed only to the one commit
     /// via `-c`, so the working repo genuinely lacks a configured identity
@@ -141,99 +141,14 @@ impl TestRepo {
         cmd
     }
 
-    /// Read every verdict-log entry file under a claim id, as parsed JSON, in
-    /// filename order (which is chronological — the stamp leads the name).
-    pub fn log_entries(&self, id: &str) -> Vec<serde_json::Value> {
-        let dir = self.path().join(".claims/log").join(id);
-        let mut names: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|_| panic!("log dir for {id} should exist"))
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .collect();
-        names.sort();
-        names
-            .iter()
-            .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
-            .collect()
-    }
-
-    /// The number of verdict-log entry files under a claim id, or 0 if the log
-    /// directory does not exist. For asserting a run wrote (or did not write) a
-    /// verdict.
-    pub fn log_count(&self, id: &str) -> usize {
-        let dir = self.path().join(".claims/log").join(id);
-        std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.filter_map(std::result::Result::ok)
-                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
     /// Write a standalone claim file directly under `.claims/`, bypassing
     /// `claim add`.
     ///
-    /// Lets a test build a store with a precise shape — several claims, specific
-    /// triggers, chosen `supports` — and seed its verdict log directly, without
-    /// running `add`. The `.md` extension and the `.claims/` prefix are added, so
-    /// `write_claim("payments/pin", ...)` lands at `.claims/payments/pin.md`.
+    /// Lets a test build a store with a precise shape — several claims, chosen
+    /// checks and `supports` — without running `add`. The `.md` extension and the
+    /// `.claims/` prefix are added, so `write_claim("payments/pin", ...)` lands at
+    /// `.claims/payments/pin.md`.
     pub fn write_claim(&self, id: &str, frontmatter_and_body: &str) {
         self.write(&format!(".claims/{id}.md"), frontmatter_and_body);
-    }
-
-    /// Append a verdict entry to a claim's log with a chosen timestamp, so a test
-    /// controls the due/stale arithmetic deterministically.
-    ///
-    /// Writes a JSON entry in the exact on-disk shape `read_entries` expects. The
-    /// filename embeds the timestamp (colons swapped for hyphens) so a plain
-    /// listing stays chronological, matching the tool's own naming. `verdict` is
-    /// one of `held`, `drifted`, `unverifiable`, `broken`.
-    pub fn write_verdict(&self, id: &str, at: &str, verdict: &str) {
-        let dir = self.path().join(".claims/log").join(id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let entry = serde_json::json!({
-            "at": at,
-            "commit": "0".repeat(40),
-            "actor": "Test User <test@example.com>",
-            "event": { "type": "verification", "verdict": verdict, "evidence": null },
-        });
-        // A filename that sorts chronologically and is filesystem-safe: the stamp
-        // with `:` replaced, plus a short disambiguator so two entries at one
-        // instant do not collide.
-        let stamp = at.replace(':', "-");
-        let n = self.log_count(id);
-        let name = format!("{stamp}-{n:04}.json");
-        std::fs::write(dir.join(name), serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
-    }
-
-    /// Append a retirement adjudication to a claim's log at a chosen timestamp, so
-    /// a test can build a `Status::Retired` claim without the (unbuilt) `retire`
-    /// verb.
-    pub fn write_retirement(&self, id: &str, at: &str, note: &str) {
-        let dir = self.path().join(".claims/log").join(id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let entry = serde_json::json!({
-            "at": at,
-            "commit": "0".repeat(40),
-            "actor": "Test User <test@example.com>",
-            "event": { "type": "adjudication", "action": { "action": "retire", "note": note } },
-        });
-        let stamp = at.replace(':', "-");
-        let n = self.log_count(id);
-        std::fs::write(
-            dir.join(format!("{stamp}-{n:04}.json")),
-            serde_json::to_vec_pretty(&entry).unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// A `claim` command with `now` pinned via the `CLAIM_NOW` env seam, so the
-    /// due/stale arithmetic is measured against a fixed instant rather than the
-    /// racing wall clock. `at` is an RFC 3339 timestamp.
-    pub fn claim_at(&self, at: &str) -> assert_cmd::Command {
-        let mut cmd = self.claim();
-        cmd.env("CLAIM_NOW", at);
-        cmd
     }
 }

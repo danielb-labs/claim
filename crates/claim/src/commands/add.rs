@@ -1,19 +1,22 @@
 //! `claim add`: author a claim, prove its check passes against reality now, then
-//! write the definition file and its establishing log entry.
+//! write the definition file.
 //!
-//! This verb is where two invariants meet the user. Invariant #4 (a write is a
-//! commit): `add` writes the claim file and appends the log entry to the working
+//! This verb is where two invariants meet the user. Invariant #4 (the truth is the
+//! claim, and a write to it is a commit): `add` writes the claim file to the working
 //! tree, and stops — it never runs `git commit`; the user commits. Invariant #5
-//! (a passing check verifies the fact): the default path runs the check once,
-//! requires `Held`, and records it. `Drifted` (the fact is already false) and
-//! `Broken` (the check cannot run) are refused — nothing is written.
+//! (a passing check verifies the fact): the default path runs the check once and
+//! requires `Held`. `Drifted` (the fact is already false) and `Broken` (the check
+//! cannot run) are refused — nothing is written. `add` is a birth *gate*, not a
+//! birth *certificate*: no establishing verdict is written, because a verdict is
+//! telemetry a hub stores, not source (see `docs/design/CLI-HUB-BOUNDARY.md`). A
+//! false claim is caught by the next check.
 //!
 //! # The default path never touches the working tree
 //!
 //! `add` runs the check against the current tree exactly once and writes the claim
-//! and its establishing verdict. It does not perturb the tree, restore it, or
-//! require it to be clean. An agent working in a dirty tree can author a claim with
-//! no ceremony, and there is no path on which uncommitted work can be lost.
+//! file. It does not perturb the tree, restore it, or require it to be clean. An
+//! agent working in a dirty tree can author a claim with no ceremony, and there is
+//! no path on which uncommitted work can be lost.
 //!
 //! # Optional witnessed-red confidence (`--witness-cmd`)
 //!
@@ -27,11 +30,11 @@
 //! refused; a `Broken` means the perturbation broke execution and is refused), then
 //! tears the worktree down even on failure.
 //!
-//! The observed red is recorded as an evidence note on the establishing entry. The
-//! user's working tree is never mutated, so `--witness-cmd` needs no clean-tree
-//! requirement and can never lose uncommitted work. Witnessing needs a born `HEAD`
-//! (the worktree checks out a commit); on an unborn repository `--witness-cmd` is
-//! refused with the fix, while the default no-witness path still works.
+//! The observed red is narrated as evidence for the author's confidence. The user's
+//! working tree is never mutated, so `--witness-cmd` needs no clean-tree requirement
+//! and can never lose uncommitted work. Witnessing needs a born `HEAD` (the worktree
+//! checks out a commit); on an unborn repository `--witness-cmd` is refused with the
+//! fix, while the default no-witness path still works.
 
 use std::io::Write;
 
@@ -62,20 +65,23 @@ struct AddReport {
     root: String,
     /// The path of the written claim file, relative to the store root.
     file: String,
-    /// The full 40-char commit sha the establishing verdict was recorded against (the
+    /// The full 40-char commit sha the establishing check was observed against (the
     /// unborn-HEAD sentinel when the repo has no commit yet). Full, not abbreviated,
-    /// so the recorded provenance does not vary with `core.abbrev`.
+    /// so the reported provenance does not vary with `core.abbrev`. No verdict is
+    /// stored; this is the commit the author's tree was at when the check held.
     commit: String,
-    /// The actor the establishing verdict was attributed to.
+    /// The actor authoring the claim, from git config.
     actor: String,
-    /// The check's verdict on the establishing run — always `held`.
+    /// The check's verdict on the establishing run — always `held`. Reported, not
+    /// stored.
     verdict: Verdict,
     /// Whether the check was additionally witnessed failing in isolation. Optional
     /// confidence, not a gate: `false` is a fully verified claim, not a penalized one.
     witnessed_red: bool,
-    /// The paths the caller must `git add` and commit, relative to `root` (invariant
-    /// #4: the tool does not commit). Anchor them with `root`, or use the printed
-    /// `git -C <root> add ...` line, so they resolve from any working directory.
+    /// The path the caller must `git add` and commit, relative to `root` (invariant
+    /// #4: the tool does not commit). Anchor it with `root`, or use the printed
+    /// `git -C <root> add ...` line, so it resolves from any working directory. Just
+    /// the claim file — no verdict is written.
     to_commit: Vec<String>,
 }
 
@@ -85,11 +91,10 @@ struct AddReport {
 /// # Errors
 ///
 /// Fails, with a message naming the fix, on: no store found; a missing required
-/// field without `--interactive` to prompt for it; an invalid id, trigger, or
-/// `max-age`; a
-/// duplicate id; a check that is `Drifted` or `Broken` against the current tree; a
-/// `--witness-cmd` whose red is not observed (or that is requested on an unborn
-/// HEAD); a git provenance failure; or an I/O failure writing the file or log.
+/// field without `--interactive` to prompt for it; an invalid id or `--max-age`
+/// hint; a duplicate id; a check that is `Drifted` or `Broken` against the current
+/// tree; a `--witness-cmd` whose red is not observed (or that is requested on an
+/// unborn HEAD); a git provenance failure; or an I/O failure writing the file.
 pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     // `discover` returns `StoreError::NoStore` for a missing store, which
@@ -127,10 +132,11 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     // `author_claim` has confirmed the id is new and the establishing check holds — so
     // its isolated worktree and side-effecting witness command never fire for an add
     // that a duplicate id or a non-holding check has already doomed (fail fast before
-    // any side effect). On success its observed-red note is folded onto the birth
-    // entry. A witness failure is a CLI contract error whose `ErrorKind` the JSON
-    // output must preserve, so it is stashed here and re-raised after `author_claim`
-    // returns, rather than flattened through `AuthorError`.
+    // any side effect). The observed red is narrated for the author's confidence;
+    // nothing is recorded, since no verdict is written. A witness failure is a CLI
+    // contract error whose `ErrorKind` the JSON output must preserve, so it is stashed
+    // here and re-raised after `author_claim` returns, rather than flattened through
+    // `AuthorError`.
     let mut witness_error: Option<anyhow::Error> = None;
     let on_established = |_outcome: &CheckOutcome| -> Result<Option<String>, AuthorError> {
         let Some(witness_cmd) = &args.witness_cmd else {
@@ -138,7 +144,7 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
         };
         let head = git::resolve_commit(store.root()).map_err(AuthorError::Provenance)?;
         match witness_in_isolation(&store, &head, check, witness_cmd, format) {
-            Ok(()) => Ok(Some(witness_note())),
+            Ok(()) => Ok(None),
             Err(e) => {
                 // Stash the real (kind-bearing) error and abort the write with a
                 // sentinel; the stash is re-raised below so `main` sees the original.
@@ -272,8 +278,9 @@ fn map_author_error(err: AuthorError) -> anyhow::Error {
 
 /// Gather every claim field from flags, prompting for absent required fields only
 /// under `--interactive`. By default a missing required field is a loud, machine-
-/// actionable error naming the flag — never a silent default (except `when`, which
-/// sensibly defaults to `on-change`) and never a prompt that could hang an agent.
+/// actionable error naming the flag — never a silent default and never a prompt that
+/// could hang an agent. `--max-age` is optional (a hub hint), so it is never required
+/// or prompted for; omitted, the claim carries no `hub:` block.
 fn gather_draft(args: &AddArgs) -> Result<ClaimDraft> {
     let interactive = args.interactive;
 
@@ -290,26 +297,15 @@ fn gather_draft(args: &AddArgs) -> Result<ClaimDraft> {
     let run = require_field(args.run.clone(), "run", "--run", interactive, || {
         prompt("Check command (exit 0 = holds, exit 1 = drifted): ")
     })?;
-    let max_age = require_field(
-        args.max_age.clone(),
-        "max-age",
-        "--max-age",
-        interactive,
-        || prompt("Max age (e.g. 120d): "),
-    )?;
-
-    // `when` has a sensible default, so it is never prompted for or required.
-    let when = args.when.clone().unwrap_or_else(|| "on-change".to_owned());
 
     Ok(ClaimDraft {
         id,
-        max_age,
+        max_age: args.max_age.clone(),
         checks: vec![CheckDraft {
             kind: CheckDraftKind::Cmd {
                 run,
                 negate: args.negate,
             },
-            when,
         }],
         supports: args.supports.clone(),
         statement,
@@ -528,9 +524,10 @@ fn run_perturbation(root: &std::path::Path, cmd: &str) -> Result<()> {
 }
 
 /// Report a created claim: build the machine record from the shared [`Authored`]
-/// outcome and print the human handoff. The claim and its birth verdict are already
-/// on disk (via [`author_claim`]); this only renders what to commit — the tool does
-/// not commit (invariant #4).
+/// outcome and print the human handoff. The claim file is already on disk (via
+/// [`author_claim`]); this only renders what to commit — the tool does not commit
+/// (invariant #4), and it writes no verdict, so the claim file is the whole of the
+/// handoff.
 fn report_created(
     store: &Store,
     claim: &Claim,
@@ -539,10 +536,7 @@ fn report_created(
     format: Format,
 ) -> Result<()> {
     let file_rel = relative_to(store.root(), &authored.claim_file);
-    let to_commit = vec![
-        file_rel.clone(),
-        relative_to(store.root(), &authored.log_file),
-    ];
+    let to_commit = vec![file_rel.clone()];
 
     let root = store.root().display().to_string();
     let report = AddReport {
@@ -562,13 +556,13 @@ fn report_created(
         if report.witnessed_red {
             println!("The check was witnessed failing in an isolated worktree (extra confidence).");
         }
-        // Abbreviate for the human line only; the recorded value stays the full sha.
+        // Abbreviate for the human line only; the reported value stays the full sha.
         println!(
-            "Recorded the establishing verdict at commit {}.",
+            "The check held against the current tree at commit {}.",
             git::short_commit(&report.commit)
         );
         println!("\nNothing is committed yet. Review, then commit:");
-        // Anchor the paths at the store root with `git -C`, so the printed command
+        // Anchor the path at the store root with `git -C`, so the printed command
         // works from any subdirectory the user ran `claim add` in.
         println!(
             "  git -C {} add {}",
@@ -580,15 +574,6 @@ fn report_created(
             report.root, report.id
         );
     })
-}
-
-/// The evidence note recorded on the establishing entry when `--witness-cmd`
-/// observed the check go red in isolation: proof, in the log, that the check
-/// discriminates. Purely additive confidence — its absence never penalizes a claim.
-fn witness_note() -> String {
-    "witnessed-red: the check was observed reporting Drifted against a perturbed \
-     isolated worktree at `claim add` time, proving it detects this fact going false"
-        .to_owned()
 }
 
 /// Print a check's verdict and evidence as a narration block (human mode only).

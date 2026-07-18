@@ -28,7 +28,7 @@ struct InitReport {
     created: bool,
 }
 
-/// Scaffold `.claims/` and `.claims/log/` in the target directory, idempotently.
+/// Scaffold `.claims/` in the target directory, idempotently.
 ///
 /// The store root is the directory the store lives in — `--dir` when given, else
 /// the current directory. This is where later commands anchor: [`claim_store::discover`]
@@ -37,8 +37,8 @@ struct InitReport {
 ///
 /// # Errors
 ///
-/// Fails if the current directory cannot be read, or the store directories cannot
-/// be created (see [`Store::init`]).
+/// Fails if the current directory cannot be read, or the store directory cannot be
+/// created (see [`Store::init`]).
 pub fn run(args: &InitArgs, format: Format) -> Result<()> {
     let root = match &args.dir {
         Some(dir) => dir.clone(),
@@ -48,13 +48,13 @@ pub fn run(args: &InitArgs, format: Format) -> Result<()> {
     let (store, created) = Store::init(&root)?;
 
     // A store outside a git repository is technically usable but degenerate: `claim
-    // add` cannot attribute a verdict without a commit and identity, so warn rather
-    // than let the user discover it later. Not fatal — `git init` may simply come
-    // next.
+    // add` cannot attribute an authored claim without a commit and identity, so warn
+    // rather than let the user discover it later. Not fatal — `git init` may simply
+    // come next.
     if !is_inside_work_tree(store.root()) {
         warn(
             "this store is not inside a git repository; `claim add` needs one to attribute \
-             verdicts. Run `git init` here before adding claims.",
+             authored claims. Run `git init` here before adding claims.",
         );
     }
 

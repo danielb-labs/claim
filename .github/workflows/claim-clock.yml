@@ -1,20 +1,18 @@
 # The clock lane, as a reusable workflow.
 #
 # A consumer repo calls this from its own scheduled workflow (see examples/consumer/).
-# On a cron it runs `claim check --due` against the trusted default branch, persists
-# the verdicts (this is the trusted context — docs/design/PRODUCT.md section 3: main-branch and
-# clock-lane runs persist), commits the new verdict-log files back, and maintains ONE
+# On a cron it runs `claim check` against the trusted default branch and maintains ONE
 # standing issue titled "claim: due & drifted". The issue is created when there is
 # anything to report, its body is updated to the current queue, and it is closed when
-# the store is clean. This standing issue is the entire v1 nag mechanism: the bell
-# that turns computed staleness into something a human hears.
+# the store is clean. This standing issue is the nag: the bell that turns a drifted or
+# broken claim into something a human hears on a schedule.
 #
-# Persistence is the point of this lane. Because it runs on the default branch with
-# the repo's own token, it has a git identity and write access; the committed verdicts
-# advance each claim's freshness clock so an `every Nd` claim is not perpetually due.
-# A read-only variant (drop the commit step and pass `--report-only`) is documented in
-# docs/ci.md for repos that would rather not commit from CI; it still nags via the
-# issue, it just never resets the due clock.
+# The CLI writes nothing — a verdict is telemetry it reports, never a committed file
+# (invariant #4; see docs/design/CLI-HUB-BOUNDARY.md). So this lane needs no git
+# identity and no write access to the code: it reads the store, runs the checks, and
+# routes the findings through the standing issue. The verdict stream, the schedule, and
+# the staleness clock belong to a hub that ingests the reported `--json` output, not to
+# git and not to this lane.
 
 name: claim clock
 
@@ -37,18 +35,15 @@ on:
         description: The directory containing the .claims/ store to check.
         type: string
         default: .
-      persist:
-        description: Commit the recorded verdicts back to the default branch.
-        type: boolean
-        default: true
 
-# The clock lane persists, so it needs to write commits and manage the standing issue.
+# Least privilege: read the code, manage the standing issue. No `contents: write` — the
+# CLI never writes a verdict, so the lane never commits.
 permissions:
-  contents: write
+  contents: read
   issues: write
 
 # Never overlap scheduled runs against the same store; a second run waits rather than
-# racing the first's commit.
+# racing the first's issue update.
 concurrency:
   group: claim-clock-${{ github.ref }}
   cancel-in-progress: false
@@ -73,62 +68,16 @@ jobs:
           source-path: _claim_tool/crates/claim
           workspace-root: _claim_tool
 
-      # Give the persisting run a git identity so `claim check` can stamp verdicts.
-      # A report-only run (`persist: false`) does not need one, but setting it is
-      # harmless.
-      - name: Configure the committer identity
-        run: |
-          git config user.name "claim-bot"
-          git config user.email "claim-bot@users.noreply.github.com"
-
-      # Persisting (`--due` alone) records verdicts to the log; report-only
-      # (`persist: false`) writes nothing. `|| true` keeps the job green: a drift or
-      # broken check is a finding to route via the issue, not a CI failure.
-      - name: Run due claims
-        working-directory: ${{ inputs.working-directory }}
-        env:
-          PERSIST: ${{ inputs.persist }}
-        run: |
-          if [ "$PERSIST" = "true" ]; then
-            claim --json check --due > "$RUNNER_TEMP/report.json" || true
-          else
-            claim --json check --due --report-only > "$RUNNER_TEMP/report.json" || true
-          fi
-
-      # Commit any new verdict-log files. `git diff --cached --quiet` skips the commit
-      # and push when nothing changed (every check held, or report-only), so a quiet
-      # day makes no commit. This is the "a write to the truth is a commit" invariant
-      # (#4): the only way a verdict reaches the store is a committed file.
-      #
-      # The push is retried under `pull --rebase` because a concurrent push (a merge
-      # landing between checkout and here) would otherwise reject it non-fast-forward,
-      # fail the job, and — worse — SKIP the issue step, so the nag would miss this
-      # cycle. Verdict-log files are append-only under distinct per-verdict paths, so a
-      # rebase never conflicts. If every attempt loses the race the step still exits 0
-      # so the always-run issue step maintains the nag from this run's report; the
-      # unpushed verdicts are re-recorded next cycle (a claim stays due until a verdict
-      # is committed).
-      - name: Commit recorded verdicts
-        if: ${{ inputs.persist }}
+      # Run every claim's checks and report; the CLI persists nothing. `|| true` keeps
+      # the job green: a drift or broken check is a finding to route via the issue, not
+      # a CI failure.
+      - name: Run claims
         working-directory: ${{ inputs.working-directory }}
         run: |
-          git add .claims/log
-          if git diff --cached --quiet; then
-            echo "No new verdicts to commit."
-            exit 0
-          fi
-          git commit -m "chore(claim): record scheduled verdicts"
-          for attempt in 1 2 3; do
-            if git push; then
-              exit 0
-            fi
-            echo "Push rejected (attempt $attempt); rebasing on the remote and retrying."
-            git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" || true
-          done
-          echo "Could not push after 3 attempts; the nag will still be maintained and the verdicts re-recorded next run." >&2
+          claim --json check > "$RUNNER_TEMP/report.json" || true
 
-      # Runs even if the commit step failed (a lost push race), so the nag reflects
-      # this run's report regardless.
+      # `if: always()` so a transient earlier failure never skips the nag — the whole
+      # point of this lane.
       - name: Render the issue body
         id: render
         if: always()
@@ -153,7 +102,7 @@ jobs:
       # Maintain the single standing issue. Found by its marker (in the body) and its
       # label. Open/update when there is a queue; close when clean. Idempotent: at most
       # one open "claim: due & drifted" issue exists at any time. `if: always()` so a
-      # failed push (lost race) never skips the nag — the whole point of this lane.
+      # transient earlier failure never skips the nag — the whole point of this lane.
       - name: Maintain the standing issue
         if: always() && steps.render.outputs.body_file != ''
         uses: actions/github-script@v7

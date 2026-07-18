@@ -12,22 +12,22 @@
 //! on disk is the source of truth, and the same `git` a human runs is the one the
 //! tool consults.
 //!
-//! Two edges are handled deliberately, because [`claim_core::append_entry`] rejects
-//! an empty `commit` or `actor` and an untraceable verdict has no provenance:
+//! Two edges are handled deliberately, because the authoring gate needs a non-empty
+//! `commit` and `actor` and an unattributable claim has no provenance:
 //!
 //! - **No git repository.** Resolving a commit fails with an error naming the fix
-//!   (run inside a git repo). A claim store lives in a git repo by design — a
-//!   write to the truth is a commit — so this is a real misconfiguration, not a
-//!   state to paper over.
+//!   (run inside a git repo). A claim store lives in a git repo by design — the
+//!   truth is a commit — so this is a real misconfiguration, not a state to paper
+//!   over.
 //! - **An unborn HEAD** (a freshly `git init`-ed repo with no commits yet). There
 //!   is no sha to report, so [`resolve_commit`] returns the sentinel
 //!   [`UNBORN_HEAD_SENTINEL`]: git's own all-zero object name, which reads as "no
-//!   commit yet" to anyone who knows git and keeps the log entry's `commit`
-//!   non-empty so it is still a valid, appendable entry. Only a *genuinely* unborn
-//!   HEAD gets the sentinel; a corrupt HEAD stays a loud error rather than being
-//!   masked as "no commit yet".
+//!   commit yet" to anyone who knows git and keeps the resolved `commit` non-empty
+//!   so a claim can still be authored. Only a *genuinely* unborn HEAD gets the
+//!   sentinel; a corrupt HEAD stays a loud error rather than being masked as "no
+//!   commit yet".
 //!
-//! Recorded shas are always the full 40-char form, never `--short`: the abbreviated
+//! Resolved shas are always the full 40-char form, never `--short`: the abbreviated
 //! width is `core.abbrev`-dependent, and the trust substrate must not vary with a
 //! user's config. Abbreviation is display-only ([`short_commit`]).
 
@@ -42,22 +42,20 @@ use crate::error::GitError;
 /// Forty zeros is git's own null object name — the value `HEAD` conceptually points
 /// at before the first commit, and what appears in a reflog's "from" field for an
 /// initial commit. Reusing it means a reader who knows git reads the sentinel
-/// correctly with no new convention to learn, and it satisfies
-/// [`claim_core::append_entry`]'s non-empty-commit requirement so the birth verdict
-/// is a valid entry. Once the author commits the new claim file, every subsequent
-/// verdict resolves a real sha; only the very first entry in a brand-new repo can
-/// carry this.
+/// correctly with no new convention to learn, and it keeps the resolved `commit`
+/// non-empty so a claim can be authored in a brand-new repo. Once the author commits
+/// the new claim file, every subsequent resolution yields a real sha; only the very
+/// first author in a brand-new repo can carry this.
 pub const UNBORN_HEAD_SENTINEL: &str = "0000000000000000000000000000000000000000";
 
-/// Resolve the *full* sha of the repository's current `HEAD`, for a verdict entry's
-/// `commit`.
+/// Resolve the *full* sha of the repository's current `HEAD`, for the provenance a
+/// claim is attributed to.
 ///
 /// The full 40-char sha, not `--short`: the abbreviated form respects the user's
-/// `core.abbrev` config, so recording it would make the trust substrate (the
-/// verdict log) vary in width and content with local configuration, and be
-/// inconsistent with the 40-char unborn sentinel. The full sha is
-/// configuration-independent; callers abbreviate only for human display
-/// ([`short_commit`]).
+/// `core.abbrev` config, so resolving it would make the recorded provenance vary in
+/// width and content with local configuration, and be inconsistent with the 40-char
+/// unborn sentinel. The full sha is configuration-independent; callers abbreviate
+/// only for human display ([`short_commit`]).
 ///
 /// `dir` is any path inside the repository (the store root); git discovers the
 /// repository from it. On an unborn HEAD this returns [`UNBORN_HEAD_SENTINEL`]
@@ -107,20 +105,20 @@ pub fn short_commit(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-/// Resolve the author identity for a verdict entry's `actor`, as `Name <email>`.
+/// Resolve the author identity a claim is attributed to, as `Name <email>`.
 ///
 /// Reads `user.name` and `user.email` from git config (which merges repo-local and
-/// global config exactly as a commit would), so the actor cached in the log matches
-/// the identity a subsequent `git commit` will stamp on the entry. This is a
+/// global config exactly as a commit would), so the resolved actor matches the
+/// identity a subsequent `git commit` will stamp on the authored claim. This is a
 /// convenience for display; the authoritative author remains the commit that adds
 /// the file (invariant #3).
 ///
 /// # Errors
 ///
 /// Returns [`GitError::MissingIdentity`] when either `user.name` or `user.email` is
-/// unset, naming the `git config` command to set it. An unattributed verdict has no
-/// provenance ([`claim_core::append_entry`] rejects an empty actor), so a missing
-/// identity is a loud error, not a silent blank.
+/// unset, naming the `git config` command to set it. An unattributed claim has no
+/// provenance (the authoring gate requires a non-empty actor), so a missing identity
+/// is a loud error, not a silent blank.
 pub fn resolve_actor(dir: &Path) -> Result<String, GitError> {
     let name = git_config(dir, "user.name")?;
     let email = git_config(dir, "user.email")?;

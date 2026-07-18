@@ -1,9 +1,9 @@
 //! Integration tests for `claim check`, against real temp git stores.
 //!
-//! The exit-code contract (0 held, 1 review, 2 broken, highest wins) and the
-//! `--report-only` no-write guarantee are the adversarial targets, so each has a
-//! direct test. Time is pinned with the `CLAIM_NOW` seam where the due decision
-//! needs it; otherwise checks are driven against a controlled tree.
+//! `check` is a stateless runtime verifier: it runs every claim's checks and
+//! reports `held`/`drifted`/`broken` now, storing nothing. The exit-code contract
+//! (0 held, 1 review, 2 broken, highest wins) and the never-persists guarantee are
+//! the adversarial targets, so each has a direct test.
 
 mod common;
 
@@ -11,9 +11,9 @@ use common::TestRepo;
 use predicates::prelude::*;
 
 /// A claim file whose cmd check holds iff `requirements.txt` pins libfoo at 4.2.
-fn pin_claim(id: &str, when: &str) -> String {
+fn pin_claim(id: &str) -> String {
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n    when: {when}\nmax-age: 120d\n---\nWe pin libfoo at 4.2.\n"
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n---\nWe pin libfoo at 4.2.\n"
     )
 }
 
@@ -25,54 +25,48 @@ fn ready_repo() -> TestRepo {
 }
 
 #[test]
-fn a_holding_check_is_held_appended_and_exit_zero() {
+fn a_holding_check_is_held_and_exit_zero() {
     let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    repo.write_claim("pin", &pin_claim("pin"));
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("held"));
 
-    // The verdict was appended.
-    assert_eq!(
-        repo.log_count("pin"),
-        1,
-        "a persisting run writes one verdict"
+    // The CLI stores nothing: no verdict log tree is created.
+    assert!(
+        !repo.exists(".claims/log"),
+        "check must not create a verdict log"
     );
-    let entries = repo.log_entries("pin");
-    assert_eq!(entries[0]["event"]["verdict"], "held");
 }
 
 #[test]
 fn a_failing_check_is_drifted_and_exit_one() {
     let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    repo.write_claim("pin", &pin_claim("pin"));
     // Break the fact.
     repo.write("requirements.txt", "libfoo==5.0\n");
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("drifted"));
-
-    assert_eq!(repo.log_entries("pin")[0]["event"]["verdict"], "drifted");
 }
 
 #[test]
 fn a_broken_check_is_broken_and_exit_two() {
     let repo = ready_repo();
-    // A command that cannot run: the grep target is fine, but the command itself
-    // exits non-0/1 (127 for not-found) → Broken.
+    // A command that cannot run: it exits non-0/1 (127 for not-found) → Broken.
     repo.write_claim(
         "broken",
-        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"this-binary-does-not-exist-xyz\"\n    when: on-change\nmax-age: 120d\n---\nA claim with a broken check.\n",
+        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"this-binary-does-not-exist-xyz\"\n---\nA claim with a broken check.\n",
     );
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
@@ -80,151 +74,38 @@ fn a_broken_check_is_broken_and_exit_two() {
 
 #[test]
 fn a_plain_readme_in_the_store_is_ignored_and_check_succeeds() {
-    // The dogfooding bug: a plain `.claims/README.md` (no frontmatter fence) is a
-    // document, not a claim, and must not be parsed. Without the scanner fix it
-    // fails "missing frontmatter" and forces `check` to exit 2, silencing the whole
-    // store. Here it coexists with a real claim: the claim is checked, the README is
-    // skipped, and the run is a clean exit 0.
+    // A plain `.claims/README.md` (no frontmatter fence) is a document, not a claim,
+    // and must not be parsed. Here it coexists with a real claim: the claim is
+    // checked, the README is skipped, and the run is a clean exit 0.
     let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    repo.write_claim("pin", &pin_claim("pin"));
     repo.write(
         ".claims/README.md",
         "# Our claim store\n\nThis directory holds the repo's claims.\n",
     );
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("held"))
         .stdout(predicate::str::contains("README").not());
-
-    // The good claim did not merely fail to error — it actually ran and persisted its
-    // verdict, so the README's presence did not quietly skip the real work.
-    assert_eq!(
-        repo.log_count("pin"),
-        1,
-        "the real claim still ran and recorded a verdict alongside the README"
-    );
 }
 
 #[test]
 fn a_frontmatter_fenced_but_malformed_claim_stays_a_loud_error() {
-    // The other half of the scanner rule: a file that *opens with a `---` fence*
-    // declared its intent to be a claim, so malformed YAML under it must stay a loud
-    // exit-2 error naming the file — never silently skipped as if it were a plain
-    // doc. Invariant #6: a real-but-broken claim is never dropped.
+    // A file that *opens with a `---` fence* declared its intent to be a claim, so
+    // malformed YAML under it must stay a loud exit-2 error naming the file — never
+    // silently skipped. Invariant #6: a real-but-broken claim is never dropped.
     let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
-    // Opens with the fence, but the YAML is unterminated.
+    repo.write_claim("pin", &pin_claim("pin"));
     repo.write(".claims/broken.md", "---\nchecks: [unclosed\n---\nS.\n");
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains(".claims/broken.md"));
-}
-
-#[test]
-fn report_only_writes_no_log_entry_but_still_reports_and_sets_exit() {
-    let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
-    repo.write("requirements.txt", "libfoo==5.0\n"); // drifted
-
-    repo.claim()
-        .args(["check", "--all", "--report-only"])
-        .assert()
-        .code(1) // the exit code is still set from the verdict
-        .stdout(predicate::str::contains("drifted"))
-        .stdout(predicate::str::contains("report-only"));
-
-    // Nothing was written: no log directory, no entries.
-    assert_eq!(
-        repo.log_count("pin"),
-        0,
-        "--report-only must not append any verdict"
-    );
-    assert!(
-        !repo.exists(".claims/log/pin"),
-        "--report-only must not even create the log directory"
-    );
-}
-
-#[test]
-fn report_only_needs_no_git_identity() {
-    // The fork-PR mode must work where no git identity is configured (a persisting
-    // run would fail resolving the actor). Build a repo with NO user.name/email.
-    let repo = TestRepo::no_identity();
-    repo.claim().arg("init").assert().success();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
-
-    repo.claim()
-        .args(["check", "--all", "--report-only"])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("held"));
-
-    // And a persisting run in the same repo *does* fail for lack of identity,
-    // confirming report-only genuinely skipped provenance rather than getting lucky.
-    repo.claim()
-        .args(["check", "--all"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("user.name").or(predicate::str::contains("user.email")));
-}
-
-#[test]
-fn a_persisting_run_with_nothing_selected_needs_no_identity() {
-    // A persisting `--due` run that selects nothing (the every-30d claim is not yet
-    // due) must not fail for a missing git identity it would never use: provenance
-    // is resolved only when there is work to persist.
-    let repo = TestRepo::no_identity();
-    repo.claim().arg("init").assert().success();
-    repo.write_claim("slow", &pin_claim("slow", "every 30d"));
-    repo.write_verdict("slow", "2026-07-15T00:00:00Z", "held"); // 2 days before NOW
-
-    repo.claim_at("2026-07-17T00:00:00Z")
-        .args(["check", "--due"])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("No due claims"));
-}
-
-#[test]
-fn due_skips_a_not_yet_due_claim_and_runs_an_overdue_and_on_change_one() {
-    let repo = ready_repo();
-    // Three claims: a slow one recently run (not due), a slow one long overdue
-    // (due), and an on-change one (always due).
-    repo.write_claim("slow-fresh", &pin_claim("slow-fresh", "every 30d"));
-    repo.write_claim("slow-stale", &pin_claim("slow-stale", "every 30d"));
-    repo.write_claim("fast", &pin_claim("fast", "on-change"));
-
-    // slow-fresh last ran 5 days before `now`; slow-stale 200 days before.
-    repo.write_verdict("slow-fresh", "2026-07-12T00:00:00Z", "held");
-    repo.write_verdict("slow-stale", "2026-01-01T00:00:00Z", "held");
-
-    let now = "2026-07-17T00:00:00Z";
-    repo.claim_at(now).args(["check", "--due"]).assert().code(0);
-
-    // slow-fresh must NOT have a new verdict (still just the one we seeded).
-    assert_eq!(
-        repo.log_count("slow-fresh"),
-        1,
-        "a not-yet-due every-30d claim is skipped by --due"
-    );
-    // slow-stale ran (seeded 1 + this run's 1 = 2).
-    assert_eq!(
-        repo.log_count("slow-stale"),
-        2,
-        "an overdue every-30d claim runs under --due"
-    );
-    // fast ran (no seed, so exactly this run's 1).
-    assert_eq!(
-        repo.log_count("fast"),
-        1,
-        "an on-change claim always runs under --due"
-    );
 }
 
 #[test]
@@ -233,11 +114,11 @@ fn an_unresolved_support_is_exit_one_even_when_the_check_holds() {
     // A claim that holds but supports a decision ref whose file does not exist.
     repo.write_claim(
         "orphan",
-        "---\nid: orphan\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n    when: on-change\nmax-age: 120d\nsupports:\n  - deleted-decision.md#anchor\n---\nSupports a deleted decision.\n",
+        "---\nid: orphan\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\nsupports:\n  - deleted-decision.md#anchor\n---\nSupports a deleted decision.\n",
     );
 
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("held"))
@@ -248,18 +129,18 @@ fn an_unresolved_support_is_exit_one_even_when_the_check_holds() {
 fn highest_code_wins_across_a_mixed_store() {
     let repo = ready_repo();
     // Held, drifted, and broken claims together → overall exit 2.
-    repo.write_claim("held", &pin_claim("held", "on-change"));
+    repo.write_claim("held", &pin_claim("held"));
     repo.write_claim(
         "broken",
-        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"nonexistent-cmd-abc\"\n    when: on-change\nmax-age: 120d\n---\nBroken.\n",
+        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"nonexistent-cmd-abc\"\n---\nBroken.\n",
     );
     // A drifted claim: grep for a string not present.
     repo.write_claim(
         "drifted",
-        "---\nid: drifted\nchecks:\n  - kind: cmd\n    run: \"grep -q 'not-in-file' requirements.txt\"\n    when: on-change\nmax-age: 120d\n---\nDrifted.\n",
+        "---\nid: drifted\nchecks:\n  - kind: cmd\n    run: \"grep -q 'not-in-file' requirements.txt\"\n---\nDrifted.\n",
     );
 
-    repo.claim().args(["check", "--all"]).assert().code(2);
+    repo.claim().arg("check").assert().code(2);
 }
 
 #[test]
@@ -270,12 +151,12 @@ fn an_agent_check_with_no_runner_is_unverifiable_exit_one_never_a_pass() {
     let repo = ready_repo();
     repo.write_claim(
         "agentic",
-        "---\nid: agentic\nchecks:\n  - kind: agent\n    instruction: investigate the changelog\n    when: every 30d\nmax-age: 120d\n---\nNeeds an agent to verify.\n",
+        "---\nid: agentic\nchecks:\n  - kind: agent\n    instruction: investigate the changelog\n---\nNeeds an agent to verify.\n",
     );
 
     repo.claim()
         .env_remove("CLAIM_AGENT_CMD")
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("unverifiable"));
@@ -285,7 +166,7 @@ fn an_agent_check_with_no_runner_is_unverifiable_exit_one_never_a_pass() {
 /// whatever runner `CLAIM_AGENT_CMD` names (or, unset, Unverifiable).
 fn agent_claim(id: &str) -> String {
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: agent\n    instruction: is the CJK corruption still unfixed in libfoo 5.x?\n    when: on-change\nmax-age: 120d\n---\nWe pin libfoo at 4.2 because 5.x corrupts CJK PDFs.\n"
+        "---\nid: {id}\nchecks:\n  - kind: agent\n    instruction: is the CJK corruption still unfixed in libfoo 5.x?\n---\nWe pin libfoo at 4.2 because 5.x corrupts CJK PDFs.\n"
     )
 }
 
@@ -307,7 +188,7 @@ fn write_mock_runner(repo: &TestRepo, stdout_line: &str) -> String {
 }
 
 #[test]
-fn agent_check_with_runner_reports_held_and_persists_the_evidence() {
+fn agent_check_with_runner_reports_held_and_its_evidence() {
     let repo = ready_repo();
     repo.write_claim("agentic", &agent_claim("agentic"));
     let runner = write_mock_runner(
@@ -318,7 +199,7 @@ fn agent_check_with_runner_reports_held_and_persists_the_evidence() {
     let output = repo
         .claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(0)
         .get_output()
@@ -329,14 +210,6 @@ fn agent_check_with_runner_reports_held_and_persists_the_evidence() {
     let evidence = v["claims"][0]["checks"][0]["evidence"].as_str().unwrap();
     assert!(evidence.contains("no CJK fix"), "evidence: {evidence}");
     assert!(evidence.contains("CHANGELOG.md"), "citations: {evidence}");
-
-    // The held verdict and its evidence were written to the log.
-    let entries = repo.log_entries("agentic");
-    assert_eq!(entries[0]["event"]["verdict"], "held");
-    assert!(entries[0]["event"]["evidence"]
-        .as_str()
-        .unwrap()
-        .contains("no CJK fix"));
 }
 
 #[test]
@@ -350,7 +223,7 @@ fn agent_check_with_runner_reports_drifted() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("drifted"));
@@ -367,19 +240,17 @@ fn agent_runner_malformed_output_is_broken_never_held() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
-
-    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
 }
 
 #[test]
 fn agent_runner_conflicting_verdicts_is_broken_never_a_chosen_pass() {
     // C1 end-to-end: a narrating runner emits a tentative held then a corrected
     // drifted. Neither wins — the run did not cleanly conclude, so it is Broken
-    // (exit 2), and no false Held is committed to the log.
+    // (exit 2), and no false Held is reported.
     let repo = ready_repo();
     repo.write_claim("agentic", &agent_claim("agentic"));
     let runner = write_mock_runner(
@@ -389,14 +260,10 @@ fn agent_runner_conflicting_verdicts_is_broken_never_a_chosen_pass() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
-
-    let verdict = &repo.log_entries("agentic")[0]["event"]["verdict"];
-    assert_eq!(verdict, "broken", "conflicting verdicts must record broken");
-    assert_ne!(verdict, "held", "a conflicted run must never commit a held");
 }
 
 #[test]
@@ -409,18 +276,16 @@ fn agent_runner_duplicate_verdict_key_is_broken() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
-    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
 }
 
 #[test]
 fn agent_runner_stderr_decoy_is_not_a_verdict() {
-    // Finding #2 end-to-end: a well-formed held written to STDERR, with nothing
-    // parseable on stdout, must be Broken — stderr is diagnostics, never a verdict
-    // source.
+    // A well-formed held written to STDERR, with nothing parseable on stdout, must be
+    // Broken — stderr is diagnostics, never a verdict source.
     let repo = ready_repo();
     repo.write_claim("agentic", &agent_claim("agentic"));
     repo.write(
@@ -436,11 +301,10 @@ fn agent_runner_stderr_decoy_is_not_a_verdict() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", path.to_string_lossy().as_ref())
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
-    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
 }
 
 #[test]
@@ -461,7 +325,7 @@ fn agent_runner_nonzero_exit_is_broken() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", path.to_string_lossy().as_ref())
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stdout(predicate::str::contains("broken"));
@@ -478,14 +342,14 @@ fn same_agent_claim_is_unverifiable_without_the_runner() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", &runner)
-        .args(["check", "--all", "--report-only"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("held"));
 
     repo.claim()
         .env_remove("CLAIM_AGENT_CMD")
-        .args(["check", "--all", "--report-only"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("unverifiable"));
@@ -500,7 +364,7 @@ fn empty_agent_cmd_is_a_loud_error_not_a_silent_fallback() {
 
     repo.claim()
         .env("CLAIM_AGENT_CMD", "   ")
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(2)
         .stderr(predicate::str::contains("CLAIM_AGENT_CMD"));
@@ -509,11 +373,11 @@ fn empty_agent_cmd_is_a_loud_error_not_a_silent_fallback() {
 #[test]
 fn check_json_shape_is_stable() {
     let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    repo.write_claim("pin", &pin_claim("pin"));
 
     let output = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(0)
         .get_output()
@@ -523,21 +387,14 @@ fn check_json_shape_is_stable() {
     let v: serde_json::Value =
         serde_json::from_slice(&output).expect("check --json is one JSON object");
     assert_eq!(v["status"], "ok");
-    assert_eq!(v["selection"], "all");
-    assert_eq!(v["report_only"], false);
-    assert!(
-        v["now"].is_string(),
-        "the envelope records the computed-at instant"
-    );
     assert_eq!(v["exit"], 0);
     assert_eq!(v["checked"], 1);
     assert_eq!(v["errors"].as_array().unwrap().len(), 0);
     let claims = v["claims"].as_array().unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0]["id"], "pin");
-    assert_eq!(claims[0]["persisted"], true);
     assert_eq!(claims[0]["checks"][0]["verdict"], "held");
-    // m9: the structured ProcessEnd is present alongside the human `detail`, so an
+    // The structured ProcessEnd is present alongside the human `detail`, so an
     // agent branches on structure, not prose.
     assert_eq!(claims[0]["checks"][0]["end"]["kind"], "exited");
     assert_eq!(claims[0]["checks"][0]["end"]["code"], 0);
@@ -546,36 +403,17 @@ fn check_json_shape_is_stable() {
 }
 
 #[test]
-fn report_only_json_marks_the_run_and_each_claim() {
-    // m6: assert the report_only:true case (only the false case was covered).
-    let repo = ready_repo();
-    repo.write_claim("pin", &pin_claim("pin", "on-change"));
-
-    let output = repo
-        .claim()
-        .args(["--json", "check", "--all", "--report-only"])
-        .assert()
-        .code(0)
-        .get_output()
-        .stdout
-        .clone();
-    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(v["report_only"], true);
-    assert_eq!(v["claims"][0]["persisted"], false);
-}
-
-#[test]
 fn a_broken_check_json_carries_the_structured_end() {
-    // m9: a broken check's structured `end` lets an agent see 'not found' (exit
-    // 127) without parsing English. A missing binary spawns then exits 127.
+    // A broken check's structured `end` lets an agent see 'not found' (exit 127)
+    // without parsing English. A missing binary spawns then exits 127.
     let repo = ready_repo();
     repo.write_claim(
         "broken",
-        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"this-binary-does-not-exist-xyz\"\n    when: on-change\nmax-age: 120d\n---\nBroken.\n",
+        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"this-binary-does-not-exist-xyz\"\n---\nBroken.\n",
     );
     let output = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(2)
         .get_output()
@@ -592,51 +430,23 @@ fn a_broken_check_json_carries_the_structured_end() {
 fn check_with_no_claims_reports_the_full_phrase() {
     let repo = ready_repo();
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("No claims to check."));
-}
-
-#[test]
-fn check_skips_a_retired_claim_under_all_and_due() {
-    // M3: a retired claim is terminal — checking it would resurface it (and a
-    // retired-because-failing check would break CI). It must be skipped and no new
-    // verdict written, under both --all and --due.
-    let repo = ready_repo();
-    repo.write_claim("done", &pin_claim("done", "on-change"));
-    repo.write_verdict("done", "2026-07-10T00:00:00Z", "held");
-    repo.write_retirement(
-        "done",
-        "2026-07-11T00:00:00Z",
-        "closed: replaced by a real test",
-    );
-    let before = repo.log_count("done");
-
-    repo.claim_at("2026-07-17T00:00:00Z")
-        .args(["check", "--all"])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("No claims to check."));
-    assert_eq!(
-        repo.log_count("done"),
-        before,
-        "a retired claim gets no new verdict"
-    );
 }
 
 #[test]
 fn a_duplicate_id_across_two_files_is_a_loud_error_naming_both() {
-    // C1: two files sharing an id share one verdict log, so a drifted fact could
-    // read as verified. `check` must error loudly, naming both files, and not run
-    // the ambiguous claim.
+    // Two files sharing an id conflate the recorded fact. `check` must error loudly,
+    // naming both files, and not run the ambiguous claim.
     let repo = ready_repo();
-    repo.write_claim("dup-a", &pin_claim("shared", "on-change"));
-    repo.write_claim("dup-b", &pin_claim("shared", "on-change"));
+    repo.write_claim("dup-a", &pin_claim("shared"));
+    repo.write_claim("dup-b", &pin_claim("shared"));
 
     let output = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(2)
         .get_output()
@@ -658,32 +468,29 @@ fn a_duplicate_id_across_two_files_is_a_loud_error_naming_both() {
             "the message names the shared id"
         );
     }
-    // The ambiguous claim did not run: no verdict was appended under the shared id.
-    assert_eq!(repo.log_count("shared"), 0);
 }
 
 #[test]
 fn a_malformed_sibling_does_not_stop_checking_the_good_claims() {
-    // M1: one bad file must not brick the run. The good claim still checks and
-    // persists; the bad one is reported; the exit is floored at 2. The bad sibling
-    // must *open with a frontmatter fence* to count as a broken claim (a fenceless
-    // doc is a skipped non-claim now); its YAML is then malformed.
+    // One bad file must not brick the run. The good claim still checks; the bad one
+    // is reported; the exit is floored at 2. The bad sibling must *open with a
+    // frontmatter fence* to count as a broken claim (a fenceless doc is a skipped
+    // non-claim); its YAML is then malformed.
     let repo = ready_repo();
-    repo.write_claim("good", &pin_claim("good", "on-change"));
+    repo.write_claim("good", &pin_claim("good"));
     repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
 
     let output = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(2)
         .get_output()
         .stdout
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    // The good claim ran and was recorded.
+    // The good claim ran.
     assert_eq!(v["claims"][0]["id"], "good");
-    assert_eq!(repo.log_count("good"), 1, "the good claim still persisted");
     // The bad file is reported.
     let errors = v["errors"].as_array().unwrap();
     assert_eq!(errors.len(), 1);
@@ -697,7 +504,7 @@ fn a_malformed_sibling_does_not_stop_checking_the_good_claims() {
 /// from the check itself passing.
 fn drifting_claim_with_skip(id: &str, skip_yaml: &str) -> String {
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"false\"\n    when: on-change\n{skip_yaml}max-age: \"30d\"\n---\nWould drift, but is skipped.\n"
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"false\"\n{skip_yaml}---\nWould drift, but is skipped.\n"
     )
 }
 
@@ -712,17 +519,14 @@ fn an_unconditional_skip_is_green_and_records_no_verdict() {
         ),
     );
 
-    // A persisting run (not --report-only): the check would drift, but the skip
-    // suppresses it, so the run is green and reports the reason.
+    // The check would drift, but the skip suppresses it, so the run is green and
+    // reports the reason. A skip is not a pass.
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("skipped"))
         .stdout(predicate::str::contains("no runner in this environment"));
-
-    // A skip is not a verification (invariant #4): nothing was written to the log.
-    assert_eq!(repo.log_count("parked"), 0, "a skip records no verdict");
 }
 
 #[test]
@@ -739,15 +543,10 @@ fn unless_true_cancels_the_skip_and_the_check_runs() {
     // `unless` succeeds (exit 0), so the skip is cancelled and the failing check runs
     // and drifts — proving an environment that can verify does.
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("drifted"));
-    assert_eq!(
-        repo.log_count("parked"),
-        1,
-        "a run whose skip was cancelled records its verdict"
-    );
 }
 
 #[test]
@@ -761,11 +560,10 @@ fn unless_false_leaves_the_skip_in_force() {
         ),
     );
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(0)
         .stdout(predicate::str::contains("skipped"));
-    assert_eq!(repo.log_count("parked"), 0);
 }
 
 #[test]
@@ -777,7 +575,7 @@ fn a_skip_json_shape_is_stable_and_carries_no_verdict() {
     );
     let out = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(0)
         .get_output()
@@ -807,12 +605,12 @@ fn a_skip_does_not_mask_a_sibling_checks_drift() {
     let repo = ready_repo();
     repo.write_claim(
         "mixed",
-        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n    skip:\n      reason: parked\n  - kind: cmd\n    run: \"false\"\n    when: on-change\nmax-age: 30d\n---\nOne check skipped, one drifts.\n",
+        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"true\"\n    skip:\n      reason: parked\n  - kind: cmd\n    run: \"false\"\n---\nOne check skipped, one drifts.\n",
     );
 
     let out = repo
         .claim()
-        .args(["--json", "check", "--all"])
+        .args(["--json", "check"])
         .assert()
         .code(1)
         .get_output()
@@ -839,10 +637,9 @@ fn a_skip_does_not_mask_a_sibling_checks_drift() {
 }
 
 #[test]
-fn a_broken_unless_runs_the_check_at_the_cli_never_mutes() {
-    // The CLI counterpart to the core broken-`unless` test: an `unless` that cannot
-    // be evaluated (exit 3) must run the failing check and surface the drift, never
-    // silently skip it.
+fn a_broken_unless_runs_the_check_and_never_mutes() {
+    // An `unless` that cannot be evaluated (exit 3) must run the failing check and
+    // surface the drift, never silently skip it.
     let repo = ready_repo();
     repo.write_claim(
         "parked",
@@ -852,15 +649,10 @@ fn a_broken_unless_runs_the_check_at_the_cli_never_mutes() {
         ),
     );
     repo.claim()
-        .args(["check", "--all"])
+        .arg("check")
         .assert()
         .code(1)
         .stdout(predicate::str::contains("drifted"));
-    assert_eq!(
-        repo.log_count("parked"),
-        1,
-        "a run that was not skipped is recorded"
-    );
 }
 
 #[test]
@@ -877,8 +669,8 @@ fn an_expired_until_runs_the_check_and_reports_the_lapse() {
     );
 
     let out = repo
-        .claim_at("2026-07-18T00:00:00Z")
-        .args(["--json", "check", "--all"])
+        .claim()
+        .args(["--json", "check"])
         .assert()
         .code(1)
         .get_output()
@@ -893,29 +685,5 @@ fn an_expired_until_runs_the_check_and_reports_the_lapse() {
             .unwrap_or_default()
             .contains("skip expired"),
         "the lapse is reported in the note: {check}"
-    );
-    repo.claim_at("2026-07-18T00:00:00Z")
-        .args(["check", "--all"])
-        .assert()
-        .code(1)
-        .stdout(predicate::str::contains("skip expired"));
-}
-
-#[test]
-fn a_skip_under_report_only_is_green_reports_and_writes_nothing() {
-    let repo = ready_repo();
-    repo.write_claim(
-        "parked",
-        &drifting_claim_with_skip("parked", "    skip:\n      reason: parked\n"),
-    );
-    repo.claim()
-        .args(["check", "--all", "--report-only"])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("skipped"));
-    assert_eq!(
-        repo.log_count("parked"),
-        0,
-        "report-only writes nothing, and neither does a skip"
     );
 }

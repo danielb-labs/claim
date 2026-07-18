@@ -1,10 +1,11 @@
-//! Integration tests for `claim amend <id>`: fixing a claim in place while keeping
-//! its history.
+//! Integration tests for `claim amend <id>`: fixing a claim in place.
 //!
-//! The load-bearing assertions here are the amend guarantee — an amend cannot green
-//! a claim whose new fact is false — and history preservation: the verdict log from
-//! before the amend must still exist afterward. Both are exercised against a real
-//! temp git repo whose `requirements.txt` is the tree the checks read.
+//! The load-bearing assertion here is the amend guarantee — an amend cannot green a
+//! claim whose new fact is false: the amended check is run against the current tree
+//! and a non-`Held` result writes nothing. Amend writes no verdict (the changelog is
+//! git history), so a successful amend's whole output is the one rewritten file to
+//! commit. Both are exercised against a real temp git repo whose `requirements.txt`
+//! is the tree the checks read.
 
 mod common;
 
@@ -15,12 +16,12 @@ use predicates::prelude::*;
 /// holds or drifts against the seeded tree deterministically.
 fn claim_file(id: &str, run: &str, statement: &str) -> String {
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"{run}\"\n    when: on-change\nmax-age: 30d\n---\n{statement}\n"
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"{run}\"\nhub:\n  max-age: 30d\n---\n{statement}\n"
     )
 }
 
 /// Seed a claim whose check currently *drifts*: the tree pins libfoo 5.0 but the
-/// check asserts 4.2. Plus a held-then-drifted history to prove preservation.
+/// check asserts 4.2. This is the mid-drift state amend brings back to the truth.
 fn drifted_repo() -> TestRepo {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
@@ -34,15 +35,12 @@ fn drifted_repo() -> TestRepo {
             "We pin libfoo at 4.2.",
         ),
     );
-    repo.write_verdict("pin", "2026-07-01T00:00:00Z", "held");
-    repo.write_verdict("pin", "2026-07-10T00:00:00Z", "drifted");
     repo
 }
 
 #[test]
-fn amend_to_the_new_truth_rewrites_the_file_and_appends_a_held() {
+fn amend_to_the_new_truth_rewrites_the_file_and_writes_no_verdict() {
     let repo = drifted_repo();
-    assert_eq!(repo.log_count("pin"), 2, "held + drifted seeded");
 
     repo.claim()
         .args([
@@ -56,33 +54,22 @@ fn amend_to_the_new_truth_rewrites_the_file_and_appends_a_held() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Amended claim 'pin'"))
-        .stdout(predicate::str::contains("history is preserved"));
+        .stdout(predicate::str::contains(
+            "confirmed Held against the current tree",
+        ));
 
     // The file is rewritten in place, and re-parseable (it went through the same
-    // render-then-parse path as `add`). `log` reads it back without error.
-    let out = repo
-        .claim()
-        .args(["--json", "log", "pin"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(v["definition"]["statement"], "We pin libfoo at 5.0.");
-    assert_eq!(
-        v["definition"]["checks"][0]["detail"],
-        "grep -q libfoo==5.0 requirements.txt"
+    // render-then-parse path as `add`). The new statement and check are on disk.
+    let file = repo.read(".claims/pin.md");
+    assert!(file.contains("We pin libfoo at 5.0."));
+    assert!(file.contains("grep -q libfoo==5.0 requirements.txt"));
+    assert!(
+        !file.contains("We pin libfoo at 4.2."),
+        "the old statement is replaced, not appended"
     );
 
-    // History preserved: the original two entries survive, plus the confirming Held.
-    assert_eq!(repo.log_count("pin"), 3);
-    let entries = v["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0]["verdict"], "held"); // 07-01, seeded
-    assert_eq!(entries[1]["verdict"], "drifted"); // 07-10, seeded — still on record
-    assert_eq!(entries[2]["verdict"], "held"); // the amend's confirming verdict
-    assert!(entries[2]["evidence"].as_str().unwrap().contains("amended"));
+    // Amend writes no verdict — the CLI stores nothing.
+    assert!(!repo.exists(".claims/log"), "amend writes no verdict log");
 }
 
 #[test]
@@ -104,12 +91,11 @@ fn amend_is_refused_when_the_amended_check_does_not_hold() {
         .stderr(predicate::str::contains("Drifted"))
         .stderr(predicate::str::contains("Nothing was written"));
 
-    // The file is untouched and the log did not grow.
+    // The file is untouched.
     assert!(repo
         .read(".claims/pin.md")
         .contains("We pin libfoo at 4.2."));
     assert!(!repo.read(".claims/pin.md").contains("still wrong"));
-    assert_eq!(repo.log_count("pin"), 2, "no verdict appended on refusal");
 }
 
 #[test]
@@ -124,7 +110,6 @@ fn amend_is_refused_when_the_amended_check_is_broken() {
         .code(2)
         .stderr(predicate::str::contains("Broken"))
         .stderr(predicate::str::contains("Nothing was written"));
-    assert_eq!(repo.log_count("pin"), 2);
     // The file is byte-for-byte unchanged (m4): a Broken refusal writes nothing.
     assert_eq!(repo.read(".claims/pin.md"), before);
 }
@@ -165,45 +150,22 @@ fn amend_changing_check_and_statement_together() {
         !v["root"].as_str().unwrap().is_empty(),
         "root is present and non-empty"
     );
-    // Two paths to commit: the rewritten file and the new verdict.
-    assert_eq!(v["to_commit"].as_array().unwrap().len(), 2);
-    assert_eq!(v["to_commit"][0], ".claims/pin.md");
-}
-
-#[test]
-fn amend_resolves_drift_so_status_becomes_verified() {
-    // After a successful amend the claim's computed status flips drifted -> verified.
-    // `now` is pinned on both the amend (so the confirming Held is stamped at this
-    // instant, via the clock seam) and the list (so it reads that Held as fresh).
-    let repo = drifted_repo();
-    repo.claim_at("2026-07-18T00:00:00Z")
-        .args([
-            "amend",
-            "pin",
-            "--statement",
-            "We pin libfoo at 5.0.",
-            "--run",
-            "grep -q libfoo==5.0 requirements.txt",
-        ])
-        .assert()
-        .success();
-
-    repo.claim_at("2026-07-18T00:00:00Z")
-        .args(["list"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("verified"));
+    // Only the rewritten file is committed — no verdict is written.
+    let to_commit = v["to_commit"].as_array().unwrap();
+    assert_eq!(to_commit.len(), 1, "only the rewritten file to commit");
+    assert_eq!(to_commit[0], ".claims/pin.md");
 }
 
 #[test]
 fn amend_with_no_fields_is_a_no_op_error() {
     let repo = drifted_repo();
+    let before = repo.read(".claims/pin.md");
     repo.claim()
         .args(["amend", "pin"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("changed nothing"));
-    assert_eq!(repo.log_count("pin"), 2);
+    assert_eq!(repo.read(".claims/pin.md"), before, "no-op writes nothing");
 }
 
 #[test]
@@ -215,7 +177,6 @@ fn amend_with_only_unchanged_fields_is_a_no_op_error() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("changed nothing"));
-    assert_eq!(repo.log_count("pin"), 2);
 }
 
 #[test]
@@ -273,7 +234,7 @@ fn amend_refuses_a_multi_check_claim_rather_than_dropping_a_check() {
     // renderer, so amend refuses loudly instead of silently dropping the second.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    let two_checks = "---\nid: multi\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n  - kind: cmd\n    run: \"true\"\n    when: every 30d\nmax-age: 30d\n---\nTwo checks.\n";
+    let two_checks = "---\nid: multi\nchecks:\n  - kind: cmd\n    run: \"true\"\n  - kind: cmd\n    run: \"true\"\nhub:\n  max-age: 30d\n---\nTwo checks.\n";
     repo.write_claim("multi", two_checks);
 
     repo.claim()
@@ -292,7 +253,7 @@ fn amend_refuses_a_skip_bearing_check_rather_than_dropping_the_skip() {
     // loudly, like the multi-check case above.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    let with_skip = "---\nid: parked\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n    skip:\n      reason: no runner in CI\n      unless: \"true\"\nmax-age: 30d\n---\nA parked claim.\n";
+    let with_skip = "---\nid: parked\nchecks:\n  - kind: cmd\n    run: \"true\"\n    skip:\n      reason: no runner in CI\n      unless: \"true\"\nhub:\n  max-age: 30d\n---\nA parked claim.\n";
     repo.write_claim("parked", with_skip);
 
     repo.claim()
@@ -309,7 +270,7 @@ fn amend_refuses_a_skip_bearing_check_rather_than_dropping_the_skip() {
 #[test]
 fn amend_only_max_age_keeps_the_check_and_statement() {
     // A pure max-age bump: the check still holds (tree already matches), only the
-    // window changes, and the statement is untouched.
+    // window changes, and the statement is untouched. max-age lives under `hub:`.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim(
@@ -338,59 +299,11 @@ fn amend_only_max_age_keeps_the_check_and_statement() {
         .collect();
     assert_eq!(changed, ["max-age"]);
     // The re-rendered file quotes single-scalar frontmatter fields (the shared
-    // renderer's injection-hardening).
-    assert!(repo.read(".claims/pin.md").contains("max-age: \"90d\""));
-    assert!(repo
-        .read(".claims/pin.md")
-        .contains("We pin libfoo at 4.2."));
-}
-
-#[test]
-fn amend_refuses_a_retired_claim_and_writes_nothing() {
-    // M4: retirement is terminal, so an amend that rewrote the file and appended a
-    // Held would leave the status Retired — the user would commit a no-change. The
-    // claim is refused before the check runs, with nothing written.
-    let repo = TestRepo::new();
-    repo.claim().arg("init").assert().success();
-    repo.write_claim(
-        "pin",
-        &claim_file(
-            "pin",
-            "grep -q libfoo==4.2 requirements.txt",
-            "We pin libfoo at 4.2.",
-        ),
-    );
-    repo.write_verdict("pin", "2026-07-10T00:00:00Z", "held");
-    repo.write_retirement("pin", "2026-07-12T00:00:00Z", "superseded");
-    let before = repo.read(".claims/pin.md");
-    let logs_before = repo.log_count("pin");
-
-    repo.claim_at("2026-07-18T00:00:00Z")
-        .args(["amend", "pin", "--statement", "Reopened?"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("is retired"))
-        .stderr(predicate::str::contains("author a new claim"));
-
-    // Nothing written: the file is byte-unchanged and no verdict was appended (so a
-    // stray Held could never quietly precede the terminal retirement).
-    assert_eq!(repo.read(".claims/pin.md"), before);
-    assert_eq!(repo.log_count("pin"), logs_before);
-
-    // The JSON error carries the machine kind. A past retirement is terminal under
-    // any `now`, so this uses the plain (unpinned) clock — avoiding the debug-only
-    // `CLAIM_NOW` warning line that would precede the JSON object on stderr.
-    let out = repo
-        .claim()
-        .args(["--json", "amend", "pin", "--statement", "Reopened?"])
-        .assert()
-        .code(2)
-        .get_output()
-        .stderr
-        .clone();
-    let v: serde_json::Value =
-        serde_json::from_slice(&out).expect("the error is a JSON object on stderr");
-    assert_eq!(v["kind"], "invalid-input");
+    // renderer's injection-hardening) and keeps max-age under hub.
+    let file = repo.read(".claims/pin.md");
+    assert!(file.contains("max-age: \"90d\""));
+    assert!(file.contains("hub:"), "max-age lives under hub:");
+    assert!(file.contains("We pin libfoo at 4.2."));
 }
 
 #[test]
@@ -400,7 +313,7 @@ fn amend_refuses_a_single_non_cmd_check() {
     // dropped or executed.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    let agent = "---\nid: world\nchecks:\n  - kind: agent\n    instruction: read the changelog\n    when: every 30d\nmax-age: 90d\n---\nlibfoo fixed the CJK bug.\n";
+    let agent = "---\nid: world\nchecks:\n  - kind: agent\n    instruction: read the changelog\nhub:\n  max-age: 90d\n---\nlibfoo fixed the CJK bug.\n";
     repo.write_claim("world", agent);
 
     repo.claim()
@@ -420,7 +333,7 @@ fn amend_supports_replaces_the_set() {
     // target is gone, the new one present.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    let with_support = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"grep -q libfoo==4.2 requirements.txt\"\n    when: on-change\nmax-age: 30d\nsupports:\n  - requirements.txt#libfoo\n---\nWe pin libfoo at 4.2.\n";
+    let with_support = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"grep -q libfoo==4.2 requirements.txt\"\nsupports:\n  - requirements.txt#libfoo\n---\nWe pin libfoo at 4.2.\n";
     repo.write_claim("pin", with_support);
 
     let out = repo
@@ -453,7 +366,7 @@ fn amend_without_supports_flag_preserves_existing_supports() {
     // targets — amend never silently drops edges it was not told to touch.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    let with_support = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"grep -q libfoo==4.2 requirements.txt\"\n    when: on-change\nmax-age: 30d\nsupports:\n  - requirements.txt#libfoo\n---\nWe pin libfoo at 4.2.\n";
+    let with_support = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"grep -q libfoo==4.2 requirements.txt\"\nsupports:\n  - requirements.txt#libfoo\nhub:\n  max-age: 30d\n---\nWe pin libfoo at 4.2.\n";
     repo.write_claim("pin", with_support);
 
     repo.claim()

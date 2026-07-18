@@ -8,13 +8,16 @@
 //! The invariants that define the product live here as types. See
 //! [`verdict::Verdict`] for the one that matters most: a check can report that a
 //! claim still holds *only* by succeeding outright. Every other outcome,
-//! including a check that could not run, resolves to something the operator will
-//! eventually be nagged about. The failure mode is a nag, never a lie.
+//! including a check that could not run, is loud — the failure mode is a nag,
+//! never a lie.
 //!
-//! A claim's history and current standing live in [`log`]: an append-only
-//! verdict log on disk, and [`log::compute_status`], the pure function that
-//! derives a claim's [`verdict::Status`] from that history and its `max_age` at
-//! read time. Status is computed, never stored.
+//! A [`claim::Claim`] is a statement, the checks that re-verify it, its
+//! `supports` graph edges, and an optional [`claim::Hub`] block of scheduling
+//! hints the CLI validates but never acts on. There is no committed verdict log
+//! and no derived status here: the CLI reports a check's *current* verdict and
+//! stores nothing. Any longer-lived ledger — freshness, staleness, due-dates —
+//! belongs to the hub that ingests the reported stream (see
+//! `docs/design/CLI-HUB-BOUNDARY.md`).
 //!
 //! Running a check and turning the result into a verdict is [`check`]:
 //! [`check::run_check`] executes a command through the shell and maps its exit
@@ -29,7 +32,6 @@
 pub mod check;
 pub mod claim;
 pub mod error;
-pub mod log;
 pub mod verdict;
 
 pub use check::{
@@ -38,11 +40,13 @@ pub use check::{
 };
 pub use claim::{
     extract_embedded_claims, has_frontmatter_fence, parse_claim_file, Check, CheckKind, Claim,
-    ClaimId, Days, Skip, Source, SupportTarget, Trigger, WikiLink,
+    ClaimId, Days, Hub, Skip, Source, SupportTarget, WikiLink,
 };
 pub use error::{Error, Result};
-pub use log::{
-    append_entry, compute_status, read_entries, Adjudication, Event, Grace, LogEntry,
-    SignedDuration, StatusReport, Timestamp,
-};
-pub use verdict::{Status, Verdict};
+pub use verdict::Verdict;
+
+/// The UTC instant type the tool records and reasons about, re-exported so both
+/// binaries and the store crate name one `Timestamp` and cannot disagree about
+/// its semantics. From `jiff`, for correctness-first instant arithmetic and
+/// lossless RFC 3339 round-trips.
+pub use jiff::Timestamp;

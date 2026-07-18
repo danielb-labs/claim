@@ -1,8 +1,5 @@
 {
   "status": "ok",
-  "selection": "all",
-  "report_only": true,
-  "now": "2026-07-18T06:32:17.572500Z",
   "exit": 1,
   "checked": 1,
   "claims": [
@@ -15,9 +12,10 @@
           "end": { "kind": "exited", "code": 1 },
           "detail": "exit 1",
           "evidence": null,
-          "when": "on-change"
+          "note": null
         }
       ],
+      "skipped": [],
       "supports": [
         {
           "target": "requirements.txt#libfoo",
@@ -25,10 +23,8 @@
           "reason": null
         }
       ],
-      "persisted": false,
       "exit": 1
     }
   ],
-  "errors": [],
-  "notes": []
+  "errors": []
 }

@@ -1,10 +1,11 @@
 # Drop-in clock lane for a repo that has a .claims/ store.
 #
 # Copy this into your repo's `.github/workflows/`. It calls the claim tool's reusable
-# clock workflow on a schedule: it runs the due claims, records their verdicts back to
-# the store, and maintains one standing "claim: due & drifted" issue — created when
-# there is a queue, updated as it changes, closed when the store is clean. This issue
-# is your nag: it turns computed staleness into something a human sees.
+# clock workflow on a schedule: it runs your claims' checks and maintains one standing
+# "claim: due & drifted" issue — created when there is a queue, updated as it changes,
+# closed when the store is clean. This issue is your nag: it turns a drifted or broken
+# claim into something a human sees on a schedule. The CLI writes nothing back to the
+# store; the verdict stream and the staleness clock belong to a hub, not to this lane.
 
 name: claims (clock)
 
@@ -22,8 +23,8 @@ jobs:
       claim-repo: your-org/claim
       claim-ref: v1
       codeowners: .github/CODEOWNERS
-      # Set to false to nag via the issue without committing verdicts from CI.
-      persist: true
+    # The reusable workflow declares its own least-privilege permissions
+    # (contents: read, issues: write); inherit the caller's token.
     permissions:
-      contents: write
+      contents: read
       issues: write

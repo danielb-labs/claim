@@ -23,7 +23,7 @@ fn claim_with_supports(id: &str, supports: &[&str]) -> String {
         format!("supports:\n{items}")
     };
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n{block}max-age: 30d\n---\nClaim {id}.\n"
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n{block}hub:\n  max-age: 30d\n---\nClaim {id}.\n"
     )
 }
 

@@ -18,6 +18,6 @@
 #
 # Wire it up locally (never in a billing-free CI, where the claim's skip suppresses it):
 #   export CLAIM_AGENT_CMD="$PWD/examples/claude-runner.sh"
-#   claim check --all
+#   claim check
 set -euo pipefail
 exec claude -p --allowedTools "Read Grep Glob" --disallowedTools "Edit Write Bash NotebookEdit"

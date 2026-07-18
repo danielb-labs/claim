@@ -8,10 +8,10 @@ checks:
   - kind: cmd
     run: "grep -q 'libfoo==4.2' requirements.txt"
     negate: true
-    when: "every 30d"
-max-age: "120d"
 supports:
   - "requirements.txt#libfoo"
   - other-claim
+hub:
+  max-age: "120d"
 ---
 We pin libfoo at 4.2.

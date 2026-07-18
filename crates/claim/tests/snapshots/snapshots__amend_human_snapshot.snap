@@ -3,9 +3,8 @@ source: crates/claim/tests/snapshots.rs
 expression: "redact_write_output(&body, repo.path())"
 ---
 Amended claim 'pin' (statement changed).
-The amended check was confirmed Held; the verdict history is preserved.
-Recorded the confirming verdict at commit <sha>.
+The amended check was confirmed Held against the current tree.
 
 Nothing is committed yet. Review, then commit:
-  git -C <root> add .claims/pin.md .claims/log/pin/<entry>.json
+  git -C <root> add .claims/pin.md
   git -C <root> commit -m "Amend claim pin"

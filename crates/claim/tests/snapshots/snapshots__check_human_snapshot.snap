@@ -1,12 +1,10 @@
 ---
 source: crates/claim/tests/snapshots.rs
-expression: "stdout(&repo, &[\"check\", \"--all\", \"--report-only\"], 0)"
+expression: "stdout(&repo, &[\"check\"], 0)"
 ---
 a  (.claims/a.md)
-  held         exit 0 [on-change]
-  (report-only: not recorded)
+  held         exit 0
 b  (.claims/b.md)
-  held         exit 0 [on-change]
-  (report-only: not recorded)
+  held         exit 0
 
 Checked 2 claim(s). Exit 0: all held, all supports resolved.

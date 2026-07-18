@@ -6,11 +6,12 @@
 # comment routing each finding to the file's CODEOWNERS owner. It NEVER fails the
 # build on a finding — invariant #6: drift routes, it does not block the changer.
 #
-# The checks run under `claim check --report-only`, which writes nothing and needs no
-# git identity, so this is safe on fork PRs with no write token (docs/design/PRODUCT.md section 3:
-# a fork PR's CI reports in its output only; trusted runs persist). The comment step
-# is gated on the PR not coming from a fork, so a fork PR still gets its checks and
-# its advisory job summary without ever handling a write token.
+# `claim check` writes nothing — it runs the checks and reports the verdicts on stdout
+# (a verdict is telemetry a hub ingests, not source; see
+# docs/design/CLI-HUB-BOUNDARY.md) — and needs no git identity, so this is safe on fork
+# PRs with no write token. The comment step is gated on the PR not coming from a fork,
+# so a fork PR still gets its checks and its advisory job summary without ever handling
+# a write token.
 #
 # Because a reusable workflow's `uses: ./…` and script files resolve against the
 # *caller's* checkout, this workflow explicitly checks out the claim tool repo into a
@@ -39,10 +40,10 @@ on:
         type: string
         default: .
 
-# Least privilege: read the code, write PR comments. No `contents: write` — the
-# on-change lane never persists a verdict, so it never needs to push. On a fork PR
-# GitHub downgrades `pull-requests` to read automatically; the comment step is gated
-# off for forks so it no-ops rather than failing.
+# Least privilege: read the code, write PR comments. No `contents: write` — the CLI
+# never writes a verdict, so the lane never needs to push. On a fork PR GitHub
+# downgrades `pull-requests` to read automatically; the comment step is gated off for
+# forks so it no-ops rather than failing.
 permissions:
   contents: read
   pull-requests: write
@@ -73,12 +74,13 @@ jobs:
           source-path: _claim_tool/crates/claim
           workspace-root: _claim_tool
 
-      # Run every check, persist nothing. `|| true` keeps the job green regardless of
-      # the exit code: the finding is advisory and must never fail the PR.
-      - name: Run claims (report-only)
+      # Run every check and report; the CLI persists nothing. `|| true` keeps the job
+      # green regardless of the exit code: the finding is advisory and must never fail
+      # the PR.
+      - name: Run claims
         working-directory: ${{ inputs.working-directory }}
         run: |
-          claim --json check --all --report-only > "$RUNNER_TEMP/report.json" || true
+          claim --json check > "$RUNNER_TEMP/report.json" || true
 
       # Build the comment body from the report. The renderer's stdout is the markdown;
       # its exit code (0 clean / 1 dirty) is not used to gate anything here. The

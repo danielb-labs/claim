@@ -1,15 +1,16 @@
 // Turn a `claim check --json` report into the markdown a human sees, and decide
-// whether there is anything to say at all. This is the load-bearing logic of both
-// CI lanes: the workflow YAML only runs `claim`, calls this, and hands the result
-// to the GitHub API. Everything a reviewer might get wrong — grouping drift from
-// broken checks, rendering supports, finding the file owner, deciding clean vs.
-// dirty — lives here where it is unit-tested against real `claim check` JSON, not
-// buried in inline `github-script` where it cannot be.
+// whether there is anything to say at all. This is the load-bearing logic of the
+// hub's CI glue: the workflow YAML only runs `claim check --json`, calls this, and
+// hands the result to the GitHub API. Everything a reviewer might get wrong —
+// grouping drift from broken checks, rendering supports, finding the file owner,
+// deciding clean vs. dirty — lives here where it is unit-tested against real
+// `claim check` JSON, not buried in inline `github-script` where it cannot be.
 //
-// Two consumers, one renderer: the on-change lane renders a PR comment, the clock
-// lane renders an issue body. Both share `classify` and the grouped `findingsBody`;
-// they differ only in framing text and the marker, so a fix to the grouping fixes
-// both.
+// Two consumers, one renderer: a PR run renders a PR comment, a scheduled run renders
+// an issue body. Both share `classify` and the grouped `findingsBody`; they differ
+// only in framing text and the marker, so a fix to the grouping fixes both. The CLI
+// stays hub-agnostic — it emits `--json`; wrapping and POSTing that to a hub is the
+// hub's CI glue, not the core tool.
 //
 // No dependencies, by policy (CLAUDE.md: every dependency is attack surface). Node's
 // standard library only. ESM so the same file is both a CLI (`node render.mjs`) and
@@ -143,10 +144,9 @@ function globToRegExp(glob, anchored) {
  * Extract the plain-language statement from a standalone claim file's markdown.
  *
  * `claim check --json` does not carry the statement (only `id`, `file`, verdicts, and
- * supports), and the on-change lane runs report-only so `claim drift` — which reads
- * persisted status — sees nothing to join against. The statement is the "why anyone
- * cares" the comment exists to show, so we read it from the file the checkout already
- * has: the markdown body after the closing `---` of a standalone claim's frontmatter.
+ * supports). The statement is the "why anyone cares" the comment exists to show, so we
+ * read it from the file the checkout already has: the markdown body after the closing
+ * `---` of a standalone claim's frontmatter.
  *
  * Deliberately narrow: it handles the standalone one-file-per-claim form only.
  * Embedded claims (a `<!-- claim` block inside CLAUDE.md) put the statement above the
@@ -176,20 +176,15 @@ export function statementFromFile(text) {
 
 /**
  * The full classification of a `claim check --json` report: the reportable claims
- * (broken/drifted/unresolved) with their owners resolved, the load errors, the
- * per-claim faults, and a single `clean` flag the caller keys the whole decision on.
+ * (broken/drifted/unresolved) with their owners resolved, the load errors, and a
+ * single `clean` flag the caller keys the whole decision on.
  *
- * `clean` is true only when there is nothing to route: no reportable claim, AND no
- * load error, AND no per-claim fault. Each of the latter two is never clean —
- *
- * - A load error (`errors[]`: a malformed or duplicate-id claim file) floors the
- *   tool's exit at 2, because a claim file that will not parse is a silent gap.
- * - A fault (`notes[]`: a claim whose own check ran, but whose verdict log could not
- *   be read) *also* floors the tool's exit at 2. The check may have held, but the tool
- *   cannot compute the claim's status from an unreadable log — so it does not know the
- *   fact holds. Ignoring `notes[]` here would render "the store is clean" and let the
- *   clock lane CLOSE its nag while the tool is saying "I can't tell." That is a false
- *   green, invariant #6, in the CI layer; the fault keeps the store dirty.
+ * `clean` is true only when there is nothing to route: no reportable claim AND no
+ * load error. A load error (`errors[]`: a malformed or duplicate-id claim file)
+ * floors the tool's exit at 2, because a claim file that will not parse is a silent
+ * gap the tool could not check at all — rendering it clean would let the hub close a
+ * nag while the tool is saying "I can't tell whether this fact holds." That is a
+ * false green, invariant #6, in the CI layer; the load error keeps the store dirty.
  */
 export function classify(report, codeownersText, readStatement) {
   const items = [];
@@ -207,14 +202,11 @@ export function classify(report, codeownersText, readStatement) {
     });
   }
   const errors = report.errors || [];
-  const notes = report.notes || [];
   return {
-    clean: items.length === 0 && errors.length === 0 && notes.length === 0,
+    clean: items.length === 0 && errors.length === 0,
     items,
     errors,
-    notes,
     exit: report.exit,
-    reportOnly: report.report_only === true,
   };
 }
 
@@ -315,20 +307,16 @@ function code(text) {
 }
 
 /**
- * Render the faults section: unloadable claim files (`errors[]`) and per-claim
- * verdict-log read faults (`notes[]`). Both mean the tool could not determine a
- * fact's status, so both are surfaced under one loud heading and both keep the store
- * dirty (see `classify`). Free-text (`e.message`, a note) is defanged so a path or
- * message it quotes cannot mention people or forge links.
+ * Render the faults section: unloadable claim files (`errors[]`), which mean the tool
+ * could not check the fact at all, so they are surfaced under one loud heading and
+ * keep the store dirty (see `classify`). Free-text (`e.message`) is defanged so a path
+ * or message it quotes cannot mention people or forge links.
  */
-function faultsSection(errors, notes) {
-  if (errors.length === 0 && notes.length === 0) return null;
+function faultsSection(errors) {
+  if (errors.length === 0) return null;
   const lines = ["### Unresolved faults (the tool could not determine status)", ""];
   for (const e of errors) {
     lines.push(`- \`${defang(e.file)}\`: ${defang(e.message)}`);
-  }
-  for (const note of notes) {
-    lines.push(`- ${defang(note)}`);
   }
   return lines.join("\n");
 }
@@ -345,7 +333,7 @@ function findingsBody(classified) {
     sections.push(group.items.map(claimBlock).join("\n"));
     sections.push("");
   }
-  const faults = faultsSection(classified.errors, classified.notes);
+  const faults = faultsSection(classified.errors);
   if (faults) {
     sections.push(faults);
     sections.push("");
@@ -426,10 +414,10 @@ function footer(classified) {
   const parts = [];
   parts.push("---");
   const broken = classified.items.some((it) => it.category === "broken");
-  const cannotTell = broken || classified.errors.length > 0 || classified.notes.length > 0;
+  const cannotTell = broken || classified.errors.length > 0;
   if (cannotTell) {
     parts.push(
-      "A **broken** check, an unloadable file, or an unreadable verdict log means the tool could not tell whether the fact holds — treat it as failing, not passing.",
+      "A **broken** check or an unloadable claim file means the tool could not tell whether the fact holds — treat it as failing, not passing.",
     );
   }
   parts.push("Resolve by fixing the claim (`claim amend`) or closing it (`claim retire`).");

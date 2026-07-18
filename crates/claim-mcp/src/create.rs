@@ -1,31 +1,31 @@
 //! The `create` tool's pure logic: record a claim an agent just established.
 //!
-//! This is the second write verb on the agent surface, and the heavier one:
-//! `report` appends a verdict to an *existing* claim, while `create` brings a new
-//! claim into being. Every honesty rule authoring rests on is enforced by the shared
+//! This is the one write verb on the agent surface. `create` brings a new claim into
+//! being: every honesty rule authoring rests on is enforced by the shared
 //! [`claim_store::author_claim`] this delegates to — not re-implemented here — so the
 //! MCP tool and the CLI's `claim add` cannot disagree about what it takes to record a
 //! fact:
 //!
 //! - **The check must hold now.** `create` runs the claim's single check against the
-//!   current tree and records it only on [`Verdict::Held`]. A [`Verdict::Drifted`]
-//!   (the fact is already false) or [`Verdict::Broken`] (the check cannot run) is
-//!   refused with the observed evidence, writing nothing — a claim whose check did
-//!   not hold is never created. An `agent` check with no runner configured is
-//!   [`Verdict::Unverifiable`], which is not `Held`, so it too is refused: an agent
-//!   cannot establish a claim it cannot verify.
+//!   current tree and records the claim only on [`Verdict::Held`]. A
+//!   [`Verdict::Drifted`] (the fact is already false) or [`Verdict::Broken`] (the
+//!   check cannot run) is refused with the observed evidence, writing nothing — a
+//!   claim whose check did not hold is never created. An `agent` check with no runner
+//!   configured is [`Verdict::Unverifiable`], which is not `Held`, so it too is
+//!   refused: an agent cannot establish a claim it cannot verify.
 //! - **The id must be new and valid.** A malformed id, a duplicate id, an empty
-//!   statement, or a bad `max-age` is rejected loudly before any check runs — reusing
-//!   claim-core's own validators via the round-trip through
+//!   statement, or a bad `max-age` hint is rejected loudly before any check runs —
+//!   reusing claim-core's own validators via the round-trip through
 //!   [`claim_core::parse_claim_file`].
-//! - **The verdict is attributed to git.** Provenance is the agent's own git
-//!   identity (invariant #3), resolved inside `author_claim`, never taken from the
-//!   request.
-//! - **The server does not commit.** The claim file and its birth verdict are left in
-//!   the working tree with a `commit_hint` naming what to commit (invariant #4, a
-//!   write to the truth is a commit the caller makes). The created claim is
-//!   *unreviewed* until the caller commits it, and a human reviews that commit — the
-//!   tool description says so.
+//! - **The claim is attributed to git.** Provenance is the agent's own git identity
+//!   (invariant #3), resolved inside `author_claim`, never taken from the request.
+//! - **The server does not commit, and writes no verdict.** The claim file is left in
+//!   the working tree with a `commit_hint` naming what to commit (invariant #4, the
+//!   truth is the claim and a write to it is a commit the caller makes). No verdict is
+//!   recorded — a verdict is telemetry a hub stores, not source (see
+//!   `docs/design/CLI-HUB-BOUNDARY.md`). The created claim is *unreviewed* until the
+//!   caller commits it, and a human reviews that commit — the tool description says
+//!   so.
 //!
 //! An unresolvable `supports` target does not fail the create (a forward reference is
 //! legitimate); it is surfaced as a warning in the response, exactly as `claim add`
@@ -45,8 +45,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Exactly one of `run` (a `cmd` check) or `instruction` (a `kind: agent` check)
 /// must be given; supplying both, or neither, is rejected. `negate` applies only to a
-/// `cmd` check (an agent check has no exit code to invert). `when` defaults to
-/// `on-change`.
+/// `cmd` check (an agent check has no exit code to invert).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CreateRequest {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
@@ -66,17 +65,16 @@ pub struct CreateRequest {
     /// and the create is refused.
     #[serde(default)]
     pub instruction: Option<String>,
-    /// When the check runs: `on-change` or `every <N>d` (e.g. `every 30d`). Defaults
-    /// to `on-change`.
-    #[serde(default)]
-    pub when: Option<String>,
     /// Invert a `cmd` check's `Held`/`Drifted` sense (the tool owns the inversion; it
     /// never wraps the command in a shell `!`). Ignored for an `instruction` check.
     #[serde(default)]
     pub negate: bool,
-    /// The dead-man's switch: how long a passing check keeps the claim fresh, as
-    /// `<N>d` (e.g. `120d`). Required.
-    pub max_age: String,
+    /// An optional hub freshness-window hint, as `<N>d` (e.g. `120d`), written under
+    /// the claim's `hub:` subfield. The CLI validates it but never acts on it — how
+    /// long a passing check keeps the claim fresh is the hub's schedule, not this
+    /// verifier's. Omitted, the claim carries no `hub:` block.
+    #[serde(default)]
+    pub max_age: Option<String>,
     /// The decisions or claim ids this claim justifies (its `supports` edge). An
     /// unresolvable target does not fail the create — it is surfaced as a warning.
     #[serde(default)]
@@ -85,8 +83,8 @@ pub struct CreateRequest {
 
 /// The `create` tool's structured output: what was written, and what to commit.
 ///
-/// The `commit_hint` names the file and the birth verdict the caller must `git add`
-/// and commit, because the server does not commit — a write to the truth is a commit
+/// The `commit_hint` names the file the caller must `git add` and commit, because
+/// the server does not commit — the truth is the claim and a write to it is a commit
 /// the caller makes, under the agent's identity, so the new claim is reviewed as part
 /// of that commit or PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -94,19 +92,17 @@ pub struct CreateResponse {
     /// The id of the created claim.
     pub id: String,
     /// The establishing verdict, always `held` — a claim is created only when its
-    /// check holds now.
+    /// check holds now. Reported, not stored.
     pub verdict: String,
-    /// The commit sha the establishing verdict was attributed to (git `HEAD`, or the
-    /// unborn sentinel), abbreviated for display.
+    /// The commit sha the establishing check was observed against (git `HEAD`, or the
+    /// unborn sentinel), abbreviated for display. No verdict is stored; this is the
+    /// commit the tree was at when the check held.
     pub commit: String,
-    /// The actor the verdict was attributed to, `Name <email>` from git config.
+    /// The actor authoring the claim, `Name <email>` from git config.
     pub actor: String,
     /// The claim file that was written, relative to the store root. Left in the
     /// working tree for the caller to commit.
     pub claim_file: String,
-    /// The establishing verdict-log file that was written, relative to the store
-    /// root. Left in the working tree for the caller to commit.
-    pub log_file: String,
     /// The exact `git` command that records the new claim. The server does not run
     /// this; a write to the truth is a commit the caller makes, and until it does the
     /// claim is unreviewed.
@@ -137,9 +133,9 @@ pub enum CreateError {
         found: &'static str,
     },
 
-    /// A field failed claim-core's schema — a malformed id, an empty statement, a bad
-    /// `max-age`, or an invalid trigger. Carries the parser's own message, which names
-    /// the field and the fix.
+    /// A field failed claim-core's schema — a malformed id, an empty statement, or a
+    /// bad `max-age` hint. Carries the parser's own message, which names the field and
+    /// the fix.
     #[error("the claim you described is not valid: {0}")]
     Invalid(String),
 
@@ -164,18 +160,18 @@ pub enum CreateError {
     Duplicate(String),
 
     /// Git provenance could not be resolved — no repository, unset identity — so the
-    /// verdict would be unattributable and is not written.
-    #[error("could not attribute the establishing verdict: {0}")]
+    /// claim would be unattributable and is not written.
+    #[error("could not attribute the claim: {0}")]
     Provenance(String),
 
-    /// The claim file could not be written, or the verdict could not be appended.
+    /// The claim file could not be written.
     #[error("could not write the claim: {0}")]
     Write(String),
 }
 
 /// Create a claim an agent established: validate the fields, run the establishing
-/// check requiring [`Verdict::Held`], and — only then — write the claim file and its
-/// birth verdict to the working tree with git provenance, without committing.
+/// check requiring [`Verdict::Held`], and — only then — write the claim file to the
+/// working tree with git provenance, without committing and without writing a verdict.
 ///
 /// The honesty gate lives in [`claim_store::author_claim`], which this delegates to;
 /// this function's own job is to turn the request into a validated [`Claim`] plus its
@@ -232,7 +228,6 @@ pub fn run_create(
     )?;
 
     let claim_file = rel(store, &authored.claim_file);
-    let log_file = rel(store, &authored.log_file);
     let warnings = supports_warnings(store, load, &claim);
 
     Ok(CreateResponse {
@@ -241,15 +236,14 @@ pub fn run_create(
         commit: short_commit(&authored.provenance.commit),
         actor: authored.provenance.actor,
         // The store root is single-quoted so a path with spaces still yields a
-        // runnable `git -C` command; the claim/log paths and id are tool-controlled
+        // runnable `git -C` command; the claim path and id are tool-controlled
         // (validated ids, store-relative paths) and carry no spaces.
         commit_hint: format!(
-            "git -C '{}' add {claim_file} {log_file} && git commit -m \"Add claim {}\"",
+            "git -C '{}' add {claim_file} && git commit -m \"Add claim {}\"",
             store.root().display(),
             claim.id,
         ),
         claim_file,
-        log_file,
         warnings,
     })
 }
@@ -260,11 +254,10 @@ pub fn run_create(
 /// The text comes from the shared [`render_claim`] (so `create` and `claim add` emit
 /// byte-identical files and share the frontmatter injection-hardening), and is
 /// validated by parsing it back through [`parse_claim_file`] — the single validation
-/// path — so a malformed id, an empty statement, a bad `max-age`, or an invalid
-/// trigger surfaces as the parser's own field-named error, and a newline-bearing
-/// scalar is refused by the renderer before any text is produced.
+/// path — so a malformed id, an empty statement, or a bad `max-age` hint surfaces as
+/// the parser's own field-named error, and a newline-bearing scalar is refused by the
+/// renderer before any text is produced.
 fn build_claim(store: &Store, request: &CreateRequest) -> Result<(Claim, String), CreateError> {
-    let when = request.when.as_deref().unwrap_or("on-change");
     let check = match (&request.run, &request.instruction) {
         (Some(run), None) => CheckRender::Cmd {
             run,
@@ -277,14 +270,13 @@ fn build_claim(store: &Store, request: &CreateRequest) -> Result<(Claim, String)
 
     let render = ClaimRender {
         id: &request.id,
-        max_age: &request.max_age,
+        max_age: request.max_age.as_deref(),
         check,
-        when,
         supports: &request.supports,
         statement: &request.statement,
     };
-    // A newline/control character in id/max-age/when is refused here, before any text
-    // is produced — the injection guard both front doors share.
+    // A newline/control character in id/max-age is refused here, before any text is
+    // produced — the injection guard both front doors share.
     let text = render_claim(&render).map_err(|e| CreateError::Invalid(e.to_string()))?;
 
     // The id must parse before it can name the file path the parser error will cite.
@@ -385,9 +377,8 @@ mod tests {
             statement: statement.to_owned(),
             run: run.map(ToOwned::to_owned),
             instruction: instruction.map(ToOwned::to_owned),
-            when: None,
             negate: false,
-            max_age: "30d".to_owned(),
+            max_age: Some("30d".to_owned()),
             supports: Vec::new(),
         }
     }
@@ -398,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn a_holding_cmd_check_creates_the_claim_and_a_held_verdict() {
+    fn a_holding_cmd_check_creates_the_claim_and_writes_no_verdict() {
         let s = TestStore::new();
         let load = s.store.load_all().unwrap();
         let request = req(
@@ -414,17 +405,15 @@ mod tests {
         assert_eq!(resp.verdict, "held");
         assert_eq!(resp.actor, "Test Agent <agent@example.com>");
         assert_eq!(resp.claim_file, ".claims/pin.md");
-        assert!(resp.log_file.starts_with(".claims/log/pin/"));
         assert!(resp.commit_hint.contains("git commit"));
         assert!(resp.warnings.is_empty());
 
-        // The claim file and exactly one Held verdict are on disk.
+        // The claim file is on disk; no verdict log is written.
         assert!(s.root().join(".claims/pin.md").exists());
-        assert_eq!(s.log_count("pin"), 1);
-        let entries = s.log_entries("pin");
-        assert_eq!(entries[0]["event"]["verdict"], "held");
-        assert_eq!(entries[0]["actor"], "Test Agent <agent@example.com>");
-        assert_eq!(entries[0]["commit"].as_str().unwrap().len(), 40);
+        assert!(
+            !s.root().join(".claims/log").exists(),
+            "no verdict log is written"
+        );
     }
 
     #[test]
@@ -474,7 +463,6 @@ mod tests {
             "a drifted check is NotHeld, got {err:?}"
         );
         assert!(!s.root().join(".claims/x.md").exists(), "nothing written");
-        assert_eq!(s.log_count("x"), 0);
     }
 
     #[test]
@@ -536,11 +524,27 @@ mod tests {
         let s = TestStore::new();
         let load = s.store.load_all().unwrap();
         let mut request = req("ok", "S.", Some("true"), None);
-        request.max_age = "banana".to_owned();
+        request.max_age = Some("banana".to_owned());
         let err = run_create(&s.store, &request, &load, &ctx(&s), ts()).unwrap_err();
         assert!(
             matches!(&err, CreateError::Invalid(m) if m.contains("day count")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_max_age_creates_a_claim_with_no_hub_block() {
+        // The hub hint is optional: a create with no max-age produces a valid claim.
+        let s = TestStore::new();
+        let load = s.store.load_all().unwrap();
+        let mut request = req("nohub", "S.", Some("true"), None);
+        request.max_age = None;
+        let resp = run_create(&s.store, &request, &load, &ctx(&s), ts()).unwrap();
+        assert_eq!(resp.verdict, "held");
+        let text = std::fs::read_to_string(s.root().join(".claims/nohub.md")).unwrap();
+        assert!(
+            !text.contains("hub:"),
+            "no hub block when max-age is unset: {text}"
         );
     }
 
@@ -614,13 +618,7 @@ mod tests {
 
         let resp = run_create(&s.store, &request, &load, &context, ts()).unwrap();
         assert_eq!(resp.verdict, "held");
-        assert_eq!(s.log_count("a"), 1);
-        // The agent's evidence is recorded on the birth verdict.
-        let entries = s.log_entries("a");
-        assert!(entries[0]["event"]["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("the fix is in 5.1"));
+        assert!(s.root().join(".claims/a.md").exists());
     }
 
     #[test]
@@ -646,7 +644,6 @@ mod tests {
             other => panic!("expected NotHeld(unverifiable), got {other:?}"),
         }
         assert!(!s.root().join(".claims/a.md").exists());
-        assert_eq!(s.log_count("a"), 0);
     }
 
     #[test]
@@ -695,8 +692,8 @@ mod tests {
         )
         .unwrap();
 
-        // The claim and verdict are on disk but uncommitted: the server does not
-        // commit (invariant #4).
+        // The claim is on disk but uncommitted: the server does not commit (invariant
+        // #4).
         assert!(
             s.working_tree_has_changes(),
             "the created claim is left in the working tree, uncommitted"
@@ -728,7 +725,7 @@ mod tests {
         let s = TestStore::new();
         let load = s.store.load_all().unwrap();
         let mut request = req("inj", "S.", Some("true"), None);
-        request.max_age = "30d\nsupports:\n  - injected".to_owned();
+        request.max_age = Some("30d\nsupports:\n  - injected".to_owned());
         let err = run_create(&s.store, &request, &load, &ctx(&s), ts()).unwrap_err();
         assert!(matches!(err, CreateError::Invalid(_)), "got {err:?}");
         assert!(!s.root().join(".claims/inj.md").exists(), "nothing written");

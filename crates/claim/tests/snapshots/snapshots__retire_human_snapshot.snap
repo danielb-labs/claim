@@ -2,11 +2,10 @@
 source: crates/claim/tests/snapshots.rs
 expression: "redact_write_output(&body, repo.path())"
 ---
-Retired claim 'gone'.
-  note: libfoo 5.0 shipped
-Its status is now `retired` (computed from this log entry); the claim file and its history are kept.
-Recorded the retirement at commit <sha>.
+Retired claim 'b-fact'.
+  note: superseded by a real test
+Removed .claims/b-fact.md from the working tree; the changelog is git history (`git log .claims/`).
 
 Nothing is committed yet. Review, then commit:
-  git -C <root> add .claims/log/gone/<entry>.json
-  git -C <root> commit -m "Retire claim gone"
+  git -C <root> rm .claims/b-fact.md
+  git -C <root> commit -m "Retire claim b-fact: superseded by a real test"

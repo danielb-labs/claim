@@ -8,10 +8,9 @@
 //! - **A global `--json` flag** ([`Cli::json`]). Agents are the heaviest readers
 //!   (docs/design/PRODUCT.md section 5), so every command owes a stable machine form. The flag
 //!   is parsed once at the top level and threaded to each command.
-//! - **One args struct per verb** ([`Command`]). The full v1 verb list is declared
-//!   so `claim --help` shows the real surface, and each verb carries its own typed
-//!   arguments; the whole v1 set — `amend`, `retire`, `stats` included — is now
-//!   implemented in [`crate::commands`].
+//! - **One args struct per verb** ([`Command`]). The verb list is declared so
+//!   `claim --help` shows the real surface, and each verb carries its own typed
+//!   arguments.
 
 use clap::{Parser, Subcommand};
 
@@ -39,30 +38,31 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The `claim` verbs. The full v1 set (docs/design/PRODUCT.md section 5).
+/// The `claim` verbs.
+///
+/// The CLI is a stateless runtime verifier: it reads claim files, runs their
+/// checks, and reports `held`/`drifted`/`broken` right now. It stores no verdicts
+/// and computes no staleness — that ledger belongs to the hub that ingests the
+/// reported stream (see `docs/design/CLI-HUB-BOUNDARY.md`).
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scaffold a `.claims/` store in the current directory.
     Init(InitArgs),
 
-    /// Create a claim: run its check now, require it passes, write the first log
-    /// entry. `--witness-cmd` optionally witnesses the check going red in isolation.
+    /// Create a claim: run its check now and require it holds, then write the file.
+    /// `--witness-cmd` optionally witnesses the check going red in isolation.
     Add(AddArgs),
 
-    /// Run checks and report holds/drifted/unverifiable/broken.
+    /// Run every claim's checks and report holds/drifted/unverifiable/broken.
     Check(CheckArgs),
-    /// Filter claims by text, path, status, staleness, or supports.
+    /// List the store's claims (id, statement, file, supports count).
     List(ListArgs),
-    /// Show a claim's full history and evidence.
-    Log(LogArgs),
-    /// List drifted claims with what each supports.
+    /// Run checks and show the drifted claims with what each supports.
     Drift(DriftArgs),
-    /// Resolve drift by fixing a claim's statement and check, keeping its history.
+    /// Resolve drift by fixing a claim's statement and check; require it holds again.
     Amend(AmendArgs),
-    /// Close a claim on purpose with a note; its status becomes `retired`.
+    /// Close a claim on purpose with a note: remove its file (a git rm).
     Retire(RetireArgs),
-    /// Pilot metrics: status and verdict counts, drifts caught, staleness.
-    Stats(StatsArgs),
 
     /// Render the `supports` graph: each claim and the decisions or claims it backs
     /// (`--backers` flips it to each target and the claims backing it).
@@ -89,8 +89,9 @@ pub struct InitArgs {
 /// non-interactively — the default: a missing required flag is an error naming it,
 /// never a prompt. [`AddArgs::interactive`] (`-i`) opts into prompting for omitted
 /// fields when authoring by hand. The default path runs the check once, requires
-/// `Held`, and writes — never touching the working tree. [`AddArgs::witness_cmd`] is
-/// the optional extra-confidence path (invariant #5); see the command's module docs.
+/// `Held`, and writes the claim file — never touching the working tree otherwise, and
+/// never writing a verdict. [`AddArgs::witness_cmd`] is the optional extra-confidence
+/// path (invariant #5); see the command's module docs.
 #[derive(Debug, clap::Args)]
 pub struct AddArgs {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
@@ -110,18 +111,13 @@ pub struct AddArgs {
     #[arg(long, value_name = "CMD")]
     pub run: Option<String>,
 
-    /// When the check runs: `on-change` or `every <N>d` (e.g. `every 30d`).
-    /// Defaults to `on-change`.
-    #[arg(long, value_name = "TRIGGER")]
-    pub when: Option<String>,
-
     /// Invert the check's `Held`/`Drifted` sense (the tool owns the inversion; it
     /// never wraps the command in a shell `!`).
     #[arg(long)]
     pub negate: bool,
 
-    /// Prompt for any required field left unset (`--id`, `--statement`, `--run`,
-    /// `--max-age`) instead of erroring.
+    /// Prompt for any required field left unset (`--id`, `--statement`, `--run`)
+    /// instead of erroring.
     ///
     /// Off by default: `claim` is headless-first, so a missing required field is a
     /// machine-actionable error naming the flag, never a prompt that could hang an
@@ -130,14 +126,13 @@ pub struct AddArgs {
     #[arg(long, short = 'i')]
     pub interactive: bool,
 
-    /// The dead-man's switch: how long a passing check keeps the claim fresh, as
-    /// `<N>d` (e.g. `120d`).
+    /// An optional hub freshness-window hint, as `<N>d` (e.g. `120d`), written under
+    /// the claim's `hub:` subfield.
     ///
-    /// Required. Like `--id`, `--statement`, and `--run`, it is prompted for only
-    /// under `--interactive`; by default (an agent or CI) omitting it fails with a
-    /// clear "missing max-age; pass --max-age" error, because a claim with no
-    /// freshness window can never be nagged and would rot silently. There is no
-    /// default: how long a fact stays fresh is the author's judgment, not the tool's.
+    /// Optional: it is a hint the CLI validates but never acts on — how long a
+    /// passing check keeps the claim fresh is a property of the hub's schedule, not
+    /// of this stateless verifier. Omitted, the claim carries no `hub:` block and the
+    /// hub decides its cadence. There is no default and none is invented.
     #[arg(long, value_name = "DAYS")]
     pub max_age: Option<String>,
 
@@ -164,8 +159,7 @@ pub struct AddArgs {
     /// Not required: a passing check already verifies the fact (invariant #5). When
     /// given, the tool applies this command in a *throwaway git worktree* detached at
     /// HEAD, runs the check there expecting `Drifted`, and tears the worktree down —
-    /// so your working tree is never touched and no clean tree is required. The
-    /// observed red is recorded as evidence on the establishing verdict. Needs a
+    /// so your working tree is never touched and no clean tree is required. Needs a
     /// commit to check out, so it is refused on an unborn HEAD (commit first, or drop
     /// the flag).
     #[arg(long, value_name = "CMD")]
@@ -193,58 +187,25 @@ ENVIRONMENT:
                    wrapper around a model CLI); its cost and budget are your
                    responsibility. See docs/agent-checks.md.";
 
-/// Arguments to `claim check`: the verify loop.
+/// Arguments to `claim check`: the runtime verifier.
 ///
-/// Selection is `--due` (default) or `--all`; they are mutually exclusive. By
-/// default the verdict of every run is appended to the log; `--report-only`
-/// suppresses every write (the fork-PR / CI-advisory mode) while still reporting
-/// and still setting the exit code.
+/// `check` runs every claim's checks and reports the current verdict — it stores
+/// nothing. There are no selection flags in this MR: the CLI runs the whole store
+/// and emits `--json` a hub or CI lane consumes; running a cheap subset on a PR is
+/// the CI step's job (real selectors are issue #19).
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = CHECK_EXIT_HELP)]
-pub struct CheckArgs {
-    /// Run every claim's checks, ignoring whether they are currently due.
-    ///
-    /// Mutually exclusive with `--due`. When neither is given, `--due` is the
-    /// default: only claims whose cadence has elapsed (or that have never run) are
-    /// checked. Retired claims are never checked under either flag.
-    #[arg(long, conflicts_with = "due")]
-    pub all: bool,
+pub struct CheckArgs {}
 
-    /// Run only the claims that are currently due (the default).
-    ///
-    /// A claim is due when any `on-change` check exists (always, in v1) or an
-    /// `every Nd` check's interval has elapsed since its last run. Named explicitly
-    /// so a script can state its intent; identical to passing nothing.
-    #[arg(long, conflicts_with = "all")]
-    pub due: bool,
-
-    /// Run and report the checks but write nothing to the verdict log.
-    ///
-    /// The untrusted-runner mode (docs/design/PRODUCT.md section 3: a fork PR's CI reports
-    /// verdicts in its output only; trusted runs persist). The exit code is still
-    /// set from the verdicts, so CI can gate on it — only the persistence is
-    /// suppressed. Because nothing is written, no git identity or commit is needed.
-    ///
-    /// Note: writing nothing means this run does not advance a claim's due clock —
-    /// an `every Nd` claim stays due until a *persisting* run records a verdict. A
-    /// nightly report-only job therefore leaves everything perpetually due; pair it
-    /// with a trusted persisting run to reset the cadence.
-    #[arg(long)]
-    pub report_only: bool,
-}
-
-/// Arguments to `claim list`: the store inventory with computed status.
+/// Arguments to `claim list`: the store inventory.
 ///
-/// The filters narrow the corpus; a bare positional term does a substring search
-/// over id and statement. Filters combine with AND — every one given must hold —
-/// so `--status drifted --path src/` is "drifted claims under src/".
+/// A plain inventory — id, statement, file, supports count — with no status: the
+/// CLI stores no verdicts, so there is nothing to compute a status from here. The
+/// filters narrow the corpus; a bare positional term does a substring search over id
+/// and statement. Filters combine with AND — every one given must hold — so
+/// `--path src/ --supports x` is "claims under src/ that support x".
 #[derive(Debug, clap::Args)]
 pub struct ListArgs {
-    /// Keep only claims with this computed status: `verified`, `drifted`, `stale`,
-    /// or `retired`.
-    #[arg(long, value_name = "STATUS")]
-    pub status: Option<String>,
-
     /// Keep only claims whose file, or one of whose watched paths, is under this
     /// path prefix.
     #[arg(long, value_name = "PREFIX")]
@@ -254,40 +215,19 @@ pub struct ListArgs {
     #[arg(long, value_name = "TARGET")]
     pub supports: Option<String>,
 
-    /// Keep only claims whose computed status is `stale` (overdue: never verified,
-    /// or past `max-age`). Equivalent to `--status stale`; a shortcut for the
-    /// common "what has gone unverified" query. Drift is a distinct status — use
-    /// `claim drift` or `--status drifted` for that.
-    #[arg(long)]
-    pub stale: bool,
-
-    /// Keep only claims with no passing verdict on record: never genuinely verified
-    /// (hand-committed with no log, or only ever broken/drifted/unverifiable). A
-    /// single passing check clears it.
-    #[arg(long)]
-    pub unverified: bool,
-
     /// A substring to match against each claim's id and statement (case-sensitive).
     #[arg(value_name = "TERM")]
     pub term: Option<String>,
 }
 
-/// Arguments to `claim log`: one claim's full definition and history.
-#[derive(Debug, clap::Args)]
-pub struct LogArgs {
-    /// The id of the claim whose history to show.
-    #[arg(value_name = "ID")]
-    pub id: String,
-}
-
 /// The scriptable exit-code contract for `claim drift`, shown under `--help`.
 const DRIFT_EXIT_HELP: &str = "\
 EXIT CODES:
-  0  no claim has drifted
-  1  at least one claim has drifted (the review queue is non-empty)
-  2  a tool error (unloadable store or claim file)";
+  0  no claim's check reported drifted
+  1  at least one claim drifted (the review queue is non-empty)
+  2  a broken check, or an unloadable store or claim file";
 
-/// Arguments to `claim drift`: the review queue of drifted claims.
+/// Arguments to `claim drift`: run checks and show the drifted claims.
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DRIFT_EXIT_HELP)]
 pub struct DriftArgs {}
@@ -309,11 +249,13 @@ pub struct GraphArgs {
     pub backers: bool,
 }
 
-/// Arguments to `claim retire <id>`: close a claim on purpose.
+/// Arguments to `claim retire <id>`: close a claim on purpose by removing its file.
 ///
-/// Retirement is a deliberate lifecycle decision, not a check result, so the only
-/// inputs are the claim to close and *why*. The note is required: a retirement
-/// with no reason is the silent closure the tool exists to prevent (invariant #6).
+/// Retirement is a deliberate lifecycle decision, so the only inputs are the claim
+/// to close and *why*. The note is required: a retirement with no reason is the
+/// silent closure the tool exists to prevent (invariant #6). The changelog is git
+/// history — `git log .claims/` — so the note rides in the commit message the caller
+/// makes, not in a stored event.
 #[derive(Debug, clap::Args)]
 pub struct RetireArgs {
     /// The id of the claim to retire.
@@ -326,8 +268,7 @@ pub struct RetireArgs {
     pub note: String,
 }
 
-/// Arguments to `claim amend <id>`: fix a claim's statement and/or check in place,
-/// keeping its verdict history.
+/// Arguments to `claim amend <id>`: fix a claim's statement and/or check in place.
 ///
 /// Every field is an *overlay*: a flag left off keeps the claim's current value, so
 /// `claim amend pin --run '<new cmd>'` changes only the check. The id is not
@@ -353,10 +294,6 @@ pub struct AmendArgs {
     #[arg(long, value_name = "CMD")]
     pub run: Option<String>,
 
-    /// The new trigger: `on-change` or `every <N>d`.
-    #[arg(long, value_name = "TRIGGER")]
-    pub when: Option<String>,
-
     /// Invert the amended check's `Held`/`Drifted` sense. Only meaningful together
     /// with `--run`: negation is a property of the check, so it is set when the
     /// command is replaced and otherwise left exactly as the existing check declares
@@ -365,7 +302,7 @@ pub struct AmendArgs {
     #[arg(long, requires = "run")]
     pub negate: bool,
 
-    /// The new freshness window, as `<N>d` (e.g. `120d`).
+    /// The new hub freshness-window hint, as `<N>d` (e.g. `120d`), under `hub:`.
     #[arg(long, value_name = "DAYS")]
     pub max_age: Option<String>,
 
@@ -375,13 +312,6 @@ pub struct AmendArgs {
     #[arg(long = "supports", value_name = "TARGET")]
     pub supports: Vec<String>,
 }
-
-/// Arguments to `claim stats`: the pilot instrumentation (docs/design/PRODUCT.md section 9).
-///
-/// A read-only rollup over the whole store; no selection flags in v1, because the
-/// pilot wants the corpus-wide picture. `--json` (global) is the structured form.
-#[derive(Debug, clap::Args)]
-pub struct StatsArgs {}
 
 /// Help text for `claim docs`, naming the topics and the two shipping modes so a
 /// user sees the whole surface under `--help` without reading the source.

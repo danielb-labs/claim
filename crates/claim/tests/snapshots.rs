@@ -1,55 +1,42 @@
-//! Snapshot tests for the four read verbs' human output (CLAUDE.md's insta
-//! obligation), so a change to a table or a report is a deliberate, reviewable
-//! diff.
+//! Snapshot tests for the verbs' human output (CLAUDE.md's insta obligation), so a
+//! change to a table or a report is a deliberate, reviewable diff.
 //!
-//! Every fixture is built from fixed bytes with `now` pinned via `CLAIM_NOW`, and
-//! the store paths in the output are store-relative (`.claims/x.md`) not temp
-//! paths, so the snapshots are stable across runs and machines. Verdicts are
-//! seeded with the all-zero commit sha, which abbreviates to a fixed `0000000`.
+//! Every fixture is built from fixed bytes, and the store paths in the output are
+//! store-relative (`.claims/x.md`) not temp paths, so the snapshots are stable across
+//! runs and machines. The checks are inert (`true`, or a `grep` against a committed
+//! `requirements.txt`), so no wall-clock durations leak into the output.
 
 mod common;
 
 use common::TestRepo;
 
-const NOW: &str = "2026-07-17T00:00:00Z";
-
-/// A cmd claim; the check body is inert (`list`/`drift`/`log` never run it).
-fn claim_file(id: &str, max_age: &str, supports: &str) -> String {
+/// A cmd claim whose check is `true` (always holds). The check body is inert for
+/// `list`; `check`/`drift` run it and it holds.
+fn claim_file(id: &str, supports: &str) -> String {
     let supports_block = if supports.is_empty() {
         String::new()
     } else {
         format!("supports:\n  - {supports}\n")
     };
     format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: {max_age}\n{supports_block}---\nStatement for {id}.\n"
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n{supports_block}---\nStatement for {id}.\n"
     )
 }
 
-/// A store with three claims of distinct status at NOW: verified, drifted, stale.
-fn mixed_store() -> TestRepo {
+/// A store with three claims: two plain, one with a supports edge.
+fn simple_store() -> TestRepo {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-
-    repo.write_claim("fresh", &claim_file("fresh", "120d", ""));
-    repo.write_verdict("fresh", "2026-07-10T00:00:00Z", "held");
-
-    repo.write_claim(
-        "gone",
-        &claim_file("gone", "120d", "requirements.txt#libfoo"),
-    );
-    repo.write_verdict("gone", "2026-07-10T00:00:00Z", "held");
-    repo.write_verdict("gone", "2026-07-15T00:00:00Z", "drifted");
-
-    repo.write_claim("old", &claim_file("old", "30d", ""));
-    repo.write_verdict("old", "2026-01-01T00:00:00Z", "held");
-
+    repo.write_claim("a-fact", &claim_file("a-fact", ""));
+    repo.write_claim("b-fact", &claim_file("b-fact", "requirements.txt#libfoo"));
+    repo.write_claim("c-fact", &claim_file("c-fact", ""));
     repo
 }
 
 /// The stdout of a `claim` invocation as a UTF-8 string, for snapshotting.
 fn stdout(repo: &TestRepo, args: &[&str], code: i32) -> String {
     let out = repo
-        .claim_at(NOW)
+        .claim()
         .args(args)
         .assert()
         .code(code)
@@ -59,29 +46,10 @@ fn stdout(repo: &TestRepo, args: &[&str], code: i32) -> String {
     String::from_utf8(out).expect("stdout is UTF-8")
 }
 
-// `list` renders a `now`-relative "STALE-IN" countdown, so its output depends on
-// the `CLAIM_NOW` seam being honored — which only happens in a debug build. A
-// release run reads the wall clock, so the countdown drifts by the days since NOW
-// and the snapshot cannot match. Gated on the same `#[cfg(debug_assertions)]` as
-// the seam, so `cargo test --release` stays clean. The other snapshots below print
-// no clock-relative value and run in either profile.
-#[cfg(debug_assertions)]
 #[test]
 fn list_human_table_snapshot() {
-    let repo = mixed_store();
+    let repo = simple_store();
     insta::assert_snapshot!(stdout(&repo, &["list"], 0));
-}
-
-#[test]
-fn drift_human_snapshot() {
-    let repo = mixed_store();
-    insta::assert_snapshot!(stdout(&repo, &["drift"], 1));
-}
-
-#[test]
-fn log_human_snapshot() {
-    let repo = mixed_store();
-    insta::assert_snapshot!(stdout(&repo, &["log", "gone"], 0));
 }
 
 #[test]
@@ -90,19 +58,36 @@ fn check_human_snapshot() {
     // always exit 0) and no wall-clock durations leak into the output.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    repo.write_claim("a", &claim_file("a", "120d", ""));
-    repo.write_claim("b", &claim_file("b", "120d", "requirements.txt#libfoo"));
-    // --report-only so the run writes nothing (keeps the fixture inspectable) and
-    // the "(report-only: not recorded)" line is exercised.
-    insta::assert_snapshot!(stdout(&repo, &["check", "--all", "--report-only"], 0));
+    repo.write_claim("a", &claim_file("a", ""));
+    repo.write_claim("b", &claim_file("b", "requirements.txt#libfoo"));
+    insta::assert_snapshot!(stdout(&repo, &["check"], 0));
+}
+
+#[test]
+fn drift_clean_human_snapshot() {
+    // Every check holds, so the drift queue is clean (exit 0).
+    let repo = simple_store();
+    insta::assert_snapshot!(stdout(&repo, &["drift"], 0));
+}
+
+#[test]
+fn drift_with_a_drifted_claim_snapshot() {
+    // One claim whose check reports drifted (a grep that fails), so it appears in the
+    // queue (exit 1).
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("held", &claim_file("held", ""));
+    repo.write_claim(
+        "gone",
+        "---\nid: gone\nchecks:\n  - kind: cmd\n    run: \"grep -q 'not-in-file' requirements.txt\"\nsupports:\n  - requirements.txt#libfoo\n---\nStatement for gone.\n",
+    );
+    insta::assert_snapshot!(stdout(&repo, &["drift"], 1));
 }
 
 /// Redact the non-deterministic fragments a write verb prints — the abbreviated
-/// commit sha, the temp store root, and the verdict-log filename's timestamp+hash —
-/// so the snapshot captures the stable wording, not a run's incidental paths. Done
-/// with plain string rewriting (no regex/insta-filters feature): each volatile
-/// fragment sits on a line with a fixed, recognizable prefix, so the redaction keys
-/// off that prefix rather than a pattern.
+/// commit sha and the temp store root — so the snapshot captures the stable wording,
+/// not a run's incidental paths. Done with plain string rewriting (no regex): each
+/// volatile fragment sits on a line with a fixed, recognizable prefix.
 fn redact_write_output(body: &str, root: &std::path::Path) -> String {
     // The tool prints the store root as git discovered it, which on macOS is the
     // canonicalized `/private/...` form, not the `/var/folders/...` symlink `TempDir`
@@ -114,13 +99,11 @@ fn redact_write_output(body: &str, root: &std::path::Path) -> String {
     body.lines()
         .map(|line| {
             if let Some(idx) = line.find("at commit ") {
-                // "Recorded ... at commit <7hex>." — keep everything up to the sha.
+                // "The check held ... at commit <7hex>." — keep everything up to the sha.
                 format!("{}at commit <sha>.", &line[..idx])
             } else if line.trim_start().starts_with("git -C ") {
-                // "  git -C <root> add <paths>" — redact the temp root and any
-                // verdict-log filename in the argument list.
-                let redacted_root = line.replacen(&root, "<root>", 1);
-                redact_log_filenames(&redacted_root)
+                // "  git -C <root> add/rm/commit ..." — redact the temp root.
+                line.replacen(&root, "<root>", 1)
             } else {
                 line.to_owned()
             }
@@ -129,31 +112,12 @@ fn redact_write_output(body: &str, root: &std::path::Path) -> String {
         .join("\n")
 }
 
-/// Replace any `.claims/log/<id>/<stamp>-<hash>.json` argument with a stable token,
-/// so a verdict-log filename's timestamp and content hash do not churn the snapshot.
-fn redact_log_filenames(line: &str) -> String {
-    line.split(' ')
-        .map(|tok| {
-            if tok.starts_with(".claims/log/") && tok.ends_with(".json") {
-                let id = tok
-                    .strip_prefix(".claims/log/")
-                    .and_then(|rest| rest.split('/').next())
-                    .unwrap_or("<id>");
-                format!(".claims/log/{id}/<entry>.json")
-            } else {
-                tok.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[test]
 fn retire_human_snapshot() {
-    let repo = mixed_store();
+    let repo = simple_store();
     let body = stdout(
         &repo,
-        &["retire", "gone", "--note", "libfoo 5.0 shipped"],
+        &["retire", "b-fact", "--note", "superseded by a real test"],
         0,
     );
     insta::assert_snapshot!(redact_write_output(&body, repo.path()));
@@ -165,30 +129,11 @@ fn amend_human_snapshot() {
     // amend succeeds deterministically (a `true` cmd is always exit 0).
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
-    repo.write_claim("pin", &claim_file("pin", "120d", ""));
+    repo.write_claim("pin", &claim_file("pin", ""));
     let body = stdout(
         &repo,
         &["amend", "pin", "--statement", "We now pin libfoo at 5.0."],
         0,
     );
     insta::assert_snapshot!(redact_write_output(&body, repo.path()));
-}
-
-// `stats` counts statuses computed against `now`, so like `list` its output
-// depends on the `CLAIM_NOW` seam and only matches in a debug build. Gated on
-// `#[cfg(debug_assertions)]` so `cargo test --release` stays clean.
-#[cfg(debug_assertions)]
-#[test]
-fn stats_human_snapshot() {
-    // A store spanning all four statuses plus a never-verified claim, so the snapshot
-    // exercises non-zero `retired` and `never verified` rows (not just the all-zero
-    // fixture). `now` is pinned, so every number and the honesty note are stable — no
-    // redaction needed.
-    let repo = mixed_store();
-    repo.write_claim("closed", &claim_file("closed", "120d", ""));
-    repo.write_verdict("closed", "2026-07-10T00:00:00Z", "held");
-    repo.write_retirement("closed", "2026-07-12T00:00:00Z", "superseded");
-    repo.write_claim("blank", &claim_file("blank", "30d", ""));
-    repo.write_verdict("blank", "2026-07-14T00:00:00Z", "broken");
-    insta::assert_snapshot!(stdout(&repo, &["stats"], 0));
 }
