@@ -1,0 +1,10 @@
+{
+  "at": "2026-07-18T21:16:40.971887Z",
+  "commit": "c7fd9d5686c4e0ecfd68025c34aac3ad91693da3",
+  "actor": "Daniel Balagula <daniel.balagula@pm.me>",
+  "event": {
+    "type": "verification",
+    "verdict": "held",
+    "evidence": null
+  }
+}
