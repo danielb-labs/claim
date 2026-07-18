@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install stable --component rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      # Runs the exact same gate as scripts/check.sh so local and CI never
+      # disagree about what "green" means.
+      - run: ./scripts/check.sh

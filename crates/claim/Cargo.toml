@@ -1,0 +1,16 @@
+[package]
+name = "claim"
+description = "Git-native CLI that binds plain-language facts to executable checks, so recorded knowledge cannot silently rot."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "claim"
+path = "src/main.rs"
+
+[dependencies]
+claim-core = { path = "../claim-core" }
+anyhow = { workspace = true }

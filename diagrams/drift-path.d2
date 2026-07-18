@@ -1,0 +1,26 @@
+# The drift path, end to end: both lanes, one verdict log, routed pressure.
+# Render: d2 --layout=elk drift-path.d2 drift-path.svg
+
+direction: down
+
+commit: "A commit touches watched paths\n(on-change lane)"
+clock: "The clock ticks\n(daily pipeline / hub scheduler)"
+ci: "CI runs the affected checks"
+runners: "Runners execute all due checks\n(budgeted; agent verdicts spot-audited)"
+verdict: "Verdict appended to the log, as a commit"
+holds: "holds:\nnothing to do" {shape: oval}
+drift: "DRIFT" {style.fill: "#f4cccc"}
+pr: "Comment on the causing PR:\nthe fact, the decision it supports,\nthe owner — a reason, not a red X"
+owner: "Review item for the decision's owner\n(looked up live from CODEOWNERS)"
+sus: "Claims resting on it become SUSPECT,\nqueued for their own re-checks" {style.fill: "#fff2cc"}
+esc: "While unhandled, pressure climbs:\ncomment, then nag, then the owning\nteam's gate, then block\n(climb speed set per claim class)"
+resolve: "Owner resolves:\namend / retire" {shape: oval}
+
+commit -> ci -> verdict
+clock -> runners -> verdict
+verdict -> holds
+verdict -> drift
+drift -> pr
+drift -> owner
+drift -> sus
+owner -> esc -> resolve

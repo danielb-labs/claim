@@ -1,0 +1,16 @@
+[package]
+name = "claim-mcp"
+description = "Model Context Protocol server exposing claim knowledge to agents: query verified facts, report verdicts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "claim-mcp"
+path = "src/main.rs"
+
+[dependencies]
+claim-core = { path = "../claim-core" }
+anyhow = { workspace = true }

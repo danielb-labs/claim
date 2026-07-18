@@ -1,0 +1,17 @@
+# How truth moves along supports edges: doubt travels, proof does not.
+# (Propagation ships post-v1; v1's drift report lists the same one-hop set.)
+# Render: d2 --layout=elk graph-propagation.d2 graph-propagation.svg
+
+direction: right
+
+a: "\"PDF export uses CJK fonts\"\n\nstatus: DRIFTED\n(its own check failed)" {style.fill: "#f4cccc"}
+b: "\"Pin libfoo at 4.2 —\n5.x corrupts CJK PDFs\"\n\nstatus: SUSPECT\n(queued for its own re-check)" {style.fill: "#fff2cc"}
+d: "Decision: libfoo==4.2\nin requirements.txt\n\nflagged for owner review" {style.fill: "#fff2cc"}
+
+a -> b: "supports"
+b -> d: "supports"
+
+a -> b: "doubt" {style.stroke: "#cc0000"; style.stroke-dash: 3}
+b -> d: "doubt" {style.stroke: "#cc0000"; style.stroke-dash: 3}
+
+note: "The other direction never happens:\nif the CJK claim re-verifies, nothing\ndownstream turns green with it.\nEvery claim earns its own green\nfrom its own check." {shape: page}

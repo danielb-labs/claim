@@ -1,0 +1,24 @@
+# Claim status lifecycle. Status is computed, never stored in the file.
+# A claim exists when its file is merged into the store; before that it's a PR.
+# Render: d2 --layout=elk lifecycle.d2 lifecycle.svg
+
+direction: right
+
+merged: "claim file merged\ninto the store" {shape: oval}
+verified: "VERIFIED" {style.fill: "#d9ead3"}
+suspect: "SUSPECT" {style.fill: "#fff2cc"}
+drifted: "DRIFTED" {style.fill: "#f4cccc"}
+stale: "STALE" {style.fill: "#fce5cd"}
+retired: "RETIRED\n(closing note may point\nat a replacing test)" {shape: oval}
+
+merged -> verified: "via claim add:\nfirst passing check\nlogged at creation"
+merged -> stale: "hand-committed,\nno verdicts yet:\ndue immediately"
+verified -> verified: "own check passes\n(max-age renewed)"
+verified -> suspect: "a claim it rests on drifts,\nor it conflicts with a\nverified claim"
+suspect -> verified: "own check passes"
+suspect -> drifted: "own check fails"
+verified -> drifted: "own check fails"
+verified -> stale: "max-age expires, or checks\nstay broken or inconclusive"
+stale -> verified: "checks run and pass,\nor a human amends"
+drifted -> retired: "retire: decision re-reviewed\n(maybe replaced by a real test)"
+drifted -> verified: "amend: fix the\nstatement + check"

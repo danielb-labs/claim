@@ -1,0 +1,31 @@
+# System architecture: who talks to what, and in which direction truth flows.
+# Render: d2 --layout=elk architecture.d2 architecture.svg
+
+direction: down
+
+cli: "claim CLI\nhumans; works fully offline"
+mcp: "MCP server\nagents: query, propose,\nreport, flag"
+ci: "CI step\non-change lane;\ncomments on PRs"
+
+repos: "YOUR REPOS  —  the source of truth" {
+  a: "repo A\ncode + .claims/\n+ verdict log"
+  b: "repo B\ncode + .claims/\n+ verdict log"
+  org: "org claims repo\n.claims/ only\n(org-level knowledge)"
+}
+
+hub: "THE HUB  —  derived; can always be rebuilt from the repos" {
+  index: "Index & search"
+  kg: "Knowledge graph"
+  queues: "Review queues"
+  dash: "Dashboards"
+  sched: "Scheduler"
+  runners: "Runners — hosted or self-hosted\n(execute cmd + agent checks)"
+  sched -> runners: "dispatches due checks"
+}
+
+cli -> repos: "read / commit"
+mcp -> repos: "read / propose as PRs"
+ci -> repos: "run on-change checks"
+
+repos -> hub: "reads: sync & reindex, anytime" {style.stroke-dash: 3}
+hub -> repos: "writes: only commits & PRs\n(incl. verification verdicts)"

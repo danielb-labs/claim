@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/claim-core", "crates/claim", "crates/claim-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/danielbalagula/claim"
+
+# Shared dependency versions. Crates opt in to what they actually use; adding a
+# line here does not pull the dependency into every crate. Only rock-solid,
+# broadly-used crates belong here — item-specific dependencies are declared in
+# the crate that needs them, with a one-line justification in its Cargo.toml.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+
+# A verification tool must never be slower than the checks it runs, but it also
+# must never trade correctness for speed. Optimize release builds; keep debug
+# assertions honest.
+[profile.release]
+opt-level = 3
+lto = "thin"
