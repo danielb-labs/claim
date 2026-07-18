@@ -24,6 +24,12 @@ serde_norway = "0.9"
 # Instant and duration arithmetic for the verdict log and status computation.
 # See crates/claim-core/Cargo.toml for the rationale.
 jiff = { version = "0.2", features = ["serde"] }
+# Wait on a child process with a deadline, so a hung check cannot hang the tool.
+# See crates/claim-core/Cargo.toml for the rationale.
+wait-timeout = "0.2"
+# Raw libc for the process-group kill (`killpg`) that stops a timed-out check's
+# grandchildren, not just its shell. See crates/claim-core/Cargo.toml.
+libc = "0.2"
 
 # A verification tool must never be slower than the checks it runs, but it also
 # must never trade correctness for speed. Optimize release builds; keep debug
