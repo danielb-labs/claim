@@ -97,7 +97,9 @@ struct AddReport {
 /// `Drifted`; a git provenance failure; or an I/O failure writing the file or log.
 pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
-    let store = discover(&cwd).map_err(|e| app(ErrorKind::NoStore, e.to_string()))?;
+    // `discover` already tags a missing store with `ErrorKind::NoStore`, so no
+    // per-verb remapping is needed — every verb agrees on the kind.
+    let store = discover(&cwd)?;
 
     let draft = gather_draft(args, format)?;
 
@@ -243,18 +245,37 @@ fn parse_id(raw: &str) -> Result<ClaimId> {
         .map_err(|e| app(ErrorKind::InvalidInput, e.to_string()))
 }
 
-/// Refuse a claim whose id already exists in the store: a duplicate would either
-/// clobber a real claim's file or collide its log. The check is on the file path;
-/// the id is unique per store by design.
+/// Refuse a claim whose id already exists anywhere in the store.
+///
+/// A duplicate id is a false-green hazard: two files sharing an id share one
+/// verdict log (`.claims/log/<id>/`), so their histories interleave and a drifted
+/// fact can read as verified. Checking only the canonical path `.claims/<id>.md`
+/// misses a claim that declares the same id from a *differently named* file, so
+/// this scans every parsed claim's id, not just the one path — the id, not the
+/// filename, is what must be unique. A canonical-path collision is still checked
+/// too, in case a file exists but does not parse (and so is absent from the id
+/// scan).
 fn reject_duplicate(store: &Store, claim: &Claim) -> Result<()> {
-    let path = store.claim_file(&claim.id);
-    if path.exists() {
+    let canonical = store.claim_file(&claim.id);
+    if canonical.exists() {
         return Err(app(
             ErrorKind::DuplicateId,
             format!(
                 "a claim with id '{}' already exists at {}; choose a different id or edit that file",
                 claim.id,
-                path.display()
+                canonical.display()
+            ),
+        ));
+    }
+
+    let load = store.load_all()?;
+    if let Some(existing) = load.claims.iter().find(|c| c.claim.id == claim.id) {
+        return Err(app(
+            ErrorKind::DuplicateId,
+            format!(
+                "a claim with id '{}' is already declared in {}; choose a different id or edit \
+                 that file",
+                claim.id, existing.path
             ),
         ));
     }

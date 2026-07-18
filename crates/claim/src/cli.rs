@@ -7,13 +7,13 @@
 //!
 //! - **A global `--json` flag** ([`Cli::json`]). Agents are the heaviest readers
 //!   (PRODUCT.md section 5), so every command owes a stable machine form. The flag
-//!   is parsed once at the top level and threaded to each command; `init` and `add`
-//!   honor it now, and a later verb inherits the plumbing for free.
+//!   is parsed once at the top level and threaded to each command.
 //! - **A stub for every unbuilt verb** ([`Command`]). The full v1 verb list is
 //!   declared so `claim --help` shows the real surface from the first item and a
 //!   later item slots its logic into an existing arm rather than adding one. An
-//!   unbuilt verb exits 2 (usage/other error) with a "not implemented" message,
-//!   never 0 — an unfinished command must not look like a success.
+//!   unbuilt verb (`amend`, `retire`, `stats`) exits 2 (usage/other error) with a
+//!   "not implemented" message, never 0 — an unfinished command must not look like
+//!   a success.
 
 use clap::{Parser, Subcommand};
 
@@ -53,14 +53,14 @@ pub enum Command {
     /// entry.
     Add(AddArgs),
 
-    /// Run checks and report holds/drifted/inconclusive/broken. (Not yet built.)
-    Check,
-    /// Filter claims by text, path, status, staleness, or supports. (Not yet built.)
-    List,
-    /// Show a claim's full history and evidence. (Not yet built.)
-    Log,
-    /// List drifted and due claims with what each supports. (Not yet built.)
-    Drift,
+    /// Run checks and report holds/drifted/unverifiable/broken.
+    Check(CheckArgs),
+    /// Filter claims by text, path, status, staleness, or supports.
+    List(ListArgs),
+    /// Show a claim's full history and evidence.
+    Log(LogArgs),
+    /// List drifted claims with what each supports.
+    Drift(DriftArgs),
     /// Resolve drift by fixing a claim's statement and check. (Not yet built.)
     Amend,
     /// Resolve drift by closing a claim with a note. (Not yet built.)
@@ -76,10 +76,10 @@ impl Command {
         match self {
             Command::Init(_) => "init",
             Command::Add(_) => "add",
-            Command::Check => "check",
-            Command::List => "list",
-            Command::Log => "log",
-            Command::Drift => "drift",
+            Command::Check(_) => "check",
+            Command::List(_) => "list",
+            Command::Log(_) => "log",
+            Command::Drift(_) => "drift",
             Command::Amend => "amend",
             Command::Retire => "retire",
             Command::Stats => "stats",
@@ -174,3 +174,109 @@ pub struct AddArgs {
     #[arg(long)]
     pub unwitnessed: bool,
 }
+
+/// The scriptable exit-code contract for `claim check`, shown under
+/// `--help`/`--long-help` so a CI author sees it without reading the source.
+const CHECK_EXIT_HELP: &str = "\
+EXIT CODES (highest applicable wins, 2 > 1 > 0):
+  0  every check held and every support resolved
+  1  a drifted or unverifiable verdict, or an unresolved support (review needed)
+  2  a broken check, an unloadable/duplicate-id claim file, or a tool error";
+
+/// Arguments to `claim check`: the verify loop.
+///
+/// Selection is `--due` (default) or `--all`; they are mutually exclusive. By
+/// default the verdict of every run is appended to the log; `--report-only`
+/// suppresses every write (the fork-PR / CI-advisory mode) while still reporting
+/// and still setting the exit code.
+#[derive(Debug, clap::Args)]
+#[command(after_long_help = CHECK_EXIT_HELP)]
+pub struct CheckArgs {
+    /// Run every claim's checks, ignoring whether they are currently due.
+    ///
+    /// Mutually exclusive with `--due`. When neither is given, `--due` is the
+    /// default: only claims whose cadence has elapsed (or that have never run) are
+    /// checked. Retired claims are never checked under either flag.
+    #[arg(long, conflicts_with = "due")]
+    pub all: bool,
+
+    /// Run only the claims that are currently due (the default).
+    ///
+    /// A claim is due when any `on-change` check exists (always, in v1) or an
+    /// `every Nd` check's interval has elapsed since its last run. Named explicitly
+    /// so a script can state its intent; identical to passing nothing.
+    #[arg(long, conflicts_with = "all")]
+    pub due: bool,
+
+    /// Run and report the checks but write nothing to the verdict log.
+    ///
+    /// The untrusted-runner mode (PRODUCT.md section 3: a fork PR's CI reports
+    /// verdicts in its output only; trusted runs persist). The exit code is still
+    /// set from the verdicts, so CI can gate on it — only the persistence is
+    /// suppressed. Because nothing is written, no git identity or commit is needed.
+    ///
+    /// Note: writing nothing means this run does not advance a claim's due clock —
+    /// an `every Nd` claim stays due until a *persisting* run records a verdict. A
+    /// nightly report-only job therefore leaves everything perpetually due; pair it
+    /// with a trusted persisting run to reset the cadence.
+    #[arg(long)]
+    pub report_only: bool,
+}
+
+/// Arguments to `claim list`: the store inventory with computed status.
+///
+/// The filters narrow the corpus; a bare positional term does a substring search
+/// over id and statement. Filters combine with AND — every one given must hold —
+/// so `--status drifted --path src/` is "drifted claims under src/".
+#[derive(Debug, clap::Args)]
+pub struct ListArgs {
+    /// Keep only claims with this computed status: `verified`, `drifted`, `stale`,
+    /// or `retired`.
+    #[arg(long, value_name = "STATUS")]
+    pub status: Option<String>,
+
+    /// Keep only claims whose file, or one of whose watched paths, is under this
+    /// path prefix.
+    #[arg(long, value_name = "PREFIX")]
+    pub path: Option<String>,
+
+    /// Keep only claims that declare this `supports` target.
+    #[arg(long, value_name = "TARGET")]
+    pub supports: Option<String>,
+
+    /// Keep only claims whose computed status is `stale` (overdue: never verified,
+    /// or past `max-age`). Equivalent to `--status stale`; a shortcut for the
+    /// common "what has gone unverified" query. Drift is a distinct status — use
+    /// `claim drift` or `--status drifted` for that.
+    #[arg(long)]
+    pub stale: bool,
+
+    /// Keep only claims with no passing verdict on record, or explicitly recorded
+    /// unwitnessed: the acknowledged epistemic debt (soft-debt view).
+    #[arg(long)]
+    pub unverified: bool,
+
+    /// A substring to match against each claim's id and statement (case-sensitive).
+    #[arg(value_name = "TERM")]
+    pub term: Option<String>,
+}
+
+/// Arguments to `claim log`: one claim's full definition and history.
+#[derive(Debug, clap::Args)]
+pub struct LogArgs {
+    /// The id of the claim whose history to show.
+    #[arg(value_name = "ID")]
+    pub id: String,
+}
+
+/// The scriptable exit-code contract for `claim drift`, shown under `--help`.
+const DRIFT_EXIT_HELP: &str = "\
+EXIT CODES:
+  0  no claim has drifted
+  1  at least one claim has drifted (the review queue is non-empty)
+  2  a tool error (unloadable store or claim file)";
+
+/// Arguments to `claim drift`: the review queue of drifted claims.
+#[derive(Debug, clap::Args)]
+#[command(after_long_help = DRIFT_EXIT_HELP)]
+pub struct DriftArgs {}
