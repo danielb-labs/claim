@@ -1,0 +1,72 @@
+{
+  "status": "ok",
+  "selection": "all",
+  "report_only": true,
+  "now": "2026-07-18T06:32:51.556860Z",
+  "exit": 2,
+  "checked": 3,
+  "claims": [
+    {
+      "id": "builds/ci-node",
+      "file": ".claims/builds/ci-node.md",
+      "checks": [
+        {
+          "verdict": "held",
+          "end": { "kind": "exited", "code": 0 },
+          "detail": "exit 0",
+          "evidence": null,
+          "when": "every 30d"
+        }
+      ],
+      "supports": [
+        {
+          "target": "docs/decisions/node20.md",
+          "resolved": false,
+          "reason": "'docs/decisions/node20.md' resolves to neither an existing file nor a claim id in the store; the decision or claim it supports may have been deleted"
+        }
+      ],
+      "persisted": false,
+      "exit": 1
+    },
+    {
+      "id": "infra/config-v1",
+      "file": ".claims/infra/config-v1.md",
+      "checks": [
+        {
+          "verdict": "broken",
+          "end": { "kind": "exited", "code": 2 },
+          "detail": "exit 2",
+          "evidence": "grep: config.txt: No such file or directory\n",
+          "when": "on-change"
+        }
+      ],
+      "supports": [],
+      "persisted": false,
+      "exit": 2
+    },
+    {
+      "id": "payments/libfoo-pin",
+      "file": ".claims/payments/libfoo-pin.md",
+      "checks": [
+        {
+          "verdict": "drifted",
+          "end": { "kind": "exited", "code": 1 },
+          "detail": "exit 1",
+          "evidence": null,
+          "when": "on-change"
+        }
+      ],
+      "supports": [
+        {
+          "target": "requirements.txt#libfoo",
+          "resolved": true,
+          "reason": null
+        }
+      ],
+      "persisted": false,
+      "exit": 1
+    }
+  ],
+  "errors": [],
+  "notes": []
+}

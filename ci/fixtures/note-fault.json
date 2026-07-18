@@ -1,0 +1,30 @@
+{
+  "status": "ok",
+  "selection": "all",
+  "report_only": true,
+  "now": "2026-07-18T07:01:40.784533Z",
+  "exit": 2,
+  "checked": 1,
+  "claims": [
+    {
+      "id": "sample/one",
+      "file": ".claims/sample/one.md",
+      "checks": [
+        {
+          "verdict": "held",
+          "end": { "kind": "exited", "code": 0 },
+          "detail": "exit 0",
+          "evidence": null,
+          "when": "on-change"
+        }
+      ],
+      "supports": [],
+      "persisted": false,
+      "exit": 0
+    }
+  ],
+  "errors": [],
+  "notes": [
+    ".claims/sample/one.md: could not read the verdict log (.claims/log/sample/one: Permission denied (os error 13)); checking anyway"
+  ]
+}

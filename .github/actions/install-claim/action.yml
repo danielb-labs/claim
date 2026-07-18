@@ -1,0 +1,45 @@
+# Build and install the `claim` binary from source, and put it on PATH.
+#
+# Factored out so both CI lanes install the tool identically. Builds with `cargo
+# install --path`, which produces a release binary in `~/.cargo/bin` (already on PATH
+# on GitHub runners). The Rust toolchain ships preinstalled on `ubuntu-latest`; the
+# cache keeps rebuilds cheap across runs.
+#
+# Pinned to building from source (rather than downloading a release) because the tool
+# has no published release channel yet; when one exists, this action gains a fast path
+# that downloads the pinned binary and skips the build.
+
+name: Install claim
+description: Build the claim binary from source and add it to PATH.
+
+inputs:
+  source-path:
+    description: Path to the claim CLI crate to build (the directory with its Cargo.toml).
+    required: true
+  workspace-root:
+    description: >
+      The cargo workspace root, for the build cache. Defaults to source-path, but a
+      crate inside a workspace should pass the workspace directory so the cache keys on
+      the right lockfile.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Cache the cargo build
+      # SHA-pinned (v2.9.1): a mutable tag on a trust tool's supply chain is the exact
+      # rot this product exists to prevent. Bump the SHA and the version comment together.
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      with:
+        # rust-cache keys on the workspace's Cargo.lock, so this must be the workspace
+        # root, not a member crate dir — otherwise the cache never hits.
+        workspaces: ${{ inputs.workspace-root != '' && inputs.workspace-root || inputs.source-path }}
+
+    - name: Build and install
+      shell: bash
+      # The path is interpolated via env, not directly into the shell, to keep untrusted
+      # input off the command line (the Actions injection footgun).
+      env:
+        SOURCE_PATH: ${{ inputs.source-path }}
+      run: cargo install --path "$SOURCE_PATH" --locked
