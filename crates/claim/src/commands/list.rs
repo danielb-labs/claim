@@ -207,6 +207,10 @@ struct Row {
     stale_in_days: Option<i64>,
     /// How many `supports` targets the claim declares.
     supports: usize,
+    /// How many of the claim's checks declare a skip. Surfaced so a claim kept green
+    /// only by a skip never *looks* silently healthy — a non-zero count marks it as
+    /// deliberately parked, and lets a reviewer audit skips across the corpus.
+    skips: usize,
     /// Whether the claim needs attention now (stale or drifted).
     due: bool,
 }
@@ -220,6 +224,12 @@ impl Row {
             last_verified: report.last_verified.map(|t| t.to_string()),
             stale_in_days: report.stale_at.map(|at| whole_days_between(now, at)),
             supports: loaded.claim.supports.len(),
+            skips: loaded
+                .claim
+                .checks
+                .iter()
+                .filter(|c| c.skip.is_some())
+                .count(),
             due: report.due,
         }
     }
@@ -266,9 +276,16 @@ fn header_cells() -> [String; 5] {
 
 /// The five display cells for one row, in header order.
 fn row_cells(row: &Row) -> [String; 5] {
+    // A claim carrying a skip is marked in its status cell so it reads as parked, not
+    // silently healthy — the same fact the `skips` count carries in `--json`.
+    let status = if row.skips > 0 {
+        format!("{} +skip", status_label(row.status))
+    } else {
+        status_label(row.status).to_owned()
+    };
     [
         row.id.clone(),
-        status_label(row.status).to_owned(),
+        status,
         last_verified_cell(row),
         stale_in_cell(row),
         row.supports.to_string(),

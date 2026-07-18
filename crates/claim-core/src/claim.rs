@@ -23,6 +23,7 @@
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
+use jiff::Timestamp;
 use serde_norway::Value;
 
 use crate::error::{Error, Result};
@@ -160,6 +161,40 @@ pub struct Check {
     pub kind: CheckKind,
     /// When this check should run.
     pub when: Trigger,
+    /// An optional declared skip: conditions under which this check is deliberately
+    /// not run. `None` — the common case — means the check always runs when due.
+    pub skip: Option<Skip>,
+}
+
+/// A declared, justified reason not to run a check in some environments.
+///
+/// A skip is an *acknowledged, bounded debt* — never a pass. A skipped check records
+/// no verdict and never advances freshness, so the claim honestly decays toward
+/// `Stale` while the skip explains why; the build stays green only where the skip
+/// legitimately applies. This is the single most dangerous thing a verification tool
+/// can offer (it is exactly the stale-green-light the tool exists to prevent), so the
+/// fields are shaped to keep it honest:
+///
+/// - [`reason`](Skip::reason) is mandatory — a silent skip is refused at parse time.
+/// - [`unless`](Skip::unless) *cancels* the skip and runs the check when a condition
+///   holds, so an environment that can verify does. A condition that cannot be
+///   evaluated runs the check rather than silently muting it.
+/// - [`until`](Skip::until) expires the skip so the debt is eventually called.
+///
+/// Who added a skip, and when, is git's to say (invariant #3), never the file's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Skip {
+    /// Why this check is skipped. Required; a skip with no reason is refused at parse.
+    pub reason: String,
+    /// A shell command whose success (exit 0) *cancels* the skip and runs the check;
+    /// a failure (exit 1) leaves the skip in force. A command that cannot be
+    /// evaluated (any other exit, a spawn failure, a timeout) runs the check — a
+    /// broken condition must never silently mute a check.
+    pub unless: Option<String>,
+    /// The instant the skip expires. On or after it the check runs regardless of
+    /// `unless`, and the lapse is reported. `None` means the skip has no time bound.
+    pub until: Option<Timestamp>,
 }
 
 /// A check's mechanism, with the fields that mechanism needs.
@@ -838,7 +873,7 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
                     run: run.to_owned(),
                     negate,
                 },
-                &["kind", "run", "negate", "when"],
+                &["kind", "run", "negate", "when", "skip"],
             )
         }
         "agent" => {
@@ -847,7 +882,7 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
                 CheckKind::Agent {
                     instruction: instruction.to_owned(),
                 },
-                &["kind", "instruction", "when"],
+                &["kind", "instruction", "when", "skip"],
             )
         }
         "human" => {
@@ -865,7 +900,10 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
                     ));
                 }
             };
-            (CheckKind::Human { prompt }, &["kind", "prompt", "when"])
+            (
+                CheckKind::Human { prompt },
+                &["kind", "prompt", "when", "skip"],
+            )
         }
         other => {
             return Err(Error::parse(
@@ -901,7 +939,139 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
     let when = Trigger::parse(when_raw)
         .map_err(|reason| Error::parse(path, format!("{}: {reason}", field("when"))))?;
 
-    Ok(Check { kind, when })
+    let skip = parse_skip(path, map, index)?;
+
+    Ok(Check { kind, when, skip })
+}
+
+/// Parse an optional `skip:` block on a check.
+///
+/// Absent or null means no skip. A present skip must be a mapping with a non-empty
+/// `reason` (the mandatory justification — a silent skip is exactly the stale green
+/// this tool refuses); `unless` (an optional non-empty command) and `until` (an
+/// optional date or RFC 3339 instant) are the guards that keep a skip from becoming a
+/// permanent mute. Any other field is rejected, like every other over-specified
+/// check field.
+fn parse_skip(path: &str, map: &serde_norway::Mapping, index: usize) -> Result<Option<Skip>> {
+    let field = |name: &str| format!("checks[{index}].skip.{name}");
+    let skip_map = match map.get("skip") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Mapping(m)) => m,
+        Some(other) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "checks[{index}].skip: expected a mapping, found {}",
+                    value_kind(other)
+                ),
+            ));
+        }
+    };
+
+    let reason = match skip_map.get("reason") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::String(_)) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "{}: must not be empty; a skip must say why it is not verifying",
+                    field("reason")
+                ),
+            ));
+        }
+        Some(other) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "{}: expected a string, found {}",
+                    field("reason"),
+                    value_kind(other)
+                ),
+            ));
+        }
+        None => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "checks[{index}].skip: missing 'reason'; a skip is never silent — it must say \
+                     why the check is not run"
+                ),
+            ));
+        }
+    };
+
+    let unless = match skip_map.get("unless") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(Value::String(_)) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "{}: must not be empty; omit it for an unconditional skip",
+                    field("unless")
+                ),
+            ));
+        }
+        Some(other) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "{}: expected a command string, found {}",
+                    field("unless"),
+                    value_kind(other)
+                ),
+            ));
+        }
+    };
+
+    let until = match skip_map.get("until") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(
+            parse_until(s)
+                .map_err(|reason| Error::parse(path, format!("{}: {reason}", field("until"))))?,
+        ),
+        Some(other) => {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "{}: expected a date 'YYYY-MM-DD' or an RFC 3339 instant, found {}",
+                    field("until"),
+                    value_kind(other)
+                ),
+            ));
+        }
+    };
+
+    for key in skip_map.keys() {
+        let name = key.as_str().unwrap_or_default();
+        if !["reason", "unless", "until"].contains(&name) {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "checks[{index}].skip: unknown field '{name}'; allowed are reason, unless, until"
+                ),
+            ));
+        }
+    }
+
+    Ok(Some(Skip {
+        reason,
+        unless,
+        until,
+    }))
+}
+
+/// Parse a skip's `until` as a full RFC 3339 instant, or a bare `YYYY-MM-DD` date
+/// taken as the start of that day in UTC. A date is the friendly common form; the
+/// instant form is there when a finer bound is wanted.
+fn parse_until(raw: &str) -> std::result::Result<Timestamp, String> {
+    let trimmed = raw.trim();
+    if let Ok(ts) = trimmed.parse::<Timestamp>() {
+        return Ok(ts);
+    }
+    format!("{trimmed}T00:00:00Z")
+        .parse::<Timestamp>()
+        .map_err(|_| format!("expected a date 'YYYY-MM-DD' or an RFC 3339 instant, found '{raw}'"))
 }
 
 /// Reject any field on a check outside the set its kind permits.
@@ -2113,5 +2283,92 @@ See [[libfoo-cjk-repro]] for the reproduction.
         // and yield no claims — exercising the bounded backward scan.
         let host = "<!-- claimA <!-- claimB <!-- claimC ".repeat(50);
         assert!(extract_embedded_claims("f.md", &host).unwrap().is_empty());
+    }
+
+    // --- Skip parsing: a skip is never silent, and its bounds parse or fail loud. ---
+
+    fn claim_with_skip(skip_yaml: &str) -> std::result::Result<Claim, Error> {
+        let text = format!(
+            "---\nid: c\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n{skip_yaml}max-age: \"30d\"\n---\nS.\n"
+        );
+        parse_claim_file("f.md", &text)
+    }
+
+    #[test]
+    fn parses_a_full_skip_block() {
+        let claim = claim_with_skip(
+            "    skip:\n      reason: parked here\n      unless: \"test -n \\\"$RUNNER\\\"\"\n      until: 2026-10-01\n",
+        )
+        .unwrap();
+        let skip = claim.checks[0].skip.as_ref().expect("skip parsed");
+        assert_eq!(skip.reason, "parked here");
+        assert_eq!(skip.unless.as_deref(), Some("test -n \"$RUNNER\""));
+        assert_eq!(skip.until, Some("2026-10-01T00:00:00Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_skip_without_a_reason_is_refused() {
+        // A silent skip is exactly the stale-green this tool exists to prevent.
+        let err = claim_with_skip("    skip:\n      unless: \"true\"\n").unwrap_err();
+        assert!(
+            parse_reason(&err).contains("missing 'reason'"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn an_empty_reason_is_refused() {
+        let err = claim_with_skip("    skip:\n      reason: \"  \"\n").unwrap_err();
+        assert!(
+            parse_reason(&err).contains("reason"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn an_unknown_skip_field_is_refused() {
+        let err =
+            claim_with_skip("    skip:\n      reason: r\n      untill: 2026-10-01\n").unwrap_err();
+        assert!(
+            parse_reason(&err).contains("untill"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn until_accepts_a_bare_date_and_an_rfc3339_instant() {
+        let by_date =
+            claim_with_skip("    skip:\n      reason: r\n      until: 2026-10-01\n").unwrap();
+        assert_eq!(
+            by_date.checks[0].skip.as_ref().unwrap().until,
+            Some("2026-10-01T00:00:00Z".parse().unwrap())
+        );
+        let by_instant =
+            claim_with_skip("    skip:\n      reason: r\n      until: \"2026-10-01T12:30:00Z\"\n")
+                .unwrap();
+        assert_eq!(
+            by_instant.checks[0].skip.as_ref().unwrap().until,
+            Some("2026-10-01T12:30:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_malformed_until_fails_loud() {
+        let err =
+            claim_with_skip("    skip:\n      reason: r\n      until: \"soon-ish\"\n").unwrap_err();
+        assert!(
+            parse_reason(&err).contains("until"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn no_skip_block_leaves_skip_none() {
+        let claim = claim_with_skip("").unwrap();
+        assert!(claim.checks[0].skip.is_none());
     }
 }

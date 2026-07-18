@@ -229,7 +229,41 @@ fn json_row_shape_is_stable() {
     assert_eq!(row["last_verified"], "2026-07-10T00:00:00Z");
     assert!(row["stale_in_days"].is_i64());
     assert_eq!(row["supports"], 0);
+    assert_eq!(row["skips"], 0, "a claim with no skip declares zero");
     assert_eq!(row["due"], false);
+}
+
+#[test]
+fn a_skip_bearing_claim_is_marked_and_counted_but_its_status_stays_clean() {
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "parked",
+        "---\nid: parked\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n    skip:\n      reason: no runner here\nmax-age: 120d\n---\nParked.\n",
+    );
+
+    // `--json`: the machine-readable `skips` count carries the fact; the `status`
+    // field stays a clean enum, so a consumer comparing `status == "..."` is not
+    // tripped by a human marker.
+    let claims = run_list(&repo, &[]);
+    let row = claims
+        .iter()
+        .find(|r| r["id"] == "parked")
+        .expect("parked is listed");
+    assert_eq!(row["skips"], 1);
+    assert!(
+        !row["status"].as_str().unwrap().contains("+skip"),
+        "the JSON status stays a clean enum: {}",
+        row["status"]
+    );
+
+    // Human: the status cell is marked `+skip`, so a claim kept green only by a skip
+    // never reads as silently healthy.
+    repo.claim()
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+skip"));
 }
 
 #[test]
