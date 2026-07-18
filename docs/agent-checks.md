@@ -1,5 +1,9 @@
 # Agent checks (`kind: agent`)
 
+For the concepts (claims, checks, the four verdicts), see the
+[overview](index.html); this page is the operator's contract for the
+`kind: agent` check the overview introduces.
+
 A `cmd` check answers a claim with an exit code: run a command, exit 0 means the
 fact holds, exit 1 means it drifted. Many facts have no such command. "Has the
 upstream CJK-corruption bug been fixed in libfoo 5.x?" is not a grep — it is a

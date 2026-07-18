@@ -1,5 +1,9 @@
 # CI integration: the two lanes
 
+New here? Start with the [overview](index.html) for the core concepts (claims,
+checks, verdicts, status); this page is the CI detail behind its "CI: the two
+lanes" section.
+
 `claim` verifies recorded facts in two places, on two clocks. Both end at the same
 verdict log; they differ in what triggers them and what they are allowed to do.
 

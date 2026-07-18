@@ -5,11 +5,15 @@
 checks, so those decisions cannot silently rot. If someone re-pins a CI action to
 a mutable tag, drops `-D warnings` from the gate, adds the archived `serde_yaml`,
 or reshapes the workspace, the matching claim drifts and the check fails loudly.
+For the concepts these checks rest on, see the [overview](index.html).
 
-This doc lives outside `.claims/` on purpose: `claim check` parses every `*.md`
-under the store as a claim file (only `.claims/log/` is skipped), so a README
-placed *inside* the store makes `check --all` exit 2 with a frontmatter error.
-Store docs therefore live here in `docs/`, not in `.claims/`.
+This doc lives here in `docs/`, but it could also live inside the store: the
+scanner parses a `.md` under `.claims/` as a claim only when it opens with a
+`---` frontmatter fence (and always skips the `.claims/log/` tree), so a plain
+`README.md` documenting the store is skipped silently rather than parsed and
+failing. A file that *does* open with a fence but is malformed stays a loud
+per-file error. Keeping this doc in `docs/` is a placement choice, not a
+work-around for the scanner.
 
 ## Running the checks here
 
