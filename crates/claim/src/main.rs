@@ -8,17 +8,30 @@
 //!
 //! # Exit codes
 //!
-//! Scriptable and stable: `0` on success, `2` on any usage or other error. The
-//! richer check/drift codes (a `Drifted` claim failing CI, for instance) arrive
-//! with those verbs; the two verbs built here are binary — they worked or they did
-//! not.
+//! Scriptable and stable. A usage error, a missing store, an I/O or git fault, or
+//! any other failure to run exits `2` ([`EXIT_ERROR`]) with an error on stderr.
+//! When a verb *runs* but finds a review-worthy condition, it returns its own
+//! code instead of erroring:
+//!
+//! - **`claim check`** — `0` when every check held and every support resolved;
+//!   `1` when at least one check drifted or was unverifiable, or a support did not
+//!   resolve; `2` when a check was broken (or a tool error occurred). Highest code
+//!   wins over a mixed store.
+//! - **`claim drift`** — `0` when no claim has drifted, `1` when any has.
+//!
+//! Every other verb is binary: `0` on success, `2` on error. A command signals a
+//! non-error exit code by returning it from [`dispatch`]; an `Err` is always
+//! `EXIT_ERROR`, so a bug that returns `Err` can never masquerade as a specific
+//! low code.
 
 mod apperror;
 mod claimfile;
 mod cli;
+mod clock;
 mod commands;
 mod git;
 mod output;
+mod scheduling;
 mod store;
 
 use clap::Parser;
@@ -27,34 +40,41 @@ use apperror::kind_of;
 use cli::{Cli, Command};
 use output::Format;
 
-/// The non-success exit code for a usage or other error, per the module docs.
+/// The exit code for a usage, I/O, git, or other failure to run — distinct from a
+/// verb's own review-worthy codes, which it returns as `Ok(code)`.
 const EXIT_ERROR: i32 = 2;
 
 fn main() {
     let cli = Cli::parse();
     let format = Format::from_json_flag(cli.json);
 
-    if let Err(err) = dispatch(&cli.command, format) {
-        report_error(&err, format);
-        std::process::exit(EXIT_ERROR);
+    match dispatch(&cli.command, format) {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            report_error(&err, format);
+            std::process::exit(EXIT_ERROR);
+        }
     }
 }
 
-/// Route a parsed command to its implementation.
+/// Route a parsed command to its implementation, returning the process exit code.
+///
+/// Most verbs return `0` on success; `check` and `drift` return a richer code
+/// (see the module docs) computed from what they found. An `Err` is reported and
+/// mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and never
+/// a verb's low code.
 ///
 /// Unbuilt verbs return an error here rather than doing nothing, so an unfinished
 /// command exits non-zero and never masquerades as a success.
-fn dispatch(command: &Command, format: Format) -> anyhow::Result<()> {
+fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
     match command {
-        Command::Init(args) => commands::init::run(args, format),
-        Command::Add(args) => commands::add::run(args, format),
-        Command::Check
-        | Command::List
-        | Command::Log
-        | Command::Drift
-        | Command::Amend
-        | Command::Retire
-        | Command::Stats => {
+        Command::Init(args) => commands::init::run(args, format).map(|()| 0),
+        Command::Add(args) => commands::add::run(args, format).map(|()| 0),
+        Command::Check(args) => commands::check::run(args, format),
+        Command::List(args) => commands::list::run(args, format).map(|()| 0),
+        Command::Log(args) => commands::log::run(args, format).map(|()| 0),
+        Command::Drift(args) => commands::drift::run(args, format),
+        Command::Amend | Command::Retire | Command::Stats => {
             anyhow::bail!("`claim {}` is not implemented yet", command.name())
         }
     }

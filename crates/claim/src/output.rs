@@ -15,6 +15,7 @@
 use std::io::Write;
 
 use anyhow::Result;
+use claim_core::{Status, Verdict};
 use serde::Serialize;
 
 /// Which form a command should print in.
@@ -90,4 +91,34 @@ pub fn note(format: Format, message: &str) {
 /// `warning:` so it reads as one.
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
+}
+
+/// The lowercase human label for a verdict, shared by every verb that prints one.
+///
+/// Kept in one place so `check`, `list`, and `log` cannot disagree on the wording
+/// a script or a human reads. The strings match the JSON `--json` forms (serde's
+/// kebab-case rename), so the human and machine vocabularies are the same words.
+#[must_use]
+pub fn verdict_label(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Held => "held",
+        Verdict::Drifted => "drifted",
+        Verdict::Unverifiable => "unverifiable",
+        Verdict::Broken => "broken",
+    }
+}
+
+/// The lowercase human label for a computed status, shared across verbs.
+///
+/// As with [`verdict_label`], one definition so the inventory table, the drift
+/// queue, and a claim's history all name a status identically, and identically to
+/// its `--json` form.
+#[must_use]
+pub fn status_label(s: Status) -> &'static str {
+    match s {
+        Status::Verified => "verified",
+        Status::Drifted => "drifted",
+        Status::Stale => "stale",
+        Status::Retired => "retired",
+    }
 }

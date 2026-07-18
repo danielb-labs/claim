@@ -10,6 +10,10 @@
 //!   anywhere inside a repository, not only its root.
 //! - **How is one created?** [`Store::init`] scaffolds `.claims/` and
 //!   `.claims/log/` in a chosen directory, idempotently.
+//! - **What claims does it hold?** [`Store::load_all`] walks `.claims/**/*.md`,
+//!   parses each, and returns the whole corpus, so the read/verify verbs
+//!   (`check`, `list`, `log`, `drift`) share one definition of "every claim in
+//!   the store" rather than each re-deriving the walk.
 //!
 //! The discovery rule is a deliberate contract: the store root is the directory
 //! *containing* `.claims/`, and there is exactly one per walk (the nearest),
@@ -20,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use claim_core::{parse_claim_file, Claim};
 
 /// The store directory name, relative to the store root.
 pub const CLAIMS_DIR: &str = ".claims";
@@ -90,6 +95,59 @@ impl Store {
         }
         path.set_extension("md");
         path.display().to_string()
+    }
+
+    /// Parse every claim in the store: `.claims/**/*.md`, excluding the verdict
+    /// log.
+    ///
+    /// The one place the read/verify verbs agree on what "the store's claims" are,
+    /// so `check`, `list`, `log`, and `drift` cannot disagree about which files
+    /// count. Returns them sorted by id for a stable, deterministic order (a
+    /// directory listing is order-unspecified across platforms), so a JSON array or
+    /// a human table reads the same on every run.
+    ///
+    /// Two directories under `.claims/` are deliberately skipped: `log/`, which
+    /// holds verdict-log JSON (`read_entries` owns those), and any file that is not
+    /// a `.md`. Everything else under `.claims/` is a standalone claim file, parsed
+    /// with [`claim_core::parse_claim_file`] and named — in a parse error — the way
+    /// it appears on disk relative to the store root.
+    ///
+    /// Embedded claims (`<!-- claim ... -->` blocks in host files like CLAUDE.md)
+    /// are *not* collected here: v1 authoring writes standalone `.claims/*.md`
+    /// files, and a store walk that also scraped every text file in the repo would
+    /// be both slow and surprising. Harvesting embedded claims is its own later
+    /// concern.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the `.claims/` directory cannot be listed, or if any claim file
+    /// cannot be read or does not parse — a malformed claim is a loud error naming
+    /// the file, never a silently dropped one. One bad file fails the whole load:
+    /// a verb that quietly skipped an unparseable claim could report a store as
+    /// clean while a claim in it rots unseen, exactly the false-green this tool
+    /// exists to prevent.
+    pub fn load_all(&self) -> Result<Vec<LoadedClaim>> {
+        let claims_dir = self.claims_dir();
+        let log_dir = self.log_dir();
+        let mut loaded = Vec::new();
+        collect_claim_files(&claims_dir, &log_dir, &mut loaded)?;
+
+        let mut parsed: Vec<LoadedClaim> = Vec::with_capacity(loaded.len());
+        for path in loaded {
+            let rel = path
+                .strip_prefix(self.root())
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read claim file {rel}"))?;
+            let claim = parse_claim_file(&rel, &text)
+                .with_context(|| format!("failed to parse claim file {rel}"))?;
+            parsed.push(LoadedClaim { claim, path: rel });
+        }
+
+        parsed.sort_by(|a, b| a.claim.id.cmp(&b.claim.id));
+        Ok(parsed)
     }
 
     /// Scaffold a store under `root`, creating `.claims/` and `.claims/log/`.
@@ -167,4 +225,61 @@ pub fn discover(start: &Path) -> Result<Store> {
          run `claim init` to create one",
         start.display()
     )
+}
+
+/// A claim parsed from the store, paired with the store-relative path it lives at.
+///
+/// Bundling the parsed [`Claim`] with its store-relative path (for display and
+/// error messages, the way a user sees it on disk) means a caller never re-derives
+/// a path from the id and risks disagreeing with where the file actually is. A
+/// caller needing the absolute path joins it onto [`Store::root`].
+#[derive(Debug, Clone)]
+pub struct LoadedClaim {
+    /// The parsed claim.
+    pub claim: Claim,
+    /// The claim file's path relative to the store root, e.g.
+    /// `.claims/payments/libfoo-pin.md`. What a human sees and what a parse error
+    /// names.
+    pub path: String,
+}
+
+/// Recursively collect standalone claim files under `dir`, skipping the verdict
+/// log directory and any non-`.md` file.
+///
+/// Pushes absolute paths into `out`; the caller parses them. The `log_dir` guard
+/// is by path equality (not name), so a claim legitimately named `log.md` at the
+/// store root is still collected — only the actual `.claims/log/` tree is
+/// excluded.
+fn collect_claim_files(dir: &Path, log_dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A store whose `.claims/` was removed out from under us is not a claim
+        // corpus at all; but a missing directory during recursion (a race) is
+        // treated as empty rather than fatal — there is simply nothing there.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to list {}", dir.display()));
+        }
+    };
+
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("failed to read an entry in {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+
+        if file_type.is_dir() {
+            // The verdict log is not a claim corpus; its JSON entries are owned by
+            // `read_entries`, not this walk.
+            if path == log_dir {
+                continue;
+            }
+            collect_claim_files(&path, log_dir, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
