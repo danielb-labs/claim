@@ -30,8 +30,8 @@ pub mod log;
 pub mod verdict;
 
 pub use check::{
-    resolve_supports, run_check, CheckContext, CheckOutcome, SupportResolution, DEFAULT_OUTPUT_CAP,
-    DEFAULT_TIMEOUT,
+    resolve_supports, run_check, CheckContext, CheckOutcome, ProcessEnd, SupportResolution,
+    DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
 };
 pub use claim::{
     extract_embedded_claims, parse_claim_file, Check, CheckKind, Claim, ClaimId, Days, Source,

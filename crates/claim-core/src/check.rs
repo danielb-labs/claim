@@ -40,7 +40,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::claim::{Check, CheckKind, SupportTarget};
+use serde::{Deserialize, Serialize};
+
+use crate::claim::{Check, CheckKind, ClaimId, SupportTarget};
 use crate::verdict::Verdict;
 
 // Check execution relies on unix process semantics — a shell, process groups, and
@@ -113,26 +115,79 @@ impl CheckContext {
     }
 }
 
-/// How a check's process ended, before negation is applied.
+/// How a check's process ended — the structured truth behind the verdict.
 ///
-/// A closed set of terminal outcomes so [`classify_exit`] is a total `match` with
-/// no catch-all that could accidentally map an unexpected case to a pass. Only
-/// [`Exited`](RunResult::Exited) carries a code that can become `Held`; every
-/// other variant is unconditionally [`Verdict::Broken`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RunResult {
+/// A closed set of terminal outcomes so the exit-code classification is a total
+/// `match` with no catch-all that could accidentally map an unexpected case to a
+/// pass. Only [`Exited`](ProcessEnd::Exited) carries a code that can become
+/// `Held`; every other variant is unconditionally [`Verdict::Broken`].
+///
+/// Exposed on [`CheckOutcome::end`] rather than only as a prose string because
+/// item 4 serializes outcomes into the committed verdict log: a structured value
+/// lets that history be filtered by machine ("show every timeout") and does not
+/// bake a run's configured timeout into the record the way a `"timed out after
+/// 60s"` string would. The [`Display`](std::fmt::Display) impl renders the human
+/// one-liner. `#[non_exhaustive]` because a future execution lane may add ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+#[non_exhaustive]
+pub enum ProcessEnd {
     /// The process ran to completion and returned an exit code. On unix this is
-    /// present only when the process was *not* killed by a signal.
-    Exited(i32),
+    /// present only when the process was *not* killed by a signal. Exit 0 is the
+    /// only path to [`Verdict::Held`]; exit 1 is [`Verdict::Drifted`]; every other
+    /// code is [`Verdict::Broken`].
+    Exited {
+        /// The process's exit code.
+        code: i32,
+    },
     /// The process was terminated by a signal (e.g. `SIGKILL`, `SIGSEGV`) and so
     /// has no exit code of its own. Always `Broken`: a check that was killed did
     /// not deliberately report anything.
     Signalled,
     /// We killed the process because it exceeded the timeout. Always `Broken`.
-    TimedOut,
+    /// Carries the budget it exceeded so the human line is self-contained and the
+    /// configured value is not lost.
+    TimedOut {
+        /// The timeout budget that was exceeded.
+        after: Duration,
+    },
     /// The process could never start — a missing shell, a non-existent working
-    /// directory, an exhausted process table. Always `Broken`.
-    SpawnFailed(String),
+    /// directory, an exhausted process table — or, defensively, a `run` string
+    /// that was empty so there was nothing to execute. Always `Broken`.
+    SpawnFailed {
+        /// Why the spawn (or pre-spawn validation) failed.
+        reason: String,
+    },
+    /// No process was run at all: an `agent` or `human` check, which has no
+    /// command lane in v1. Distinct from `SpawnFailed` (which is a *cmd* check
+    /// that could not start, and is `Broken`): a not-executed check is
+    /// [`Verdict::Unverifiable`], so the claim ages toward a human rather than
+    /// being recorded as broken. Never [`Verdict::Held`].
+    NotExecuted {
+        /// Which lane the check needs, for the human line.
+        note: String,
+    },
+}
+
+impl std::fmt::Display for ProcessEnd {
+    /// The human one-liner recorded alongside a `Broken` verdict so the log says
+    /// *why* it broke. A sub-second timeout renders in milliseconds rather than
+    /// collapsing to `0s`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessEnd::Exited { code } => write!(f, "exit {code}"),
+            ProcessEnd::Signalled => f.write_str("killed by signal"),
+            ProcessEnd::TimedOut { after } => {
+                if *after < Duration::from_secs(1) {
+                    write!(f, "timed out after {}ms", after.as_millis())
+                } else {
+                    write!(f, "timed out after {}s", after.as_secs())
+                }
+            }
+            ProcessEnd::SpawnFailed { reason } => write!(f, "failed to spawn: {reason}"),
+            ProcessEnd::NotExecuted { note } => write!(f, "not executed: {note}"),
+        }
+    }
 }
 
 /// The result of running one check: its verdict and the evidence a caller records.
@@ -148,11 +203,11 @@ pub struct CheckOutcome {
     /// The verdict, after exit-code classification and any negation. The single
     /// answer to "did this check pass"; only [`Verdict::Held`] does.
     pub verdict: Verdict,
-    /// A short, human-readable description of how the process ended — `exit 0`,
-    /// `exit 127`, `killed by signal`, `timed out after 60s`, or the spawn error.
-    /// Recorded so a `Broken` verdict in the log says *why* it broke without a
-    /// caller re-deriving it.
-    pub status: String,
+    /// How the process ended, structured — the machine-readable truth the verdict
+    /// was derived from. Recorded so a `Broken` verdict in the log says *why* it
+    /// broke and can be filtered by kind. [`status`](CheckOutcome::status) renders
+    /// its human one-liner.
+    pub end: ProcessEnd,
     /// Combined stdout+stderr, truncated to the context's `output_cap`. `None`
     /// when the process produced no output or never started. When truncated, the
     /// retained bytes end with a marker line naming the cap, so a reader is never
@@ -164,13 +219,32 @@ pub struct CheckOutcome {
     pub duration: Duration,
 }
 
+impl CheckOutcome {
+    /// The human one-liner describing how the process ended — `exit 0`,
+    /// `exit 127`, `killed by signal`, `timed out after 300ms`, or the spawn
+    /// error. A convenience over `outcome.end.to_string()` for display sites.
+    #[must_use]
+    pub fn status(&self) -> String {
+        self.end.to_string()
+    }
+}
+
 /// Run one check and classify its outcome into a [`CheckOutcome`].
 ///
-/// Total by construction: it never returns an error. Every way a check can fail
-/// to produce a clean answer — a missing binary, a bad working directory, a
-/// signal, a timeout — resolves to a [`Verdict::Broken`] outcome, because a
-/// caller that had to handle a `Result` here could forget the error arm and let a
-/// broken check read as anything other than broken (invariant #1).
+/// Total by construction, barring an OS-level failure: it never returns an error.
+/// Every way a check can fail to produce a clean answer — a missing binary, a bad
+/// working directory, a signal, a timeout — resolves to a [`Verdict::Broken`]
+/// outcome, because a caller that had to handle a `Result` here could forget the
+/// error arm and let a broken check read as anything other than broken (invariant
+/// #1). The one thing outside this guarantee is the host OS itself giving way (an
+/// allocation failure aborts; the timed wait can, on an internal fault, panic) —
+/// no verdict can be honestly synthesized from a broken runtime.
+///
+/// **Process-global side effect.** Executing a `cmd` check uses `wait-timeout`,
+/// which installs a process-wide `SIGCHLD` handler on first use and reaps child
+/// processes through it. An embedder that also manages child processes in the same
+/// process — notably `claim-mcp` — must be aware that this handler exists
+/// process-wide, not scoped to this call.
 ///
 /// Only [`CheckKind::Cmd`] is executed. An [`CheckKind::Agent`] or
 /// [`CheckKind::Human`] check returns [`Verdict::Unverifiable`] with a note that
@@ -190,7 +264,9 @@ pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
         CheckKind::Cmd { run, negate } => run_cmd(run, *negate, ctx),
         CheckKind::Agent { .. } => CheckOutcome {
             verdict: Verdict::Unverifiable,
-            status: "not executed".to_owned(),
+            end: ProcessEnd::NotExecuted {
+                note: "agent investigation lane, not built in v1".to_owned(),
+            },
             evidence: Some(
                 "agent checks are not executed in v1; this claim needs the agent \
                  investigation lane, which is not built yet"
@@ -200,7 +276,9 @@ pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
         },
         CheckKind::Human { .. } => CheckOutcome {
             verdict: Verdict::Unverifiable,
-            status: "not executed".to_owned(),
+            end: ProcessEnd::NotExecuted {
+                note: "scheduled human look, not built in v1".to_owned(),
+            },
             evidence: Some(
                 "human checks are not executed by the tool; this claim needs a \
                  scheduled human look, which is not built yet"
@@ -218,15 +296,32 @@ pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
 /// shell features). The shell interprets syntax only; the exit-code-to-verdict
 /// mapping and negation are the tool's, per invariants #1 and #2.
 fn run_cmd(run: &str, negate: bool, ctx: &CheckContext) -> CheckOutcome {
+    // Defense-in-depth against a vacuous pass: an empty or whitespace-only `run`
+    // would execute as `sh -c ""`, exit 0, and report Held forever — a check that
+    // can never go red. The parser already rejects this at authoring time; this
+    // second guard means even a `Check` built by some other path cannot slip a
+    // blank command past the honesty core. Broken, never Held (and never Drifted
+    // under negate, since Broken does not invert).
+    if run.trim().is_empty() {
+        return CheckOutcome {
+            verdict: Verdict::Broken,
+            end: ProcessEnd::SpawnFailed {
+                reason: "run is empty; nothing to verify".to_owned(),
+            },
+            evidence: None,
+            duration: Duration::ZERO,
+        };
+    }
+
     let started = Instant::now();
-    let (result, output) = execute(run, ctx);
+    let (end, output) = execute(run, ctx);
     let duration = started.elapsed();
 
-    let base = classify_exit(&result);
+    let base = classify_exit(&end);
     let verdict = apply_negation(base, negate);
     CheckOutcome {
         verdict,
-        status: describe(&result, ctx.timeout),
+        end,
         evidence: evidence_from(output, ctx.output_cap),
         duration,
     }
@@ -240,15 +335,18 @@ fn run_cmd(run: &str, negate: bool, ctx: &CheckContext) -> CheckOutcome {
 /// other exit code (2 for a grep error, 126 for not-executable, 127 for
 /// not-found, 130 for Ctrl-C, …), death by signal, a timeout, or a spawn failure
 /// — is [`Verdict::Broken`]. A check that could not run cannot report that the
-/// fact is fine.
-fn classify_exit(result: &RunResult) -> Verdict {
-    match result {
-        RunResult::Exited(0) => Verdict::Held,
-        RunResult::Exited(1) => Verdict::Drifted,
-        RunResult::Exited(_)
-        | RunResult::Signalled
-        | RunResult::TimedOut
-        | RunResult::SpawnFailed(_) => Verdict::Broken,
+/// fact is fine. `NotExecuted` never reaches here (agent/human checks bypass
+/// classification), but the arm is present so the `match` is total and its floor
+/// is `Broken`, never a pass.
+fn classify_exit(end: &ProcessEnd) -> Verdict {
+    match end {
+        ProcessEnd::Exited { code: 0 } => Verdict::Held,
+        ProcessEnd::Exited { code: 1 } => Verdict::Drifted,
+        ProcessEnd::Exited { .. }
+        | ProcessEnd::Signalled
+        | ProcessEnd::TimedOut { .. }
+        | ProcessEnd::SpawnFailed { .. }
+        | ProcessEnd::NotExecuted { .. } => Verdict::Broken,
     }
 }
 
@@ -270,25 +368,17 @@ fn apply_negation(verdict: Verdict, negate: bool) -> Verdict {
     }
 }
 
-/// A one-line description of how the process ended, for the log entry.
-fn describe(result: &RunResult, timeout: Duration) -> String {
-    match result {
-        RunResult::Exited(code) => format!("exit {code}"),
-        RunResult::Signalled => "killed by signal".to_owned(),
-        RunResult::TimedOut => format!("timed out after {}s", timeout.as_secs()),
-        RunResult::SpawnFailed(reason) => format!("failed to spawn: {reason}"),
-    }
-}
-
 /// Turn captured output into evidence, applying the cap.
 ///
-/// `output` already carries whether it was truncated (the reader stopped at the
-/// cap). Empty output yields `None` so the log entry's `evidence` is absent
-/// rather than an empty string. Non-UTF-8 bytes are replaced rather than dropped,
-/// so binary noise in a command's output cannot lose the readable parts around
-/// it.
+/// `output` already carries whether it was truncated at the cap and whether a
+/// reader was detached because a process outlived the check and held its output
+/// pipe open (the escapee case; see [`execute`]). Empty output yields `None` so
+/// the log entry's `evidence` is absent rather than an empty string — unless a
+/// reader was detached, in which case the note is worth recording even with no
+/// bytes. Non-UTF-8 bytes are replaced rather than dropped, so binary noise in a
+/// command's output cannot lose the readable parts around it.
 fn evidence_from(output: Captured, cap: usize) -> Option<String> {
-    if output.bytes.is_empty() {
+    if output.bytes.is_empty() && !output.escapee {
         return None;
     }
     let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
@@ -297,22 +387,58 @@ fn evidence_from(output: Captured, cap: usize) -> Option<String> {
             "\n[output truncated at {cap} bytes; the check produced more]"
         ));
     }
+    if output.escapee {
+        text.push_str(
+            "\n[output truncated: a process outlived the check and held its output open]",
+        );
+    }
     Some(text)
 }
 
-/// stdout and stderr captured up to the cap, and whether more was produced.
+/// stdout and stderr captured up to the cap.
+///
+/// `truncated` is set when the cap was hit; `escapee` when a reader had to be
+/// detached because a process outlived the check and kept the pipe open, so the
+/// capture is whatever had arrived by the grace deadline. Both are surfaced in
+/// the evidence so a reader is never misled that partial output is complete.
 struct Captured {
     bytes: Vec<u8>,
     truncated: bool,
+    escapee: bool,
 }
+
+/// How long to wait for the output readers to drain after the check's own
+/// process has been reaped and its group killed, before detaching a stuck reader.
+///
+/// After [`execute`] reaps the shell and kills its process group, any reader
+/// still blocked can only be one whose pipe is held open by a process that
+/// *escaped* the group — a `setsid()` daemon the check spawned, which no
+/// group-kill can reach. Waiting on it forever would let a check's timeout fail
+/// to bound [`run_check`] (the liveness the timeout exists to protect). A short
+/// fixed grace lets a normal reader finish draining the last buffered bytes, then
+/// the escapee's reader is detached and whatever it captured so far is kept. Two
+/// seconds is comfortably longer than draining a closed pipe takes yet negligible
+/// against the check timeout.
+#[cfg(unix)]
+const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Spawn the shell command, capture bounded output, and enforce the timeout.
 ///
-/// Returns the terminal [`RunResult`] and the captured output. This is the only
+/// Returns the terminal [`ProcessEnd`] and the captured output. This is the only
 /// function that touches the process; all judgement is downstream of it, so the
 /// honesty rules stay readable and testable apart from the I/O.
+///
+/// Liveness is the load-bearing property here, and it is why the readers are
+/// drained through shared buffers with a *bounded* join rather than a plain
+/// `JoinHandle::join`. A plain join blocks until the pipe's write end closes,
+/// which a process that outlived the check — a backgrounded daemon that inherited
+/// stdout, or one that called `setsid()` and escaped the group — never does. That
+/// would make the check's timeout fail to bound this function at all. Instead,
+/// once the shell is reaped and its group killed, the readers are given
+/// [`READER_JOIN_GRACE`] to finish; a reader still stuck past that is detached
+/// (its thread deliberately leaked, bounded and rare) with whatever it captured.
 #[cfg(unix)]
-fn execute(run: &str, ctx: &CheckContext) -> (RunResult, Captured) {
+fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
     use wait_timeout::ChildExt;
@@ -328,84 +454,137 @@ fn execute(run: &str, ctx: &CheckContext) -> (RunResult, Captured) {
 
     // Put the shell in its own process group (pgid == the shell's pid) so a
     // command that spawns children — `sleep 100 | foo` — puts them in the same
-    // group. On timeout we kill the *group*, so no grandchild is orphaned. Set on
+    // group. We kill the *group*, so no in-group grandchild is orphaned. Set on
     // the child only; passing 0 makes the child its own leader without disturbing
     // the tool's own group.
     command.process_group(0);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(e) => return (RunResult::SpawnFailed(e.to_string()), Captured::empty()),
+        Err(e) => {
+            return (
+                ProcessEnd::SpawnFailed {
+                    reason: e.to_string(),
+                },
+                Captured::empty(),
+            )
+        }
     };
+    // A pid is always well within i32 (kernel PID_MAX is far below i32::MAX), so
+    // this cast cannot truncate; it only bridges std's u32 to libc's signed pid_t.
     let pgid = child.id() as libc::pid_t;
 
-    // Drain stdout and stderr on their own threads. A command that writes more
-    // than a pipe buffer holds would otherwise block on the write while we block
-    // on the wait — a deadlock that no timeout could break, because the process
-    // never reaches the point where it could be reaped. The readers also enforce
-    // the cap, so a flood of output is bounded in memory.
+    // Drain stdout and stderr on their own threads into shared buffers. Draining
+    // concurrently avoids the deadlock where a command that writes more than a
+    // pipe buffer holds blocks on the write while we block on the wait. Sharing
+    // the buffer (rather than returning it from the thread) is what lets us take
+    // the captured-so-far bytes even when a reader must be detached.
     let cap = ctx.output_cap;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_reader = stdout.map(|s| spawn_reader(s, cap));
-    let err_reader = stderr.map(|s| spawn_reader(s, cap));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let out_reader = child
+        .stdout
+        .take()
+        .map(|s| spawn_reader(s, cap, done_tx.clone()));
+    let err_reader = child.stderr.take().map(|s| spawn_reader(s, cap, done_tx));
 
-    let result = match child.wait_timeout(ctx.timeout) {
-        Ok(Some(status)) => {
+    let end = match child.wait_timeout(ctx.timeout) {
+        Ok(Some(status)) => match status.code() {
             // `code()` is `None` exactly when a signal killed the process; that is
             // never a deliberate answer, so it is `Broken` via `Signalled`.
-            match status.code() {
-                Some(code) => RunResult::Exited(code),
-                None => {
-                    debug_assert!(
-                        status.signal().is_some(),
-                        "a unix ExitStatus with no code must carry a signal"
-                    );
-                    RunResult::Signalled
-                }
+            Some(code) => ProcessEnd::Exited { code },
+            None => {
+                debug_assert!(
+                    status.signal().is_some(),
+                    "a unix ExitStatus with no code must carry a signal"
+                );
+                ProcessEnd::Signalled
             }
-        }
+        },
         Ok(None) => {
-            // The deadline passed and the child is still running. Kill the whole
-            // group so children the shell spawned die too, then block until the
-            // shell is reaped so it is not left a zombie and its threads finish.
+            // The deadline passed and the child is still running. Kill the group
+            // *before* the reaping `wait()`, or the wait would block for the whole
+            // remaining lifetime of the still-running command.
             kill_group(pgid);
             let _ = child.wait();
-            RunResult::TimedOut
+            ProcessEnd::TimedOut { after: ctx.timeout }
         }
         Err(e) => {
-            // Waiting itself failed (an OS-level fault). Treat it as unrunnable —
-            // Broken, never a pass — and still make an effort to reap the child.
+            // Waiting itself faulted; kill the group before reaping for the same
+            // reason, then reap best-effort.
             kill_group(pgid);
             let _ = child.wait();
-            RunResult::SpawnFailed(format!("waiting for the check failed: {e}"))
+            ProcessEnd::SpawnFailed {
+                reason: format!("waiting for the check failed: {e}"),
+            }
         }
     };
 
-    // Join the readers now that the process has ended and both pipe ends are
-    // closed, so the reads return EOF. Combine stdout then stderr into one buffer,
-    // re-capped in case both streams were near the cap.
-    let mut captured = out_reader.map_or_else(Captured::empty, join_reader);
-    if let Some(err) = err_reader {
-        captured.extend(join_reader(err), cap);
+    // Kill the process group on EVERY terminal path — not only the timeout arms
+    // above (which killed before reaping). A check that *completed* may still have
+    // leaked a background child; killing the group after the shell is reaped reaps
+    // that in-group child too — no orphan survives a completed check — and closes
+    // any pipe an in-group child still holds, which is what lets the readers reach
+    // EOF promptly in the common case. A second kill on the timeout paths is a
+    // harmless ESRCH (the group is already gone). ESRCH on a clean exit is equally
+    // harmless: the group emptied itself.
+    kill_group(pgid);
+
+    let captured = collect_output(out_reader, err_reader, &done_rx, cap);
+    (end, captured)
+}
+
+/// Collect the two readers' captured output with a bounded wait.
+///
+/// The child is already reaped and its group killed, so any reader that is not
+/// finished is blocked on a pipe held open by a process that escaped the group.
+/// Wait up to [`READER_JOIN_GRACE`] *total* for both readers to signal
+/// completion; then snapshot each shared buffer regardless. A reader that
+/// finished is joined (its thread is done); one that did not is detached — its
+/// thread is deliberately leaked rather than joined, so a single escapee cannot
+/// wedge the tool — and its buffer is marked as an escapee capture.
+#[cfg(unix)]
+fn collect_output(
+    out_reader: Option<Reader>,
+    err_reader: Option<Reader>,
+    done_rx: &std::sync::mpsc::Receiver<()>,
+    cap: usize,
+) -> Captured {
+    let expected = out_reader.is_some() as usize + err_reader.is_some() as usize;
+    let deadline = Instant::now() + READER_JOIN_GRACE;
+    for _ in 0..expected {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if done_rx.recv_timeout(remaining).is_err() {
+            break;
+        }
     }
-    (result, captured)
+
+    let mut captured = out_reader.map_or_else(Captured::empty, Reader::take);
+    if let Some(err) = err_reader {
+        captured.extend(err.take(), cap);
+    }
+    captured
 }
 
 /// Kill an entire process group by its leader's pid.
 ///
-/// A timed-out check's shell and every child it spawned share this group (see
+/// A check's shell and every child that stayed in its group share this pgid (see
 /// [`execute`]'s `process_group(0)`), so signalling the group — not just the
-/// shell — is what prevents an orphaned grandchild outliving the tool. `SIGKILL`
-/// rather than `SIGTERM`: a hung check has already ignored its budget, and a
-/// clean shutdown it might trap is not owed to it. A failure (the group already
-/// gone) is ignored; the goal is that nothing survives, and an already-dead group
-/// meets it.
+/// shell — is what prevents an in-group grandchild outliving the tool. `SIGKILL`
+/// rather than `SIGTERM`: a check that has to be group-killed has already either
+/// timed out or exited, and a clean shutdown it might trap is not owed to it. A
+/// failure is ignored because the goal is only that nothing in the group survives.
 #[cfg(unix)]
 fn kill_group(pgid: libc::pid_t) {
-    // SAFETY: `killpg` is an FFI call with no memory effects; it only delivers a
-    // signal. Any error (ESRCH: the group is already gone) is intentionally
-    // ignored, since a vanished group is the outcome we want.
+    // SAFETY: `killpg` is a plain FFI syscall with no memory effects; it delivers
+    // a signal and returns. The precondition it needs is that the check's own
+    // process is not reaped by anyone but us: `execute` always `wait()`s the child
+    // before this call, and the child leads this group, so on the normal paths the
+    // pgid still refers to this check's group (or is already empty → ESRCH), never
+    // a recycled unrelated group. Errors are intentionally ignored: ESRCH means
+    // the group is already gone (the outcome we want); EPERM would mean a member
+    // changed credentials (a setuid grandchild) and we may not signal it — that
+    // grandchild then escapes the no-orphan guarantee, an accepted limitation of a
+    // core that does not run privileged.
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
@@ -417,12 +596,14 @@ impl Captured {
         Captured {
             bytes: Vec::new(),
             truncated: false,
+            escapee: false,
         }
     }
 
     /// Append another stream's capture, keeping the combined total within `cap`.
     fn extend(&mut self, other: Captured, cap: usize) {
         self.truncated |= other.truncated;
+        self.escapee |= other.escapee;
         let room = cap.saturating_sub(self.bytes.len());
         if other.bytes.len() > room {
             self.truncated = true;
@@ -433,62 +614,129 @@ impl Captured {
     }
 }
 
-/// Spawn a thread that reads a child stream into a capped buffer.
+/// A running output reader: the thread draining one stream, and the shared buffer
+/// it writes into.
 ///
-/// Returned as a join handle so the caller collects the bytes after the process
-/// ends. Reading on a thread (rather than after `wait`) is what avoids the
-/// pipe-buffer deadlock described in [`execute`].
+/// Holding the buffer in an [`Arc<Mutex<_>>`](std::sync::Mutex) shared with the
+/// thread — rather than returning it by joining — is what lets [`execute`] take
+/// the captured-so-far bytes even when the thread must be *detached* because a
+/// process outlived the check and is holding the pipe open.
+#[cfg(unix)]
+struct Reader {
+    handle: std::thread::JoinHandle<()>,
+    buf: std::sync::Arc<std::sync::Mutex<Captured>>,
+    /// Set by the reader thread as its final action, so this is a race-free
+    /// "the drain is complete" signal. `JoinHandle::is_finished` can briefly lag a
+    /// thread that has finished its work but not yet been torn down, which would
+    /// spuriously flag a completed reader as an escapee; this flag does not.
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl Reader {
+    /// Take this reader's captured output, joining the thread if its drain is
+    /// complete and detaching it (leaking the thread, deliberately) if it is not.
+    ///
+    /// A completed drain means the thread is exiting, so the join is prompt. An
+    /// incomplete one can only be blocked on a pipe held by an escaped process;
+    /// joining would block [`execute`] indefinitely, so instead the thread is
+    /// dropped — a bounded, rare leak — and the buffer is marked as an escapee
+    /// capture so the evidence says the output is partial.
+    fn take(self) -> Captured {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            // The drain finished; join reaps the exiting thread. A panic in the
+            // reader (only an allocation abort could get here, and that aborts
+            // rather than unwinds, so this is defense-in-depth) degrades to no
+            // output rather than propagating.
+            let _ = self.handle.join();
+            std::mem::take(&mut *lock(&self.buf))
+        } else {
+            let mut captured = std::mem::take(&mut *lock(&self.buf));
+            captured.escapee = true;
+            captured
+            // `self.handle` is dropped here without a join: the thread is detached
+            // and will exit on its own if the escaped process ever closes the pipe.
+        }
+    }
+}
+
+impl Default for Captured {
+    fn default() -> Self {
+        Captured::empty()
+    }
+}
+
+/// Lock a mutex, recovering the guard even if a previous holder panicked.
+///
+/// A poisoned buffer is not a reason to lose the evidence in it, so the poison is
+/// stepped over rather than propagated.
+#[cfg(unix)]
+fn lock(buf: &std::sync::Mutex<Captured>) -> std::sync::MutexGuard<'_, Captured> {
+    buf.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Spawn a thread that drains a child stream into a shared capped buffer, then
+/// signals completion on `done`.
+///
+/// Reading on a thread (rather than after `wait`) is what avoids the pipe-buffer
+/// deadlock described in [`execute`]; the shared buffer is what lets its bytes be
+/// recovered even if the thread must later be detached. The completion signal on
+/// `done` lets the collector wait for a bounded grace rather than an unbounded
+/// join.
 #[cfg(unix)]
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     cap: usize,
-) -> std::thread::JoinHandle<Captured> {
-    std::thread::spawn(move || read_capped(reader, cap))
+    signal: std::sync::mpsc::Sender<()>,
+) -> Reader {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Captured::empty()));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_buf = std::sync::Arc::clone(&buf);
+    let thread_done = std::sync::Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        drain_into(reader, cap, &thread_buf);
+        // Mark done before waking the collector, so a collector that observes the
+        // wakeup and then reads the flag always sees `true` (release/acquire pair).
+        thread_done.store(true, std::sync::atomic::Ordering::Release);
+        // A send failure means the collector already stopped waiting (its grace
+        // elapsed); nothing to signal, so the error is ignored.
+        let _ = signal.send(());
+    });
+    Reader { handle, buf, done }
 }
 
-/// Join a reader thread, treating a panicked reader as "no output".
+/// Read from `reader` until EOF or error, appending into the shared buffer up to
+/// `cap` bytes.
 ///
-/// A reader thread only panics on an allocation failure, which is already an
-/// environment fault; losing its (partial) evidence is acceptable and must not
-/// bring down the tool, so the panic is swallowed into empty output rather than
-/// re-raised.
+/// Keeps consuming past the cap in fixed chunks so the writing child sees its pipe
+/// drained and can exit rather than block forever on a full pipe — draining
+/// without retaining, and marking the capture truncated. The read is done into a
+/// local buffer and the shared lock is taken only to append, so the lock is never
+/// held across a blocking `read` and the collector can always snapshot promptly. A
+/// read error ends the loop; a broken pipe is not itself a check failure.
 #[cfg(unix)]
-fn join_reader(handle: std::thread::JoinHandle<Captured>) -> Captured {
-    handle.join().unwrap_or_else(|_| Captured::empty())
-}
-
-/// Read from `reader` until EOF or the cap, whichever comes first.
-///
-/// Stops reading once `cap` bytes are retained, marking the result truncated. It
-/// keeps consuming past the cap in fixed chunks so the writing child sees its
-/// pipe drained and can exit rather than block forever on a full pipe — draining
-/// without retaining. A read error ends the loop with whatever was gathered; a
-/// broken pipe is not itself a check failure.
-#[cfg(unix)]
-fn read_capped<R: Read>(mut reader: R, cap: usize) -> Captured {
-    let mut bytes = Vec::new();
-    let mut truncated = false;
+fn drain_into<R: Read>(mut reader: R, cap: usize, shared: &std::sync::Mutex<Captured>) {
     let mut buf = [0u8; 8 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if bytes.len() < cap {
-                    let room = cap - bytes.len();
+                let mut captured = lock(shared);
+                if captured.bytes.len() < cap {
+                    let room = cap - captured.bytes.len();
                     let take = n.min(room);
-                    bytes.extend_from_slice(&buf[..take]);
+                    captured.bytes.extend_from_slice(&buf[..take]);
                     if take < n {
-                        truncated = true;
+                        captured.truncated = true;
                     }
                 } else {
-                    truncated = true;
+                    captured.truncated = true;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    Captured { bytes, truncated }
 }
 
 /// Whether a claim's `supports` target still resolves, and why not if it does not.
@@ -515,18 +763,24 @@ pub struct SupportResolution {
 /// A `supports` target is either a decision ref `path#anchor` (or a bare `path`)
 /// or a bare claim id. Resolution is a pure function of its inputs: the caller
 /// supplies `known_claim_ids`, the set of ids it collected from the store, so
-/// this needs no second store read and stays deterministic and testable.
+/// this needs no second store read and stays deterministic and testable. Taking
+/// [`ClaimId`]s (not raw strings) matches what the CLI already holds and avoids a
+/// stringly-typed boundary.
 ///
 /// Resolution rules, each yielding a reason when it fails:
 ///
 /// - **`path#anchor`**: unambiguously a decision ref, because a claim id can
 ///   never contain `#` (see [`crate::claim::ClaimId`]). Resolves iff the file
-///   exists under `repo_root` *and* the anchor text occurs somewhere in it. The
-///   anchor check is a plain substring scan — cheap, and enough to catch a
-///   decision heading that was deleted or renamed. It is intentionally not a
-///   Markdown-aware anchor match: over-precise matching would produce false
-///   "unresolved" alarms on valid files, and the goal is to catch a *deleted*
-///   decision, not to police heading syntax.
+///   exists under `repo_root` *and* the anchor still occurs in it *at a word
+///   boundary* — the anchor bounded by non-word characters (or the file edges),
+///   so a deleted `## libfoo` heading is not reported resolved merely because the
+///   substring `libfoo` survives inside `libfoobar` elsewhere. It stays a text
+///   scan, not a Markdown-aware anchor match: over-precise structural matching
+///   would raise false "unresolved" alarms on valid files, and the goal is to
+///   catch a *deleted* decision, not to police heading syntax. This is a
+///   best-effort collision-reducer, not a guarantee; authors should pick
+///   distinctive anchors (a decision id, not a common word) so resolution has an
+///   unambiguous mark to look for.
 /// - **anything else** (no `#`): a namespaced claim id (`payments/libfoo-pin`)
 ///   is shaped exactly like a path, so the target is not forced into one
 ///   interpretation. It resolves if it is *either* a known claim id *or* an
@@ -546,7 +800,7 @@ pub struct SupportResolution {
 pub fn resolve_supports(
     supports: &[SupportTarget],
     repo_root: &Path,
-    known_claim_ids: &[&str],
+    known_claim_ids: &[ClaimId],
 ) -> Vec<SupportResolution> {
     supports
         .iter()
@@ -566,14 +820,14 @@ pub fn resolve_supports(
 /// neither does it go unresolved, with a reason naming both possibilities. A
 /// claim id and a file path colliding cannot mask a real failure: the target
 /// resolves precisely when at least one interpretation is real.
-fn resolve_one(target: &str, repo_root: &Path, known_claim_ids: &[&str]) -> SupportResolution {
+fn resolve_one(target: &str, repo_root: &Path, known_claim_ids: &[ClaimId]) -> SupportResolution {
     if let Some((path_part, anchor)) = target.split_once('#') {
         let candidate = resolve_path(repo_root, path_part);
         return resolve_decision_ref(target, &candidate, path_part, Some(anchor));
     }
 
     // No anchor: resolve as a claim id or as a bare file path, whichever is real.
-    if known_claim_ids.contains(&target) {
+    if known_claim_ids.iter().any(|id| id.as_str() == target) {
         return resolved(target);
     }
     let candidate = resolve_path(repo_root, target);
@@ -608,7 +862,7 @@ fn resolve_decision_ref(
     }
     if let Some(anchor) = anchor {
         match std::fs::read_to_string(candidate) {
-            Ok(contents) if contents.contains(anchor) => resolved(target),
+            Ok(contents) if anchor_occurs(&contents, anchor) => resolved(target),
             Ok(_) => SupportResolution {
                 target: target.to_owned(),
                 resolved: false,
@@ -650,6 +904,37 @@ fn resolve_path(repo_root: &Path, path_part: &str) -> PathBuf {
     } else {
         repo_root.join(p)
     }
+}
+
+/// Whether `anchor` occurs in `haystack` at a word boundary.
+///
+/// A boundary is a non-word character (anything but `[A-Za-z0-9_]`) or a file
+/// edge on each side, so the anchor `libfoo` matches `## libfoo` and `libfoo:`
+/// but not `libfoobar`. This reduces the false-resolve where a deleted heading's
+/// keyword survives as a fragment of some unrelated identifier — a soft
+/// false-green off the verdict path. It is a text scan, not a Markdown parse: the
+/// aim is to catch a *removed* decision, not to validate heading syntax. An empty
+/// anchor never matches (an empty `#` fragment is a malformed target, not a
+/// license to resolve).
+fn anchor_occurs(haystack: &str, anchor: &str) -> bool {
+    if anchor.is_empty() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let hay = haystack.as_bytes();
+    let needle = anchor.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(anchor) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !is_word(hay[start - 1]);
+        let right_ok = end == hay.len() || !is_word(hay[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 #[cfg(all(test, unix))]
@@ -702,7 +987,8 @@ mod tests {
         // "the check could not run" case and must be Broken, never a pass.
         let outcome = run("this-binary-does-not-exist-anywhere", false);
         assert_eq!(outcome.verdict, Verdict::Broken);
-        assert_eq!(outcome.status, "exit 127");
+        assert_eq!(outcome.end, ProcessEnd::Exited { code: 127 });
+        assert_eq!(outcome.status(), "exit 127");
     }
 
     #[test]
@@ -717,7 +1003,8 @@ mod tests {
             &CheckContext::new(tmp.path()),
         );
         assert_eq!(outcome.verdict, Verdict::Broken);
-        assert_eq!(outcome.status, "exit 126");
+        assert_eq!(outcome.end, ProcessEnd::Exited { code: 126 });
+        assert_eq!(outcome.status(), "exit 126");
     }
 
     #[test]
@@ -740,7 +1027,8 @@ mod tests {
         // signal itself, so wait returns a signal status with no code.
         let outcome = run("kill -9 $$", false);
         assert_eq!(outcome.verdict, Verdict::Broken);
-        assert_eq!(outcome.status, "killed by signal");
+        assert_eq!(outcome.end, ProcessEnd::Signalled);
+        assert_eq!(outcome.status(), "killed by signal");
     }
 
     #[test]
@@ -749,7 +1037,7 @@ mod tests {
         // classification is on "no exit code", not on a specific signal.
         let outcome = run("kill -SEGV $$", false);
         assert_eq!(outcome.verdict, Verdict::Broken);
-        assert_eq!(outcome.status, "killed by signal");
+        assert_eq!(outcome.status(), "killed by signal");
     }
 
     #[test]
@@ -761,9 +1049,14 @@ mod tests {
         let outcome = run_check(&cmd("true", false), &ctx);
         assert_eq!(outcome.verdict, Verdict::Broken);
         assert!(
-            outcome.status.starts_with("failed to spawn"),
+            matches!(outcome.end, ProcessEnd::SpawnFailed { .. }),
+            "end: {:?}",
+            outcome.end
+        );
+        assert!(
+            outcome.status().starts_with("failed to spawn"),
             "status: {}",
-            outcome.status
+            outcome.status()
         );
     }
 
@@ -868,10 +1161,12 @@ mod tests {
         let outcome = run_check(&cmd("sleep 30", false), &ctx);
         assert_eq!(outcome.verdict, Verdict::Broken);
         assert!(
-            outcome.status.starts_with("timed out"),
-            "status: {}",
-            outcome.status
+            matches!(outcome.end, ProcessEnd::TimedOut { .. }),
+            "end: {:?}",
+            outcome.end
         );
+        // Sub-second budgets render in milliseconds, not a misleading "0s".
+        assert_eq!(outcome.status(), "timed out after 200ms");
         // It timed out fast, not after the full sleep.
         assert!(
             outcome.duration < Duration::from_secs(5),
@@ -909,6 +1204,114 @@ mod tests {
              was not killed",
             sentinel.display()
         );
+    }
+
+    #[test]
+    fn collect_output_is_bounded_when_a_reader_never_reaches_eof() {
+        // M1 (liveness) at the unit level, OS-quirk-free: a reader whose pipe is
+        // held open by a process that outlived the check (an escapee the group-kill
+        // cannot reach) never reaches EOF. `collect_output` must still return in
+        // roughly the reader grace by detaching that reader — never blocking on an
+        // unbounded join, which is what made the check's timeout fail to bound
+        // `run_check`. A held-open real pipe (a `sleep` we deliberately do not kill
+        // here) is the escapee stand-in.
+        //
+        // Testing `collect_output` directly, rather than through a shell trick that
+        // manufactures a true session escape, keeps this deterministic across
+        // platforms whose non-interactive shells differ on whether a backgrounded
+        // job can `setsid()`.
+        let mut sleeper = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = sleeper.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let reader = spawn_reader(stdout, DEFAULT_OUTPUT_CAP, tx);
+
+        let started = Instant::now();
+        let captured = collect_output(Some(reader), None, &rx, DEFAULT_OUTPUT_CAP);
+        let elapsed = started.elapsed();
+
+        // Bounded by the grace, not the sleeper's 30s lifetime.
+        assert!(
+            elapsed < READER_JOIN_GRACE + Duration::from_secs(2),
+            "collect_output must be bounded by the reader grace ({READER_JOIN_GRACE:?}); \
+             took {elapsed:?}"
+        );
+        // The unfinished reader was detached and its capture flagged as an escapee.
+        assert!(
+            captured.escapee,
+            "a detached reader's capture must be marked as an escapee"
+        );
+
+        // Clean up the sleeper so it does not linger past the test.
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    #[test]
+    fn escapee_capture_is_noted_in_the_evidence() {
+        // The escapee marker must surface to a human in the evidence, so a partial
+        // capture is never mistaken for the whole output.
+        let escapee = Captured {
+            bytes: b"partial".to_vec(),
+            truncated: false,
+            escapee: true,
+        };
+        let evidence = evidence_from(escapee, DEFAULT_OUTPUT_CAP).unwrap();
+        assert!(evidence.contains("partial"));
+        assert!(
+            evidence.contains("a process outlived the check"),
+            "evidence must note the escapee: {evidence}"
+        );
+    }
+
+    #[test]
+    fn a_completed_check_leaves_no_in_group_orphan() {
+        // M2: the no-orphan guarantee must hold on the COMPLETION path too, not
+        // only the timeout path. The shell exits 0 immediately after backgrounding
+        // an in-group grandchild that would write a sentinel after a sleep. Killing
+        // the group unconditionally after the shell is reaped kills that grandchild
+        // before it can write. Without the unconditional group-kill, the sentinel
+        // would appear.
+        let tmp = tempdir();
+        let sentinel = tmp.path().join("orphan-wrote-this.txt");
+        let run = format!(
+            "( sleep 3; echo alive > '{}' ) & exit 0",
+            sentinel.display()
+        );
+        let outcome = run_check(&cmd(&run, false), &CheckContext::new(tmp.path()));
+        assert_eq!(outcome.verdict, Verdict::Held);
+
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(
+            !sentinel.exists(),
+            "a grandchild of a COMPLETED check survived and wrote {}; the group was \
+             not killed on the completion path",
+            sentinel.display()
+        );
+    }
+
+    // --- Empty run is never a vacuous pass (C1, defense-in-depth). ---
+
+    #[test]
+    fn empty_run_is_broken_never_held() {
+        // The execution-side guard mirroring the parser's rejection: even a `Check`
+        // built by some non-parser path with a blank command must be Broken, never
+        // a pass, and never Drifted under negation.
+        for blank in ["", "   ", "\t\n"] {
+            let outcome = run(blank, false);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Broken,
+                "blank run {blank:?} must be Broken"
+            );
+            assert!(matches!(outcome.end, ProcessEnd::SpawnFailed { .. }));
+            // And under negate it stays Broken — a blank run cannot become a pass.
+            assert_eq!(run(blank, true).verdict, Verdict::Broken);
+        }
     }
 
     // --- Output capture and truncation (spec item 5). ---
@@ -963,6 +1366,26 @@ mod tests {
         assert_eq!(outcome.verdict, Verdict::Held);
     }
 
+    #[test]
+    fn timeout_retains_output_produced_before_the_kill() {
+        // m6: partial output a check emitted before it was timed out must survive
+        // into the evidence, so a Broken-by-timeout verdict still shows what the
+        // check had said. The command prints a marker, flushes by newline, then
+        // hangs past the timeout.
+        let tmp = tempdir();
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.timeout = Duration::from_millis(400);
+        let outcome = run_check(&cmd("echo early-marker; sleep 30", false), &ctx);
+        assert!(matches!(outcome.end, ProcessEnd::TimedOut { .. }));
+        let evidence = outcome
+            .evidence
+            .expect("output produced before the kill must be retained");
+        assert!(
+            evidence.contains("early-marker"),
+            "pre-kill output should be in the evidence: {evidence}"
+        );
+    }
+
     // --- Non-cmd kinds are never silently passed (invariant #6). ---
 
     #[test]
@@ -975,7 +1398,7 @@ mod tests {
         };
         let outcome = run_check(&check, &CheckContext::new("."));
         assert_eq!(outcome.verdict, Verdict::Unverifiable);
-        assert_ne!(outcome.verdict, Verdict::Held);
+        assert!(matches!(outcome.end, ProcessEnd::NotExecuted { .. }));
         assert!(outcome.evidence.is_some());
     }
 
@@ -996,17 +1419,16 @@ mod tests {
 
     #[test]
     fn status_describes_the_exit() {
-        assert_eq!(run("exit 0", false).status, "exit 0");
-        assert_eq!(run("exit 1", false).status, "exit 1");
-        assert_eq!(run("exit 42", false).status, "exit 42");
+        assert_eq!(run("exit 0", false).status(), "exit 0");
+        assert_eq!(run("exit 1", false).status(), "exit 1");
+        assert_eq!(run("exit 42", false).status(), "exit 42");
     }
 
     // --- Supports resolution (spec item 7). ---
 
-    /// Wrap raw strings as `SupportTarget`s via a claim parse round-trip is
-    /// overkill; construct them through the public parser path instead by using
-    /// the claim module. Since `SupportTarget` has no public constructor, build
-    /// targets by parsing a minimal claim carrying them.
+    /// Build `SupportTarget`s from raw strings. `SupportTarget` has no public
+    /// constructor, so they are produced the only way a caller can: by parsing a
+    /// minimal claim that carries them in its `supports` list.
     fn targets(raw: &[&str]) -> Vec<SupportTarget> {
         let list = raw
             .iter()
@@ -1019,6 +1441,11 @@ mod tests {
         crate::claim::parse_claim_file("f.md", &src)
             .unwrap()
             .supports
+    }
+
+    /// Build a `Vec<ClaimId>` for the `known_claim_ids` argument from raw slugs.
+    fn ids(raw: &[&str]) -> Vec<ClaimId> {
+        raw.iter().map(|s| s.parse::<ClaimId>().unwrap()).collect()
     }
 
     #[test]
@@ -1064,7 +1491,7 @@ mod tests {
         let res = resolve_supports(
             &targets(&["payments/libfoo-pin"]),
             tmp.path(),
-            &["payments/libfoo-pin"],
+            &ids(&["payments/libfoo-pin"]),
         );
         assert!(res[0].resolved, "{:?}", res[0]);
     }
@@ -1072,7 +1499,11 @@ mod tests {
     #[test]
     fn namespaced_id_that_is_neither_file_nor_id_is_unresolved() {
         let tmp = tempdir();
-        let res = resolve_supports(&targets(&["payments/gone"]), tmp.path(), &["other/id"]);
+        let res = resolve_supports(
+            &targets(&["payments/gone"]),
+            tmp.path(),
+            &ids(&["other/id"]),
+        );
         assert!(!res[0].resolved);
         assert!(res[0]
             .reason
@@ -1104,16 +1535,57 @@ mod tests {
     }
 
     #[test]
+    fn anchor_matches_at_word_boundary_not_as_a_substring() {
+        // Anchor-collision fix: a deleted `libfoo` heading must read as unresolved
+        // even when the substring `libfoo` survives inside an unrelated identifier
+        // (`libfoobar`). A bare `contains` would soft-false-green here.
+        let tmp = tempdir();
+        std::fs::write(
+            tmp.path().join("decisions.md"),
+            b"see libfoobar for the other thing\n",
+        )
+        .unwrap();
+        let res = resolve_supports(&targets(&["decisions.md#libfoo"]), tmp.path(), &[]);
+        assert!(
+            !res[0].resolved,
+            "libfoo must not resolve via the substring in libfoobar: {:?}",
+            res[0]
+        );
+    }
+
+    #[test]
+    fn anchor_occurs_respects_boundaries() {
+        // Direct coverage of the boundary predicate: bounded by punctuation, file
+        // edges, and whitespace resolve; a run-on identifier does not.
+        assert!(anchor_occurs("## libfoo pin", "libfoo"));
+        assert!(anchor_occurs("libfoo", "libfoo"));
+        assert!(anchor_occurs("(libfoo)", "libfoo"));
+        assert!(anchor_occurs("id: libfoo\n", "libfoo"));
+        assert!(!anchor_occurs("libfoobar", "libfoo"));
+        assert!(!anchor_occurs("prefixlibfoo", "libfoo"));
+        assert!(!anchor_occurs("", "libfoo"));
+        assert!(!anchor_occurs("anything", ""));
+    }
+
+    #[test]
     fn resolving_bare_claim_id_resolves() {
         let tmp = tempdir();
-        let res = resolve_supports(&targets(&["other-claim"]), tmp.path(), &["other-claim"]);
+        let res = resolve_supports(
+            &targets(&["other-claim"]),
+            tmp.path(),
+            &ids(&["other-claim"]),
+        );
         assert!(res[0].resolved, "{:?}", res[0]);
     }
 
     #[test]
     fn missing_bare_claim_id_is_unresolved_with_reason() {
         let tmp = tempdir();
-        let res = resolve_supports(&targets(&["other-claim"]), tmp.path(), &["some-other-id"]);
+        let res = resolve_supports(
+            &targets(&["other-claim"]),
+            tmp.path(),
+            &ids(&["some-other-id"]),
+        );
         assert!(!res[0].resolved);
         let reason = res[0].reason.as_ref().unwrap();
         assert!(reason.contains("other-claim"), "reason: {reason}");
@@ -1136,7 +1608,7 @@ mod tests {
         let res = resolve_supports(
             &targets(&["here.txt", "gone.txt", "known-id"]),
             tmp.path(),
-            &["known-id"],
+            &ids(&["known-id"]),
         );
         assert!(res[0].resolved);
         assert!(!res[1].resolved);
@@ -1147,15 +1619,43 @@ mod tests {
 
     #[test]
     fn classify_exit_is_total_and_correct() {
-        assert_eq!(classify_exit(&RunResult::Exited(0)), Verdict::Held);
-        assert_eq!(classify_exit(&RunResult::Exited(1)), Verdict::Drifted);
-        assert_eq!(classify_exit(&RunResult::Exited(2)), Verdict::Broken);
-        assert_eq!(classify_exit(&RunResult::Exited(127)), Verdict::Broken);
-        assert_eq!(classify_exit(&RunResult::Exited(-1)), Verdict::Broken);
-        assert_eq!(classify_exit(&RunResult::Signalled), Verdict::Broken);
-        assert_eq!(classify_exit(&RunResult::TimedOut), Verdict::Broken);
         assert_eq!(
-            classify_exit(&RunResult::SpawnFailed("x".to_owned())),
+            classify_exit(&ProcessEnd::Exited { code: 0 }),
+            Verdict::Held
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::Exited { code: 1 }),
+            Verdict::Drifted
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::Exited { code: 2 }),
+            Verdict::Broken
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::Exited { code: 127 }),
+            Verdict::Broken
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::Exited { code: -1 }),
+            Verdict::Broken
+        );
+        assert_eq!(classify_exit(&ProcessEnd::Signalled), Verdict::Broken);
+        assert_eq!(
+            classify_exit(&ProcessEnd::TimedOut {
+                after: Duration::from_secs(1)
+            }),
+            Verdict::Broken
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::SpawnFailed {
+                reason: "x".to_owned()
+            }),
+            Verdict::Broken
+        );
+        assert_eq!(
+            classify_exit(&ProcessEnd::NotExecuted {
+                note: "x".to_owned()
+            }),
             Verdict::Broken
         );
     }

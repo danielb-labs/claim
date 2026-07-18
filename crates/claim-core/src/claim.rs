@@ -771,6 +771,20 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
     let (kind, allowed): (CheckKind, &[&str]) = match kind_raw {
         "cmd" => {
             let run = require_check_str(path, map, index, "run")?;
+            if run.trim().is_empty() {
+                // A blank or whitespace-only `run` runs as `sh -c ""`, exits 0,
+                // and reports Held forever — a check that can never go red, the
+                // exact vacuous pass this tool exists to prevent. Rejected at parse
+                // time alongside the other empty-string checks (id, statement,
+                // supports).
+                return Err(Error::parse(
+                    path,
+                    format!(
+                        "{}: must not be empty; a check with no command can never fail",
+                        field("run")
+                    ),
+                ));
+            }
             let negate = match map.get("negate") {
                 None => false,
                 Some(Value::Bool(b)) => *b,
@@ -1271,6 +1285,27 @@ See [[libfoo-cjk-repro]] for the reproduction.
                 negate: false
             }
         );
+    }
+
+    #[test]
+    fn empty_or_blank_run_is_rejected() {
+        // A blank `run` would execute as `sh -c ""`, exit 0, and report Held
+        // forever — a vacuous pass that can never go red. It is rejected at parse
+        // time alongside empty id/statement/supports. A comment-only command is
+        // blank once the shell strips it, but the parser cannot know that; those
+        // are caught defensively at execution (see check.rs), so here only the
+        // syntactically-empty forms must fail.
+        for bad in ["\"\"", "\"   \"", "\"\\t\""] {
+            let src = format!(
+                "---\nid: a\nchecks:\n  - kind: cmd\n    run: {bad}\n    when: on-change\nmax-age: 1d\n---\nS.\n"
+            );
+            let err = expect_err(&src);
+            assert!(
+                parse_reason(&err).contains("must not be empty"),
+                "run {bad} should be rejected: {}",
+                parse_reason(&err)
+            );
+        }
     }
 
     #[test]
