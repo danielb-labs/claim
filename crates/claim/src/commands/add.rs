@@ -307,8 +307,9 @@ fn warn_unresolved_supports(store: &Store, existing: &StoreLoad, claim: &Claim) 
             warn(&format!(
                 "supports target '{}' does not resolve: {reason}. The claim will be created, but \
                  `claim check` will flag this as an unresolved support until it resolves. If you \
-                 meant a Markdown heading, `#anchor` is a literal text scan, not a slug — use the \
-                 words as written.",
+                 meant a Markdown heading, `#anchor` is a case-sensitive text scan, not a slug — \
+                 use the words as written and matching case (`#Approved dependencies`, not \
+                 `#approved-dependencies`).",
                 res.target
             ));
         }

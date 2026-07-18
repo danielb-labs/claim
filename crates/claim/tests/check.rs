@@ -98,6 +98,14 @@ fn a_plain_readme_in_the_store_is_ignored_and_check_succeeds() {
         .code(0)
         .stdout(predicate::str::contains("held"))
         .stdout(predicate::str::contains("README").not());
+
+    // The good claim did not merely fail to error — it actually ran and persisted its
+    // verdict, so the README's presence did not quietly skip the real work.
+    assert_eq!(
+        repo.log_count("pin"),
+        1,
+        "the real claim still ran and recorded a verdict alongside the README"
+    );
 }
 
 #[test]

@@ -127,16 +127,17 @@ pub struct AddArgs {
     /// A `supports` target this claim justifies — a decision ref
     /// (`requirements.txt#libfoo`) or a bare claim id. Repeatable.
     ///
-    /// A decision ref `path#anchor` resolves when `path` exists and the literal
-    /// text `anchor` occurs in it (a word-boundary substring scan). It is a plain
-    /// occurrence check, not a Markdown heading slug: `CLAUDE.md#approved-dependencies`
-    /// looks for the text `approved-dependencies`, so to point at a heading like
-    /// "## Approved dependencies" use the words as written (`CLAUDE.md#Approved
-    /// dependencies`), not the GitHub anchor slug. A bare target (no `#`) resolves
-    /// when it is an existing file or a known claim id. `add` runs this check now
-    /// and prints a warning for each target that does not resolve (a forward
-    /// reference is allowed, so it is a warning, not a hard failure); `check` later
-    /// reports an unresolved target as review-needed.
+    /// A decision ref `path#anchor` resolves when `path` exists and the text
+    /// `anchor` occurs in it as a case-sensitive word-boundary text scan — not a
+    /// Markdown heading slug. `CLAUDE.md#approved-dependencies` looks for the exact
+    /// text `approved-dependencies`, so to point at a heading like "## Approved
+    /// dependencies" use the words as written and matching case (`CLAUDE.md#Approved
+    /// dependencies`), not the GitHub anchor slug; `#approved` will not match
+    /// `Approved`. A bare target (no `#`) resolves when it is an existing file or a
+    /// known claim id. `add` runs this check now and prints a warning for each
+    /// target that does not resolve (a forward reference is allowed, so it is a
+    /// warning, not a hard failure); `check` later reports an unresolved target as
+    /// review-needed.
     #[arg(long = "supports", value_name = "TARGET")]
     pub supports: Vec<String>,
 

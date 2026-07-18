@@ -422,8 +422,8 @@ fn collect_claim_files(
     Ok(())
 }
 
-/// Whether a `.md` file under `.claims/` should be parsed as a claim: it opens
-/// with a `---` frontmatter fence, or it could not be read to tell.
+/// Whether a `.md` file under `.claims/` should be parsed as a claim: its first
+/// line opens with a `---` frontmatter fence, or it could not be read to tell.
 ///
 /// A readable file with no opening fence is a plain document and returns `false`
 /// (skip it). A file that opens with the fence returns `true` (parse it, so
@@ -431,9 +431,22 @@ fn collect_claim_files(
 /// prove it is a plain doc, so it is kept for [`load_one`] to report the read
 /// failure rather than silently dropped here. See [`collect_claim_files`] for the
 /// rule and its trade-off.
+///
+/// Only the first line is read — the fence lives there and
+/// [`claim_core::has_frontmatter_fence`] looks no further — so this stays cheap on
+/// a store of many `.md` files and never re-reads the whole file that [`load_one`]
+/// is about to parse.
 fn intends_to_be_a_claim(path: &Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(text) => claim_core::has_frontmatter_fence(&text),
+    use std::io::BufRead;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let mut first_line = String::new();
+    // A read failure mid-file is treated the same as an unreadable file: keep it, so
+    // `load_one` surfaces the fault loudly rather than this walk deciding it is a doc.
+    match std::io::BufReader::new(file).read_line(&mut first_line) {
+        Ok(_) => claim_core::has_frontmatter_fence(&first_line),
         Err(_) => true,
     }
 }

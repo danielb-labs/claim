@@ -545,6 +545,55 @@ fn add_does_not_warn_when_every_supports_resolves() {
     assert!(repo.exists(".claims/dep-note.md"));
 }
 
+#[test]
+fn supports_warning_in_json_mode_goes_to_stderr_and_leaves_stdout_clean() {
+    // `warn_unresolved_supports` claims a `--json` caller still sees the warning
+    // without its stdout being contaminated. Prove it for a tool-emitted warning:
+    // in `--json` mode the unresolvable-support warning is on stderr, while stdout
+    // remains exactly the single parseable JSON object a consumer reads.
+    let repo = ready_repo();
+    repo.write(
+        "DECISIONS.md",
+        "# Approved dependencies\n\nserde is fine.\n",
+    );
+    repo.git(&["add", "DECISIONS.md"]);
+    repo.git(&["commit", "-q", "-m", "add decisions"]);
+
+    let output = repo
+        .claim()
+        .args([
+            "--json",
+            "add",
+            "--id",
+            "dep-note",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--supports",
+            "DECISIONS.md#approved-dependencies",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("does not resolve"))
+        .get_output()
+        .clone();
+
+    // stdout is one clean JSON object, uncontaminated by the warning.
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is a single valid JSON object");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["id"], "dep-note");
+    // The warning is not on stdout — it belongs to stderr alone.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("does not resolve"),
+        "the warning must not leak onto stdout: {stdout}"
+    );
+}
+
 // --- Optional witnessed-red: extra confidence, in an isolated worktree. ---
 
 #[test]

@@ -441,16 +441,24 @@ pub fn parse_claim_file(path: &str, contents: &str) -> Result<Claim> {
 /// it is broken). A file that does *not* open with the fence is a plain document
 /// the scanner may skip.
 ///
-/// The rule is exactly [`parse_claim_file`]'s opening-fence test — the fence
-/// alone on the first line — so the scanner and the parser can never disagree
-/// about what counts as a claim file. It only inspects the first line and reads
-/// no further, so it is cheap enough to run on every `.md` in a store.
+/// This is the parser's opening-fence *acceptance* condition, and only that: it
+/// returns `true` for exactly the first lines [`parse_claim_file`] accepts as a
+/// fence. The parser is additionally stricter — it also requires a following
+/// newline and a body to proceed — so a file this accepts can still fail to
+/// parse (a bare `---` with no body is one such case). The divergence is
+/// one-directional and that is the load-bearing property: any file the parser
+/// would accept as a claim, this accepts too, so the scanner never skips a real
+/// claim; when the two differ, it is only the parser being louder, never the
+/// scanner being quieter. It inspects only the first line, so a caller may pass
+/// just that line rather than a whole file.
 #[must_use]
 pub fn has_frontmatter_fence(contents: &str) -> bool {
     let text = contents.strip_prefix('\u{feff}').unwrap_or(contents);
-    // Mirror `split_frontmatter`'s opening test exactly: the first line must *start*
-    // with `---` (no leading whitespace — an indented `---` is not a fence) and carry
-    // nothing but whitespace after it.
+    // The parser's opening-fence acceptance: the first line must *start* with `---`
+    // (no leading whitespace — an indented `---` is not a fence) and carry nothing
+    // but whitespace after it. The parser then also needs a newline and a body, which
+    // this does not require — the accepted-as-fence set is a superset, so divergence
+    // only ever makes the parser louder.
     text.strip_prefix(FRONTMATTER_FENCE)
         .map(|rest| rest.split_once('\n').map_or(rest, |(head, _)| head))
         .is_some_and(|line_rest| line_rest.trim().is_empty())
@@ -1393,14 +1401,19 @@ See [[libfoo-cjk-repro]] for the reproduction.
     }
 
     #[test]
-    fn frontmatter_fence_detection_matches_the_opening_fence_rule() {
-        // A store scanner uses this to tell a claim from a plain doc; it must agree
-        // exactly with `split_frontmatter`'s opening test, or a fenced-but-broken
-        // claim could be skipped instead of erroring loudly.
+    fn frontmatter_fence_detection_accepts_exactly_the_parser_opening_fence() {
+        // A store scanner uses this to tell a claim from a plain doc. It must accept
+        // every first line the parser accepts as a fence, or a fenced-but-broken
+        // claim could be skipped instead of erroring loudly; it may accept *more*
+        // (the parser is additionally stricter), which only ever makes the parser
+        // louder, never the scanner quieter.
         assert!(has_frontmatter_fence("---\nid: a\n---\nS.\n"));
         assert!(has_frontmatter_fence("---   \nid: a\n---\nS.\n")); // trailing space is fine
         assert!(has_frontmatter_fence("\u{feff}---\nid: a\n")); // a leading BOM is tolerated
-        assert!(has_frontmatter_fence("---")); // fence alone, no newline
+                                                                // A bare `---` with no body is accepted as a fence here but the parser rejects
+                                                                // it (no body) — the safe divergence: the scanner keeps it, the parser is loud.
+        assert!(has_frontmatter_fence("---"));
+        assert!(parse_claim_file("f.md", "---").is_err());
 
         assert!(!has_frontmatter_fence("# README\n\nnot a claim\n"));
         assert!(!has_frontmatter_fence("")); // empty file
