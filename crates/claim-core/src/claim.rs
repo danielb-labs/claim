@@ -486,9 +486,11 @@ pub fn extract_embedded_claims(path: &str, contents: &str) -> Result<Vec<Claim>>
 /// Locate the YAML payload of an embedded block and the byte just past its
 /// closing fence.
 ///
-/// The closer is the first line after the opener that is exactly `-->` (allowing
-/// only surrounding whitespace), never a `-->` embedded in a value. Returns the
-/// YAML slice between the fences and the offset one past the closing line.
+/// The closer is the first line after the opener that is exactly `-->`, allowing
+/// only trailing whitespace. Leading whitespace disqualifies it: a `-->` indented
+/// beneath a mapping key is block-scalar content, not a fence, so an arrow inside
+/// a multi-line value cannot silently truncate the block and drop later checks.
+/// Returns the YAML slice between the fences and the offset one past the closer.
 fn embedded_yaml<'a>(
     path: &str,
     contents: &'a str,
@@ -500,7 +502,9 @@ fn embedded_yaml<'a>(
     // exact across CRLF.
     let mut offset = after_open;
     for line in contents[after_open..].split_inclusive('\n') {
-        if line.trim_end_matches(['\r', '\n']).trim() == EMBED_CLOSE {
+        // `trim_end` (not `trim`) so an indented `-->` stays block-scalar content,
+        // matching the unindented-closing-fence rule in `split_frontmatter`.
+        if line.trim_end() == EMBED_CLOSE {
             let yaml = &contents[after_open..offset];
             return Ok((yaml, offset + line.len()));
         }
@@ -1756,6 +1760,25 @@ See [[libfoo-cjk-repro]] for the reproduction.
             CheckKind::Cmd {
                 run: "second".to_owned(),
                 negate: false
+            }
+        );
+    }
+
+    #[test]
+    fn indented_arrow_alone_in_block_scalar_does_not_truncate_the_block() {
+        // A `-->` alone on an indented line is block-scalar content, not the fence.
+        // Only an unindented `-->` closes the block. Matching on a trimmed line
+        // (leading whitespace stripped) would truncate here and silently drop the
+        // second check -- the same "nag never a lie" break as an inline arrow, via
+        // an indented one.
+        let host = "Fact.\n<!-- claim\nid: x\nmax-age: 1d\nchecks:\n  - kind: agent\n    when: on-change\n    instruction: |\n      line one\n      -->\n      line three\n  - kind: cmd\n    run: second\n    when: on-change\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].checks.len(), 2);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "line one\n-->\nline three\n".to_owned()
             }
         );
     }
