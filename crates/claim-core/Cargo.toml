@@ -16,7 +16,7 @@ thiserror = { workspace = true }
 serde_norway = { workspace = true }
 # Timestamps and duration arithmetic for the verdict log. Chosen over `time` and
 # `chrono` for its correctness-first design: `Timestamp` is an unambiguous UTC
-# instant, RFC 3339 (de)serialization round-trips losslessly, and duration math
-# is total rather than silently wrapping — the properties a trust tool needs from
-# the clock its staleness is measured against.
+# instant, RFC 3339 (de)serialization round-trips losslessly, and `checked_add`
+# surfaces out-of-range arithmetic as an error instead of wrapping — the
+# properties a trust tool needs from the clock its staleness is measured against.
 jiff = { workspace = true }

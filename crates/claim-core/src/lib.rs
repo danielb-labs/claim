@@ -27,7 +27,7 @@ pub use claim::{
 };
 pub use error::{Error, Result};
 pub use log::{
-    append_entry, compute_status, read_entries, Adjudication, Event, LogEntry, StatusReport,
-    Timestamp, DEFAULT_GRACE_DAYS,
+    append_entry, compute_status, read_entries, Adjudication, Event, Grace, LogEntry,
+    SignedDuration, StatusReport, Timestamp,
 };
 pub use verdict::{Status, Verdict};

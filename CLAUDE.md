@@ -78,11 +78,11 @@ first item to need it picks one and records the choice in this file. **Chosen:
 which is what a trust tool needs from its parser; rationale in
 `crates/claim-core/Cargo.toml`. For instant and duration arithmetic (the verdict
 log's timestamps and status computation), **`jiff`** (item 02): correctness-first,
-with unambiguous UTC instants, lossless RFC 3339 round-trips, and total duration
-math — chosen over `time`/`chrono`; rationale in `crates/claim-core/Cargo.toml`.
-Adding any
-other dependency requires a one-line justification in the crate's `Cargo.toml`
-and a note in the review — every dependency is attack surface and maintenance.
+with unambiguous UTC instants, lossless RFC 3339 round-trips, and checked duration
+arithmetic that surfaces overflow instead of wrapping — chosen over `time`/`chrono`;
+rationale in `crates/claim-core/Cargo.toml`. Adding any other dependency requires a
+one-line justification in the crate's `Cargo.toml` and a note in the review — every
+dependency is attack surface and maintenance.
 
 **Toolchain.** `cargo` may not be on a fresh shell's `PATH`; run
 `source "$HOME/.cargo/env"` first (`scripts/check.sh` does this for you).

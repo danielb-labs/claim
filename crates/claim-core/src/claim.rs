@@ -247,8 +247,9 @@ impl Trigger {
 /// any other number, and so `max-age` carries meaning at the type level. Always
 /// positive: a zero-day freshness window would mean a claim is stale the instant
 /// it is verified, which is never what an author intends, so it is rejected at
-/// parse time. This crate deliberately avoids a datetime library — turning a day
-/// count into calendar arithmetic is a later item's decision.
+/// parse time. The verdict log turns a day count into instant arithmetic
+/// (`crate::log`), treating a day as an unambiguous 24 hours against a UTC
+/// instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Days(NonZeroU32);
 
@@ -259,6 +260,17 @@ impl Days {
     #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
+    }
+
+    /// Wrap a positive day count already known at the type level.
+    ///
+    /// `const` so callers can build compile-time day constants (a policy default,
+    /// a grace window) without routing through the string parser and an
+    /// `unwrap`. Takes a [`NonZeroU32`] so the positivity guarantee is discharged
+    /// by the type, not re-checked here.
+    #[must_use]
+    pub const fn from_nonzero(days: NonZeroU32) -> Self {
+        Days(days)
     }
 }
 

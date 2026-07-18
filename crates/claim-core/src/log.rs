@@ -28,6 +28,7 @@
 //! there — committing it is the caller's job, per invariant #4.
 
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,7 @@ use crate::claim::{ClaimId, Days};
 use crate::error::{Error, Result};
 use crate::verdict::{Status, Verdict};
 
-pub use jiff::Timestamp;
+pub use jiff::{SignedDuration, Timestamp};
 
 /// One event in a claim's history: who observed what, when, and at which commit.
 ///
@@ -58,11 +59,13 @@ pub struct LogEntry {
     pub at: Timestamp,
     /// The git commit sha the claim's checks were observed against, so a verdict
     /// can always be traced back to the exact tree that produced it. A short or
-    /// full hex sha; validated only as non-empty here (the caller supplies it
-    /// from git).
+    /// full hex sha supplied by the caller from git. [`append_entry`] rejects an
+    /// empty or whitespace-only value: an untraceable verdict has no provenance,
+    /// which the trust model forbids.
     pub commit: String,
     /// Who or what made the observation: a human id or an agent id. Cached for
     /// display; the authoritative author is the commit that adds this file.
+    /// [`append_entry`] rejects an empty or whitespace-only value.
     pub actor: String,
     /// What happened: a verification produced a verdict, or an adjudication
     /// closed the claim.
@@ -120,24 +123,34 @@ pub enum Adjudication {
 /// A claim's status plus the facts a caller needs to act on it.
 ///
 /// [`compute_status`] returns this rather than a bare [`Status`] because the CLI
-/// and the drift queue need more than the label: "stale in N days" for the due
-/// list, the last-verified date for a claim's page, whether it is due *now* for
-/// `claim check --due`. Keeping the derivation in one place means those consumers
-/// never re-derive it inconsistently.
+/// and the drift queue need more than the label: "stale in N days" (from
+/// `stale_at`) for the due list, the last-verified date for a claim's page,
+/// whether it is due *now* for `claim check --due`. Keeping the derivation in one
+/// place means those consumers never re-derive it inconsistently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     /// The computed status. The single answer to "is this claim OK right now".
     pub status: Status,
-    /// The instant of the most recent [`Verdict::Held`] in the history, if any.
-    /// `None` means the claim has never passed a check and is stale by
-    /// definition. This is "when was this last verified" — always a log
-    /// timestamp, never a field typed into a file.
+    /// The instant of the most recent *past* [`Verdict::Held`] — the newest one
+    /// at or before `now`. `None` means the claim has never passed a check as of
+    /// `now` and is stale by definition. A `Held` timestamped in the future (clock
+    /// skew, or forgery) is deliberately excluded: a verification that has not yet
+    /// happened cannot certify present freshness. This is "when was this last
+    /// verified" — always a log timestamp, never a field typed into a file.
     pub last_verified: Option<Timestamp>,
-    /// How long ago the claim was last verified, measured from `now`. `None`
-    /// when `last_verified` is `None`. May be negative if a `Held` entry is
-    /// timestamped in the future relative to `now`; callers treating a future
-    /// verification as valid get the natural answer.
-    pub age: Option<jiff::SignedDuration>,
+    /// How long ago the claim was last verified, measured from `now`. `None` when
+    /// `last_verified` is `None`. Never negative: it mirrors `last_verified`,
+    /// which only ever holds a past `Held`.
+    pub age: Option<SignedDuration>,
+    /// The instant at which the claim becomes (or became) [`Status::Stale`] — the
+    /// end of its fresh window. Answers "stale in N days" as `stale_at - now`, and
+    /// "how overdue" when it is in the past. `None` when there is no finite
+    /// deadline to report: a [`Status::Retired`] claim (terminal), a claim never
+    /// verified (already stale, no window to expire), or the rare case where the
+    /// window would extend past the representable end of time (see
+    /// [`compute_status`]). Reflects the grace-extended window when a
+    /// broken/unverifiable streak is active.
+    pub stale_at: Option<Timestamp>,
     /// Whether the claim needs a check now: `true` for anything wanting
     /// attention ([`Status::Stale`] or [`Status::Drifted`]), `false` when
     /// [`Status::Verified`] or [`Status::Retired`]. A retired claim is terminal,
@@ -145,17 +158,45 @@ pub struct StatusReport {
     pub due: bool,
 }
 
-/// The default grace window for a broken or unverifiable streak, in days.
+/// A grace window: how long a broken or unverifiable streak may keep a claim
+/// fresh past its `max_age` before it goes stale anyway.
+///
+/// A distinct newtype from [`Days`], and the last positional argument of
+/// [`compute_status`], so the two day counts that function takes — `max_age` and
+/// the grace window — cannot be transposed at a call site without a type error.
+/// Transposing them would silently change a claim's staleness, exactly the quiet
+/// wrong answer this tool exists to prevent.
 ///
 /// A check that breaks (`Broken`) or keeps coming back inconclusive
 /// (`Unverifiable`) does not immediately flip a still-fresh claim to stale:
 /// transient breakage — a runner outage, a flaky probe — should not nag on the
-/// first failure. But the streak cannot mask indefinitely, or a check that
-/// breaks and stays broken becomes a permanent false-fresh. After this many days
-/// past the last real `Held`, the claim goes [`Status::Stale`] regardless. Per
-/// PRODUCT.md section 3; configurable by passing a different value to
-/// [`compute_status`].
-pub const DEFAULT_GRACE_DAYS: u32 = 90;
+/// first failure. But the streak cannot mask indefinitely, or a check that breaks
+/// and stays broken becomes a permanent false-fresh. Once the streak has run
+/// `grace` past the last real `Held`, the claim goes [`Status::Stale`] regardless.
+/// Per PRODUCT.md section 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Grace(pub Days);
+
+impl Grace {
+    /// The default grace window, 90 days, per PRODUCT.md section 3.
+    ///
+    /// A usable compile-time constant: `const` all the way down, so a caller can
+    /// pass `Grace::DEFAULT` without parsing a string at runtime.
+    pub const DEFAULT: Grace = {
+        // 90 is a nonzero literal; the `expect` can never fire, and being const it
+        // is checked at compile time rather than trusted at runtime.
+        let Some(days) = NonZeroU32::new(90) else {
+            panic!("90 is nonzero")
+        };
+        Grace(Days::from_nonzero(days))
+    };
+
+    /// The window as a plain [`Days`].
+    #[must_use]
+    pub fn days(self) -> Days {
+        self.0
+    }
+}
 
 /// Append one entry to a claim's log, creating the log directory as needed.
 ///
@@ -173,13 +214,36 @@ pub const DEFAULT_GRACE_DAYS: u32 = 90;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] naming the path if the directory cannot be created or
-/// the file cannot be written. In the astronomically unlikely event that an
-/// entry with byte-identical content already exists at the same timestamp (same
-/// instant, same commit, same actor, same event), the existing file is left
-/// untouched and its path returned — re-recording an identical observation is a
-/// no-op, not an error, and never an overwrite.
+/// - [`Error::Parse`] if `entry.commit` or `entry.actor` is empty or
+///   whitespace-only: a verdict with no traceable commit or actor has no
+///   provenance, which the trust model forbids.
+/// - [`Error::Io`] naming the path if the directory cannot be created or the file
+///   cannot be written.
+/// - [`Error::Io`] naming the path if the target filename already exists **with
+///   different bytes**. The filename is a timestamp plus a 64-bit hash of the
+///   entry, so a hash collision between two genuinely different observations is
+///   improbable but not impossible — and silently keeping the older file could
+///   drop a `Drifted` and leave a stale `Held` as the record, a false-green this
+///   tool must never produce. A byte-identical file at the same path is instead a
+///   no-op (the observation is already recorded): its path is returned. This also
+///   makes concurrent writers racing for the same content-addressed name safe —
+///   the loser confirms the bytes match and treats the record as written.
 pub fn append_entry(log_root: &Path, id: &ClaimId, entry: &LogEntry) -> Result<PathBuf> {
+    if entry.commit.trim().is_empty() {
+        return Err(Error::parse(
+            "commit",
+            "a verdict log entry needs a non-empty commit sha; an untraceable \
+             verdict has no provenance",
+        ));
+    }
+    if entry.actor.trim().is_empty() {
+        return Err(Error::parse(
+            "actor",
+            "a verdict log entry needs a non-empty actor; an unattributed verdict \
+             has no provenance",
+        ));
+    }
+
     let dir = claim_log_dir(log_root, id);
     fs::create_dir_all(&dir).map_err(|source| Error::Io {
         path: dir.display().to_string(),
@@ -195,9 +259,8 @@ pub fn append_entry(log_root: &Path, id: &ClaimId, entry: &LogEntry) -> Result<P
     })?;
     let path = dir.join(entry_filename(entry, &json));
 
-    // Create-new so a byte-identical re-record cannot clobber, and so the write
-    // is atomic against a concurrent writer racing for the same content-addressed
-    // name: the loser sees AlreadyExists and treats the observation as recorded.
+    // Create-new so an existing file is never clobbered, and so the write is
+    // atomic against a concurrent writer racing for the same name.
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -211,7 +274,30 @@ pub fn append_entry(log_root: &Path, id: &ClaimId, entry: &LogEntry) -> Result<P
             })?;
             Ok(path)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The name matched; that alone does not prove the *content* matches,
+            // because the name is only a timestamp plus a 64-bit hash. Read the
+            // existing bytes and decide: identical → the observation is already
+            // recorded, a no-op; different → a hash collision that would silently
+            // drop this observation, so refuse loudly.
+            let existing = fs::read(&path).map_err(|source| Error::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            if existing == json {
+                Ok(path)
+            } else {
+                Err(Error::Io {
+                    path: path.display().to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "a different log entry already occupies this filename \
+                         (timestamp + content-hash collision); refusing to drop \
+                         the new observation",
+                    ),
+                })
+            }
+        }
         Err(source) => Err(Error::Io {
             path: path.display().to_string(),
             source,
@@ -248,10 +334,12 @@ pub fn read_entries(log_root: &Path, id: &ClaimId) -> Result<Vec<LogEntry>> {
         }
     };
 
-    // Collect (filename, entry) so the sort key is the on-disk name, which is
-    // time-sortable by construction and breaks ties deterministically by content
-    // hash. Sorting by the parsed `at` alone would be non-deterministic for two
-    // entries sharing an instant; the filename is a total order.
+    // Sort by the entry's own timestamp, tie-broken by filename for a total,
+    // deterministic order. Sorting by the parsed `at` (not the filename bytes) is
+    // what makes the order *data-derived*: a filename whose timestamp portion is
+    // not perfectly fixed-width, or was written by an older tool, cannot reorder
+    // history behind the reader's back and swallow a later verdict. The filename
+    // tiebreak keeps two entries sharing an instant in a stable order.
     let mut named: Vec<(std::ffi::OsString, LogEntry)> = Vec::new();
     for dirent in read_dir {
         let dirent = dirent.map_err(|source| Error::Io {
@@ -275,156 +363,218 @@ pub fn read_entries(log_root: &Path, id: &ClaimId) -> Result<Vec<LogEntry>> {
         named.push((dirent.file_name(), entry));
     }
 
-    named.sort_by(|(a, _), (b, _)| a.cmp(b));
+    named.sort_by(|(a_name, a), (b_name, b)| a.at.cmp(&b.at).then_with(|| a_name.cmp(b_name)));
     Ok(named.into_iter().map(|(_, entry)| entry).collect())
 }
 
-/// Compute a claim's [`Status`] and a [`StatusReport`] from its history.
+/// Compute a claim's [`StatusReport`] from its history — the concrete form of
+/// invariant #3, status derived and never stored.
 ///
-/// This is the heart of the item and the concrete form of invariant #3. It is a
-/// pure function of its inputs — `max_age`, the ordered `history`, `now`, and the
+/// A pure function of its inputs — `max_age`, the `history`, `now`, and the
 /// `grace` window for broken/unverifiable streaks — with no hidden clock, so a
-/// test can pin every timestamp and get a deterministic answer.
+/// test can pin every timestamp and get a deterministic answer. The result does
+/// **not** depend on the order `history` is passed in: a local copy is sorted by
+/// each entry's own `at` (ties broken by preserving input order) before any rule
+/// applies, so a caller that mis-sorts cannot flip the verdict.
 ///
-/// `history` must be in chronological order, as [`read_entries`] returns it. The
-/// rules, applied in this order:
+/// The rules, applied in this order over the time-sorted history:
 ///
-/// 1. If the most recent adjudication anywhere in the history is a
-///    [`Adjudication::Retire`], the claim is [`Status::Retired`]. Retirement is
-///    terminal for v1: a later `Held` does *not* revive it (retiring is a
-///    deliberate human act; a stray check re-running should not undo it). To
-///    reopen, author a new claim.
-/// 2. Otherwise, if the most recent *verdict* is [`Verdict::Drifted`], the claim
-///    is [`Status::Drifted`] — its own check says the fact is no longer true, and
-///    that is true regardless of `max_age`.
-/// 3. Otherwise, if any [`Verdict::Held`] exists and the latest one is within the
-///    claim's *fresh window* of `now`, the claim is [`Status::Verified`]. The
-///    boundary is inclusive: a claim verified *exactly* at the window's end is
-///    still `Verified`, because the window is the length of validity and its last
-///    instant is still inside it; staleness begins the instant after.
+/// 1. If the most recent *past-or-present* adjudication is a
+///    [`Adjudication::Retire`], the claim is [`Status::Retired`]. Terminal for
+///    v1: a later `Held` does not revive it (retiring is deliberate; a stray
+///    check re-running must not undo it). To reopen, author a new claim. A
+///    *future-dated* retirement is ignored here — it must not calm a claim that
+///    is presently alarming (see the honesty note below).
+/// 2. Otherwise, consider the latest *conclusive* verdict: a [`Verdict::Held`]
+///    at or before `now`, or a [`Verdict::Drifted`] at any time. (`Broken` and
+///    `Unverifiable` are inconclusive — the check ran but could not answer — and
+///    never win this step; they only affect the grace window in rule 3.) If that
+///    latest conclusive verdict is `Drifted`, the claim is [`Status::Drifted`]:
+///    its own check says the fact is no longer true, regardless of `max_age`.
+/// 3. Otherwise, if the latest conclusive verdict is a `Held` (necessarily at or
+///    before `now`) and `now` is within that `Held`'s *fresh window*, the claim
+///    is [`Status::Verified`]. The boundary is inclusive: a claim verified
+///    *exactly* at the window's end is still `Verified`; staleness begins the
+///    instant after.
 ///
-///    The fresh window is normally `max_age`. But when the most recent verdict
-///    since that `Held` is a `Broken` or `Unverifiable` streak — the check ran
-///    but could not confirm — a claim already past `max_age` is given until
-///    `grace` (from the last `Held`) before it goes stale. This is the one place
+///    The window is normally `max_age`. But when the entries *after* that `Held`
+///    are a `Broken`/`Unverifiable` streak — the check ran but could not confirm
+///    — the window extends to `grace` from the `Held`. This is the one place
 ///    `grace` is load-bearing: transient breakage (a runner outage, a flaky
 ///    probe) should not nag on the first failure past `max_age`, but the streak
-///    cannot mask indefinitely, or a check that breaks and stays broken becomes a
-///    permanent false-fresh. Since `grace` (default 90 days) is meant to exceed a
-///    typical `max_age`, the window can only ever *extend*, never shrink; a fresh
-///    `Held` collapses it back to `max_age`.
-/// 4. Otherwise the claim is [`Status::Stale`]. This one branch covers every way
-///    a claim ages out: never verified (no `Held` ever), last `Held` older than
-///    `max_age` with no lingering streak, or a `Broken`/`Unverifiable` streak
-///    that has run past the last `Held` for longer than `grace`. In every case
-///    the end state is a human being nagged, never a stale green light
-///    (invariant #6).
+///    cannot mask indefinitely or a stuck-broken check becomes a permanent
+///    false-fresh. `grace` (default 90 days) is meant to exceed a typical
+///    `max_age`, so the window can only extend, never shrink; a fresh `Held`
+///    collapses it back to `max_age`.
+/// 4. Otherwise the claim is [`Status::Stale`]: never verified, aged past
+///    `max_age` with no streak, or a streak run past `grace`. The end state is a
+///    human being nagged, never a stale green light (invariant #6).
 ///
-/// Note the interaction of rules 2 and 3: a `Held` followed later by a `Broken`
-/// is *not* drifted (rule 2 only fires on `Drifted`); it stays `Verified` while
-/// within `max_age`, extends to `grace` while the streak continues, then goes
-/// `Stale`. A `Drifted` followed later by a `Held` is `Verified` — the claim was
-/// re-verified and the drift is history.
+/// **Honesty under a bad clock (invariant #6).** A future-dated entry — clock
+/// skew or forgery — can never make a claim *safer* than the same history
+/// without it, nor turn `due` off. A future `Held` is excluded from freshness
+/// (`last_verified`, `age`) entirely: a verification that has not yet happened
+/// cannot certify present freshness. A future `Retire` is excluded from rule 1:
+/// it must not calm a presently-alarming claim. Only a future `Drifted` is
+/// honored, because it can only *raise* alarm.
+///
+/// Interactions worth noting: `Held → Drifted → Broken` is `Drifted` (the latest
+/// *conclusive* verdict is the `Drifted`; the trailing `Broken` cannot mask it).
+/// `Held → Broken` stays `Verified` within `max_age`, extends to `grace` while
+/// the streak continues, then goes `Stale`. `Drifted → Held` is `Verified` — the
+/// claim was re-verified and the drift is history.
+///
+/// `stale_at` reports the instant the fresh window ends (grace-extended when a
+/// streak is active), or `None` when there is no finite deadline: retired, never
+/// verified, or a window that would overflow the representable end of time.
 #[must_use]
 pub fn compute_status(
     max_age: Days,
     history: &[LogEntry],
     now: Timestamp,
-    grace: Days,
+    grace: Grace,
 ) -> StatusReport {
-    let last_held = history.iter().rev().find_map(|e| match &e.event {
+    // Order-independence (C1a): derive the verdict from the entries' own
+    // timestamps, not the order the caller happened to pass. A stable sort keeps
+    // input order as the tiebreak for a shared instant, matching `read_entries`.
+    let mut sorted: Vec<&LogEntry> = history.iter().collect();
+    sorted.sort_by_key(|e| e.at);
+
+    // Freshness may only rest on a Held that has actually happened: a future Held
+    // is a pending observation, not present certification.
+    let last_verified = sorted.iter().rev().find_map(|e| match &e.event {
         Event::Verification {
             verdict: Verdict::Held,
             ..
-        } => Some(e.at),
+        } if e.at <= now => Some(e.at),
         _ => None,
     });
+    let age = last_verified.map(|at| now.duration_since(at));
 
-    let age = last_held.map(|at| now.duration_since(at));
-
-    let status = compute_status_kind(max_age, history, now, grace, last_held);
+    let (status, stale_at) = classify(max_age, &sorted, now, grace, last_verified);
     let due = !matches!(status, Status::Verified | Status::Retired);
 
     StatusReport {
         status,
-        last_verified: last_held,
+        last_verified,
         age,
+        stale_at,
         due,
     }
 }
 
-/// The status label alone, factored out so [`compute_status`] can assemble the
-/// full report around it. Takes the pre-computed `last_held` to avoid scanning
-/// the history twice.
-fn compute_status_kind(
+/// The status and its stale-at deadline, over an already time-sorted history.
+///
+/// Returns `stale_at` alongside the label so the two are computed from one pass
+/// of reasoning and can never disagree.
+fn classify(
     max_age: Days,
-    history: &[LogEntry],
+    sorted: &[&LogEntry],
     now: Timestamp,
-    grace: Days,
-    last_held: Option<Timestamp>,
-) -> Status {
-    // Rule 1: a retirement is terminal, and only the *latest* adjudication
-    // counts, so an amend-then-retire (or a hypothetical future reopen) reads
-    // correctly the moment those exist.
-    if let Some(latest_adjudication) = history.iter().rev().find_map(|e| match &e.event {
-        Event::Adjudication { action } => Some(action),
-        Event::Verification { .. } => None,
+    grace: Grace,
+    last_verified: Option<Timestamp>,
+) -> (Status, Option<Timestamp>) {
+    // Rule 1: a past-or-present retirement is terminal. A future-dated retire is
+    // ignored — honoring it could calm a presently-alarming claim, which
+    // invariant #6 forbids.
+    if let Some(latest_adjudication) = sorted.iter().rev().find_map(|e| match &e.event {
+        Event::Adjudication { action } if e.at <= now => Some(action),
+        _ => None,
     }) {
         match latest_adjudication {
-            Adjudication::Retire { .. } => return Status::Retired,
+            Adjudication::Retire { .. } => return (Status::Retired, None),
         }
     }
 
-    // The most recent verdict, if the claim has ever been checked. Adjudications
-    // are skipped: they were handled by rule 1, and a retirement that a later
-    // amend reopened must not masquerade as a verdict here.
-    let latest_verdict = history.iter().rev().find_map(|e| match &e.event {
-        Event::Verification { verdict, .. } => Some(*verdict),
-        Event::Adjudication { .. } => None,
+    // Rule 2: the latest *conclusive* verdict, by timestamp. A Held counts only
+    // if it has happened (future Held excluded from certifying); a Drifted counts
+    // at any time (it can only raise alarm). Broken/Unverifiable are inconclusive
+    // and never win here, so a trailing broken streak cannot mask an earlier
+    // Drifted (C3).
+    let latest_conclusive = sorted.iter().rev().find_map(|e| match &e.event {
+        Event::Verification {
+            verdict: Verdict::Drifted,
+            ..
+        } => Some(Verdict::Drifted),
+        Event::Verification {
+            verdict: Verdict::Held,
+            ..
+        } if e.at <= now => Some(Verdict::Held),
+        _ => None,
     });
 
-    // Rule 2: the most recent verdict wins if it is Drifted. Broken and
-    // Unverifiable deliberately fall through — they are freshness failures, not a
-    // statement that the fact changed, so they age via the grace window in rule 3
-    // rather than flipping straight to a drift report.
-    if latest_verdict == Some(Verdict::Drifted) {
-        return Status::Drifted;
+    if latest_conclusive == Some(Verdict::Drifted) {
+        return (Status::Drifted, None);
     }
 
-    // Rule 3: a Held within the fresh window is Verified, inclusive of the
-    // window's final instant. The window is `max_age` normally, but extends to
-    // `grace` when a Broken/Unverifiable streak is in progress since the last
-    // Held — a check that ran and could not confirm buys the claim time to
-    // recover, bounded so it can never mask a permanently broken check.
-    if let Some(held_at) = last_held {
-        let streak_active = matches!(
-            latest_verdict,
-            Some(Verdict::Broken | Verdict::Unverifiable)
-        );
+    // Rule 3: the conclusive verdict is a Held (== last_verified). It is Verified
+    // while `now` is within the fresh window; the window extends to grace when the
+    // entries after that Held are an inconclusive streak.
+    if let Some(held_at) = last_verified {
+        debug_assert_eq!(latest_conclusive, Some(Verdict::Held));
+        let streak_active = entries_after_are_inconclusive_streak(sorted, held_at);
         let window = if streak_active {
-            days_duration(max_age).max(days_duration(grace))
+            days_duration(max_age).max(days_duration(grace.days()))
         } else {
             days_duration(max_age)
         };
-        if now <= held_at + window {
-            return Status::Verified;
+        // Overflow (C2): a huge max_age/grace, or a late Held, can push the
+        // deadline past Timestamp::MAX. An unrepresentable deadline is unreachably
+        // far in the future, so the claim is within its window — Verified — and
+        // there is no finite `stale_at` to report.
+        match held_at.checked_add(window) {
+            Ok(stale_at) => {
+                if now <= stale_at {
+                    return (Status::Verified, Some(stale_at));
+                }
+            }
+            Err(_) => return (Status::Verified, None),
         }
     }
 
-    // Rule 4: everything else is stale — never verified, aged past max_age with
-    // no streak, or a streak run past grace. The end state is always a nag, never
-    // a stale green light (invariant #6).
-    Status::Stale
+    // Rule 4: stale — never verified, or aged past the window. No finite deadline
+    // to report when never verified; otherwise the deadline is already past and a
+    // caller wanting "how overdue" recomputes it, so we leave `stale_at` None here
+    // to mean "already stale" uniformly.
+    (Status::Stale, None)
+}
+
+/// Whether every entry strictly after `held_at` is an inconclusive
+/// (`Broken`/`Unverifiable`) verification — the condition that extends the fresh
+/// window to `grace`.
+///
+/// `held_at` is the latest conclusive `Held`, so the entries after it contain no
+/// `Held` and no `Drifted` (a later `Drifted` would have won rule 2). This
+/// confirms there *is* such a trailing streak (at least one inconclusive entry),
+/// and that nothing else — an adjudication that was not a retire, say — sits
+/// among them. An empty tail means the `Held` is the last word: no extension.
+fn entries_after_are_inconclusive_streak(sorted: &[&LogEntry], held_at: Timestamp) -> bool {
+    let mut tail = sorted.iter().skip_while(|e| e.at <= held_at).peekable();
+    if tail.peek().is_none() {
+        return false;
+    }
+    tail.all(|e| {
+        matches!(
+            &e.event,
+            Event::Verification {
+                verdict: Verdict::Broken | Verdict::Unverifiable,
+                ..
+            }
+        )
+    })
 }
 
 /// The freshness window as a fixed duration.
 ///
-/// `max_age` is a whole-day count and a [`Timestamp`] is a UTC instant with no
-/// zone or DST, so a day here is an unambiguous 24 hours. Using a fixed duration
-/// (rather than a calendar span) is both correct for instants and what keeps the
-/// boundary arithmetic in [`compute_status`] exact and total.
-fn days_duration(days: Days) -> jiff::SignedDuration {
-    jiff::SignedDuration::from_hours(i64::from(days.get()) * 24)
+/// `max_age`/`grace` are whole-day counts and a [`Timestamp`] is a UTC instant
+/// with no zone or DST, so a day here is an unambiguous 24 hours. A fixed
+/// duration (rather than a calendar span) is both correct for instants and what
+/// keeps the boundary arithmetic in [`compute_status`] exact. The multiplication
+/// is widened to `i64`, which `u32::MAX` days in hours cannot overflow; the
+/// subsequent [`Timestamp::checked_add`] is where an out-of-range deadline is
+/// caught.
+fn days_duration(days: Days) -> SignedDuration {
+    SignedDuration::from_hours(i64::from(days.get()) * 24)
 }
 
 /// The directory holding a claim's log entries: `<log_root>/<claim-id>/`.
@@ -437,32 +587,76 @@ fn days_duration(days: Days) -> jiff::SignedDuration {
 /// flat id can never collide). No escaping is needed or wanted: an escaped path
 /// would be less legible in `git log` and on the forge, where these files are
 /// meant to be read by humans.
+///
+/// The `debug_assert!`s are belt-and-suspenders for a trust product: if a future
+/// change to [`ClaimId`] validation ever let a `..` or absolute segment through,
+/// a debug build would trip here rather than silently write outside `log_root`.
 fn claim_log_dir(log_root: &Path, id: &ClaimId) -> PathBuf {
     let mut dir = log_root.to_path_buf();
     for segment in id.as_str().split('/') {
+        debug_assert!(
+            !segment.is_empty() && segment != "." && segment != "..",
+            "ClaimId must never yield an empty, '.', or '..' path segment: {segment:?}"
+        );
         dir.push(segment);
     }
+    debug_assert!(
+        dir.starts_with(log_root),
+        "a claim's log dir must stay under log_root: {}",
+        dir.display()
+    );
     dir
 }
 
-/// The filename for a log entry: a time-sortable stamp, a short content hash, and
-/// `.json`.
+/// The filename for a log entry: a fixed-width time-sortable stamp, a content
+/// hash, and `.json`.
 ///
-/// The name must satisfy two constraints at once. It must sort chronologically
-/// as a plain string, so listing a directory yields history in order without
-/// parsing every file — met by a fixed-width UTC RFC 3339 stamp with `:`
-/// rendered as `-` (`:` is unsafe on some filesystems; the substitution is
-/// uniform and positional, so lexicographic order is preserved). And it must be
-/// collision-resistant without randomness, because randomness would make tests
-/// non-deterministic — met by a hash *of the entry's serialized bytes*, so two
+/// The name must satisfy two constraints at once. It must sort chronologically as
+/// a plain string, so a plain directory listing is already in order — met by a
+/// **fixed-width** UTC stamp: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnnZ`, with `:` rendered
+/// as `-` (`:` is unsafe on some filesystems) and the subsecond part always nine
+/// zero-padded digits. Fixed width is essential: `Timestamp::to_string()` omits
+/// trailing zeros (`...00Z` vs `...00.5Z`), and because `.` (0x2E) sorts before
+/// `Z` (0x5A) a whole-second entry would otherwise sort *after* a fractional
+/// entry a moment later, scrambling the listing. And the name must be
+/// collision-resistant without randomness (randomness would make tests
+/// non-deterministic) — met by a hash *of the entry's serialized bytes*, so two
 /// genuinely distinct entries at the same instant get distinct names while a
-/// byte-identical re-record maps to the same name (and [`append_entry`] treats
-/// that as the no-op it is).
+/// byte-identical re-record maps to the same name.
 ///
-/// Example: `2026-07-17T12-00-00Z-a1b2c3d4e5f60718.json`.
+/// Read order does not *depend* on this being perfect — [`read_entries`] and
+/// [`compute_status`] sort by the parsed `at`, not the filename — but a listing
+/// that already reads chronologically is worth the fixed width.
+///
+/// Example: `2026-07-17T12-00-00.000000000Z-a1b2c3d4e5f60718.json`.
 fn entry_filename(entry: &LogEntry, json: &[u8]) -> String {
-    let stamp = entry.at.to_string().replace(':', "-");
-    format!("{stamp}-{:016x}.json", fnv1a64(json))
+    format!(
+        "{}-{:016x}.json",
+        fixed_width_stamp(entry.at),
+        fnv1a64(json)
+    )
+}
+
+/// A fixed-width, filesystem-safe, chronologically-sortable rendering of an
+/// instant: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnnZ`.
+///
+/// Built from the RFC 3339 string rather than reformatting from components, so it
+/// stays anchored to jiff's canonical UTC output; only the variable-width
+/// fractional tail is normalized to a constant nine digits and `:` is swapped for
+/// `-`.
+fn fixed_width_stamp(at: Timestamp) -> String {
+    let rfc = at.to_string();
+    // `to_string()` is `<date>T<time>[.frac]Z`. Split off the trailing `Z` and any
+    // fractional part, keep the whole-second head, then re-attach a fixed 9-digit
+    // nanosecond field so every stamp is the same length.
+    let head = rfc
+        .strip_suffix('Z')
+        .unwrap_or(&rfc)
+        .split('.')
+        .next()
+        .unwrap_or(&rfc);
+    let nanos = at.subsec_nanosecond();
+    format!("{}.{:09}Z", head.replace(':', "-"), nanos)
 }
 
 /// FNV-1a over the entry bytes, for the filename's collision-resistant suffix.
@@ -495,6 +689,10 @@ mod tests {
 
     fn days(n: u32) -> Days {
         Days::from_str(&format!("{n}d")).unwrap()
+    }
+
+    fn grace(n: u32) -> Grace {
+        Grace(days(n))
     }
 
     fn ts(s: &str) -> Timestamp {
@@ -569,7 +767,7 @@ mod tests {
 
     #[test]
     fn append_then_read_round_trips_one_entry() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("libfoo-pin");
         let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
         append_entry(tmp.path(), &claim, &entry).unwrap();
@@ -580,7 +778,7 @@ mod tests {
 
     #[test]
     fn read_returns_entries_in_chronological_order() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("c");
         // Append out of chronological order to prove the read sorts, not the
         // write.
@@ -596,10 +794,51 @@ mod tests {
     }
 
     #[test]
+    fn read_orders_whole_and_fractional_second_entries_chronologically() {
+        // C1: `Timestamp::to_string()` drops trailing zeros, so a whole-second
+        // entry and a fractional entry a moment later have unequal-width stamps;
+        // sorting on the parsed `at` (not filename bytes) keeps them in true
+        // order. Without the fix, the whole-second Held would sort after the
+        // fractional Drifted and `compute_status` would read Verified, swallowing
+        // the drift.
+        let tmp = TempDir::new();
+        let claim = id("c");
+        let held = verify("2026-07-17T12:00:00Z", Verdict::Held);
+        let drifted = verify("2026-07-17T12:00:00.5Z", Verdict::Drifted);
+        append_entry(tmp.path(), &claim, &drifted).unwrap();
+        append_entry(tmp.path(), &claim, &held).unwrap();
+
+        let read = read_entries(tmp.path(), &claim).unwrap();
+        assert_eq!(read, vec![held, drifted]);
+        let report = compute_status(days(30), &read, ts("2026-07-17T13:00:00Z"), grace(90));
+        assert_eq!(
+            report.status,
+            Status::Drifted,
+            "the later fractional Drifted must win, not be reordered away"
+        );
+    }
+
+    #[test]
+    fn compute_status_is_independent_of_input_order() {
+        // C1a: the verdict derives from the entries' own timestamps, so passing
+        // the same history in any order yields the same status. A caller that
+        // mis-sorts cannot flip Drifted to Verified.
+        let held = verify("2026-07-01T12:00:00Z", Verdict::Held);
+        let drifted = verify("2026-07-10T12:00:00Z", Verdict::Drifted);
+        let in_order = [held.clone(), drifted.clone()];
+        let reversed = [drifted, held];
+        let now = ts("2026-07-17T12:00:00Z");
+        assert_eq!(
+            compute_status(days(30), &in_order, now, grace(90)),
+            compute_status(days(30), &reversed, now, grace(90)),
+        );
+    }
+
+    #[test]
     fn two_entries_at_the_same_timestamp_coexist() {
         // One-file-per-entry means a shared instant is not a collision: distinct
         // content yields distinct filenames, and both survive.
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("c");
         let a = LogEntry {
             at: ts("2026-07-17T12:00:00Z"),
@@ -633,7 +872,7 @@ mod tests {
         // A re-recorded identical observation must not overwrite or duplicate:
         // append-only means new files only, and an identical entry is the same
         // file.
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("c");
         let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
         let first = append_entry(tmp.path(), &claim, &entry).unwrap();
@@ -643,8 +882,50 @@ mod tests {
     }
 
     #[test]
+    fn same_name_different_content_is_a_loud_error() {
+        // M6: an AlreadyExists whose bytes differ from the new entry is a hash
+        // collision that would silently drop this observation — possibly a
+        // Drifted, leaving an older Held as the record. It must be loud, not a
+        // no-op. Simulate the collision by pre-writing a different payload at the
+        // exact filename the new entry will target.
+        let tmp = TempDir::new();
+        let claim = id("c");
+        let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
+        let json = serde_json::to_vec_pretty(&entry).unwrap();
+        let dir = tmp.path().join("c");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(entry_filename(&entry, &json));
+        fs::write(&path, b"{\"different\":\"content\"}").unwrap();
+
+        let err = append_entry(tmp.path(), &claim, &entry).unwrap_err();
+        match &err {
+            Error::Io { path: p, .. } => assert!(p.contains(".json"), "path: {p}"),
+            other => panic!("expected a loud I/O error on collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_rejects_empty_commit_or_actor() {
+        // m4: a verdict with no traceable commit or actor has no provenance.
+        let tmp = TempDir::new();
+        let claim = id("c");
+        let mut no_commit = verify("2026-07-17T12:00:00Z", Verdict::Held);
+        no_commit.commit = "   ".to_owned();
+        let err = append_entry(tmp.path(), &claim, &no_commit).unwrap_err();
+        assert!(matches!(&err, Error::Parse { reason, .. } if reason.contains("commit")));
+
+        let mut no_actor = verify("2026-07-17T12:00:00Z", Verdict::Held);
+        no_actor.actor = String::new();
+        let err = append_entry(tmp.path(), &claim, &no_actor).unwrap_err();
+        assert!(matches!(&err, Error::Parse { reason, .. } if reason.contains("actor")));
+
+        // Nothing was written for either rejected entry.
+        assert!(read_entries(tmp.path(), &claim).unwrap().is_empty());
+    }
+
+    #[test]
     fn namespaced_id_maps_to_nested_path_and_round_trips() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("payments/libfoo-pin");
         let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
         let path = append_entry(tmp.path(), &claim, &entry).unwrap();
@@ -660,7 +941,7 @@ mod tests {
 
     #[test]
     fn distinct_namespaced_ids_do_not_collide() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let a = id("payments/pin");
         let b = id("payments/pin-two");
         append_entry(
@@ -680,8 +961,49 @@ mod tests {
     }
 
     #[test]
+    fn read_does_not_pick_up_a_nested_namespace() {
+        // m6: reading `a` must not sweep in entries under `a/b`. The `.json`
+        // extension filter plus per-claim directories keep namespaces isolated;
+        // this pins that so a future change to the listing can't merge histories.
+        let tmp = TempDir::new();
+        let parent = id("a");
+        let child = id("a/b");
+        append_entry(
+            tmp.path(),
+            &parent,
+            &verify("2026-07-17T12:00:00Z", Verdict::Held),
+        )
+        .unwrap();
+        append_entry(
+            tmp.path(),
+            &child,
+            &verify("2026-07-17T13:00:00Z", Verdict::Held),
+        )
+        .unwrap();
+
+        assert_eq!(read_entries(tmp.path(), &parent).unwrap().len(), 1);
+        assert_eq!(read_entries(tmp.path(), &child).unwrap().len(), 1);
+        assert_eq!(
+            read_entries(tmp.path(), &parent).unwrap()[0].at,
+            ts("2026-07-17T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn hostile_ids_are_rejected_before_they_reach_the_path() {
+        // m3: path-traversal ids must never validate. `claim_log_dir`'s
+        // debug_assert is the second line of defense; `ClaimId` is the first.
+        for bad in ["../x", "a/../b", "/abs", "..", "a/..", "./x"] {
+            assert!(
+                ClaimId::from_str(bad).is_err(),
+                "id {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn missing_log_dir_reads_as_empty() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let read = read_entries(tmp.path(), &id("never-logged")).unwrap();
         assert!(read.is_empty());
     }
@@ -690,17 +1012,17 @@ mod tests {
     fn malformed_entry_file_errors_and_names_the_file() {
         // Invariant #6: a bad entry is loud, never silently dropped. Dropping it
         // could hide a Drifted verdict and read the claim as fresh.
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("c");
         let dir = tmp.path().join("c");
         fs::create_dir_all(&dir).unwrap();
-        let bad = dir.join("2026-07-17T12-00-00Z-deadbeefdeadbeef.json");
+        let bad = dir.join("2026-07-17T12-00-00.000000000Z-deadbeefdeadbeef.json");
         fs::write(&bad, b"{ this is not valid json").unwrap();
 
         let err = read_entries(tmp.path(), &claim).unwrap_err();
         match &err {
             Error::Parse { path, reason } => {
-                assert!(path.contains("2026-07-17T12-00-00Z"), "path: {path}");
+                assert!(path.contains("2026-07-17T12-00-00"), "path: {path}");
                 assert!(reason.contains("malformed"), "reason: {reason}");
             }
             other => panic!("expected a parse error naming the file, got {other:?}"),
@@ -709,7 +1031,7 @@ mod tests {
 
     #[test]
     fn non_json_files_in_log_dir_are_ignored() {
-        let tmp = tempdir();
+        let tmp = TempDir::new();
         let claim = id("c");
         let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
         append_entry(tmp.path(), &claim, &entry).unwrap();
@@ -719,64 +1041,129 @@ mod tests {
         assert_eq!(read_entries(tmp.path(), &claim).unwrap(), vec![entry]);
     }
 
+    // --- Filenames and the hash. ---
+
     #[test]
-    fn filename_is_time_sortable_and_colon_free() {
-        let entry = verify("2026-07-17T12:00:00Z", Verdict::Held);
+    fn filename_is_fixed_width_sortable_and_colon_free() {
+        let whole = verify("2026-07-17T12:00:00Z", Verdict::Held);
+        let frac = verify("2026-07-17T12:00:00.5Z", Verdict::Held);
+        let name_whole = fixed_width_stamp(whole.at);
+        let name_frac = fixed_width_stamp(frac.at);
+        assert!(!name_whole.contains(':'), "colon-free: {name_whole}");
+        assert_eq!(
+            name_whole.len(),
+            name_frac.len(),
+            "stamps must be fixed width: {name_whole} vs {name_frac}"
+        );
+        assert!(
+            name_whole < name_frac,
+            "the earlier instant must sort first: {name_whole} vs {name_frac}"
+        );
+        assert_eq!(name_whole, "2026-07-17T12-00-00.000000000Z");
+        assert_eq!(name_frac, "2026-07-17T12-00-00.500000000Z");
+    }
+
+    #[test]
+    fn entry_filename_is_pinned() {
+        // M5: pin a full filename so a change to the stamp format or the hash is a
+        // visible test failure, not a silent rename of every log file.
+        let entry = LogEntry {
+            at: ts("2026-07-17T12:00:00Z"),
+            commit: "deadbeef".to_owned(),
+            actor: "ci".to_owned(),
+            event: Event::Verification {
+                verdict: Verdict::Held,
+                evidence: None,
+            },
+        };
         let json = serde_json::to_vec_pretty(&entry).unwrap();
         let name = entry_filename(&entry, &json);
-        assert!(!name.contains(':'), "filename must be colon-free: {name}");
-        assert!(name.starts_with("2026-07-17T12-00-00Z-"), "{name}");
-        assert!(name.ends_with(".json"), "{name}");
+        assert_eq!(name, "2026-07-17T12-00-00.000000000Z-fe9ee47967c600f3.json");
+    }
+
+    #[test]
+    fn fnv1a64_matches_known_answers() {
+        // M5: pin the hand-rolled FNV-1a against the canonical test vectors, so a
+        // future edit (e.g. to FNV-1) is caught before it silently renames files.
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     // --- Status computation. ---
+    //
+    // Status tests assert the full `StatusReport` on the branches that matter, so
+    // `due`/`age`/`last_verified`/`stale_at` cannot silently regress (m1).
 
     #[test]
     fn empty_history_is_stale_and_due() {
-        let report = compute_status(days(30), &[], ts("2026-07-17T12:00:00Z"), days(90));
-        assert_eq!(report.status, Status::Stale);
-        assert!(report.due);
-        assert_eq!(report.last_verified, None);
-        assert_eq!(report.age, None);
+        let report = compute_status(days(30), &[], ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Stale,
+                last_verified: None,
+                age: None,
+                stale_at: None,
+                due: true,
+            }
+        );
     }
 
     #[test]
     fn single_held_within_max_age_is_verified() {
         let history = [verify("2026-07-01T12:00:00Z", Verdict::Held)];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
-        assert_eq!(report.status, Status::Verified);
-        assert!(!report.due);
-        assert_eq!(report.last_verified, Some(ts("2026-07-01T12:00:00Z")));
-        assert!(report.age.unwrap().as_hours() == 16 * 24);
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Verified,
+                last_verified: Some(ts("2026-07-01T12:00:00Z")),
+                age: Some(SignedDuration::from_hours(16 * 24)),
+                // No streak, so the window is max_age: Jul 1 + 30d = Jul 31.
+                stale_at: Some(ts("2026-07-31T12:00:00Z")),
+                due: false,
+            }
+        );
     }
 
     #[test]
     fn held_exactly_at_max_age_boundary_is_verified() {
-        // Documented decision: the boundary is inclusive. A claim verified
-        // exactly max_age ago is still within the window; staleness begins the
-        // instant after.
+        // Documented decision: the boundary is inclusive. A claim verified exactly
+        // max_age ago is still within the window; staleness begins the instant
+        // after.
         let history = [verify("2026-06-17T12:00:00Z", Verdict::Held)];
-        // Exactly 30 days later.
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.stale_at, Some(ts("2026-07-17T12:00:00Z")));
+        assert!(!report.due);
     }
 
     #[test]
     fn held_one_second_past_max_age_is_stale() {
         let history = [verify("2026-06-17T12:00:00Z", Verdict::Held)];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:01Z"), days(90));
-        assert_eq!(report.status, Status::Stale);
-        assert!(report.due);
-        // last_verified is still reported even when stale — the CLI shows "last
-        // verified <date>, now overdue".
-        assert_eq!(report.last_verified, Some(ts("2026-06-17T12:00:00Z")));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:01Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Stale,
+                // last_verified is still reported when stale — the CLI shows "last
+                // verified <date>, now overdue".
+                last_verified: Some(ts("2026-06-17T12:00:00Z")),
+                age: Some(SignedDuration::from_hours(30 * 24) + SignedDuration::from_secs(1)),
+                stale_at: None,
+                due: true,
+            }
+        );
     }
 
     #[test]
     fn held_well_past_max_age_is_stale() {
         let history = [verify("2026-01-01T12:00:00Z", Verdict::Held)];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
+        assert!(report.due);
+        assert_eq!(report.last_verified, Some(ts("2026-01-01T12:00:00Z")));
     }
 
     #[test]
@@ -785,11 +1172,18 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Held),
             verify("2026-07-10T12:00:00Z", Verdict::Drifted),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
-        assert_eq!(report.status, Status::Drifted);
-        assert!(report.due);
-        // The last Held is still recorded even though the claim has since drifted.
-        assert_eq!(report.last_verified, Some(ts("2026-07-01T12:00:00Z")));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Drifted,
+                // The last Held is still recorded even though the claim drifted.
+                last_verified: Some(ts("2026-07-01T12:00:00Z")),
+                age: Some(SignedDuration::from_hours(16 * 24)),
+                stale_at: None,
+                due: true,
+            }
+        );
     }
 
     #[test]
@@ -799,9 +1193,38 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Drifted),
             verify("2026-07-10T12:00:00Z", Verdict::Held),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Verified);
         assert_eq!(report.last_verified, Some(ts("2026-07-10T12:00:00Z")));
+        assert_eq!(report.stale_at, Some(ts("2026-08-09T12:00:00Z")));
+        assert!(!report.due);
+    }
+
+    #[test]
+    fn held_then_drifted_then_broken_is_drifted() {
+        // C3: a trailing Broken must not mask an earlier Drifted. The latest
+        // *conclusive* verdict is the Drifted, so the claim is Drifted, not
+        // Verified via a grace window measured from the pre-drift Held.
+        let history = [
+            verify("2026-07-01T12:00:00Z", Verdict::Held),
+            verify("2026-07-10T12:00:00Z", Verdict::Drifted),
+            verify("2026-07-12T12:00:00Z", Verdict::Broken),
+        ];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Drifted);
+        assert!(report.due);
+    }
+
+    #[test]
+    fn held_then_drifted_then_unverifiable_is_drifted() {
+        // C3, with Unverifiable in the trailing position.
+        let history = [
+            verify("2026-07-01T12:00:00Z", Verdict::Held),
+            verify("2026-07-10T12:00:00Z", Verdict::Drifted),
+            verify("2026-07-12T12:00:00Z", Verdict::Unverifiable),
+        ];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Drifted);
     }
 
     #[test]
@@ -813,8 +1236,12 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Held),
             verify("2026-07-10T12:00:00Z", Verdict::Broken),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Verified);
+        // A streak is active, so the window is the grace-extended one (90d from
+        // the Held), not max_age.
+        assert_eq!(report.stale_at, Some(ts("2026-09-29T12:00:00Z")));
+        assert!(!report.due);
     }
 
     #[test]
@@ -827,8 +1254,10 @@ mod tests {
             verify("2026-01-01T12:00:00Z", Verdict::Held),
             verify("2026-02-01T12:00:00Z", Verdict::Broken),
         ];
-        let report = compute_status(days(30), &history, ts("2026-03-15T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-03-15T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.stale_at, Some(ts("2026-04-01T12:00:00Z")));
+        assert!(!report.due);
     }
 
     #[test]
@@ -840,22 +1269,23 @@ mod tests {
             verify("2026-01-01T12:00:00Z", Verdict::Held),
             verify("2026-02-01T12:00:00Z", Verdict::Broken),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
+        assert!(report.due);
     }
 
     #[test]
     fn broken_streak_at_grace_boundary_is_verified() {
         // Grace, like max_age, is inclusive of its final instant. Held Jan 1,
-        // grace 90d → Apr 1 12:00:00 is still fresh; one second later is stale
-        // (asserted by the past-grace test above at a coarser distance).
+        // grace 90d → Apr 1 12:00:00 is still fresh; one second later is stale.
         let history = [
             verify("2026-01-01T12:00:00Z", Verdict::Held),
             verify("2026-02-01T12:00:00Z", Verdict::Broken),
         ];
-        let at_boundary = compute_status(days(30), &history, ts("2026-04-01T12:00:00Z"), days(90));
+        let at_boundary = compute_status(days(30), &history, ts("2026-04-01T12:00:00Z"), grace(90));
         assert_eq!(at_boundary.status, Status::Verified);
-        let past = compute_status(days(30), &history, ts("2026-04-01T12:00:01Z"), days(90));
+        assert_eq!(at_boundary.stale_at, Some(ts("2026-04-01T12:00:00Z")));
+        let past = compute_status(days(30), &history, ts("2026-04-01T12:00:01Z"), grace(90));
         assert_eq!(past.status, Status::Stale);
     }
 
@@ -867,8 +1297,9 @@ mod tests {
             verify("2026-01-01T12:00:00Z", Verdict::Held),
             verify("2026-02-01T12:00:00Z", Verdict::Unverifiable),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
+        assert!(report.due);
         // The last Held is still reported for the CLI's "last verified" line.
         assert_eq!(report.last_verified, Some(ts("2026-01-01T12:00:00Z")));
     }
@@ -881,33 +1312,43 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Unverifiable),
             verify("2026-07-10T12:00:00Z", Verdict::Unverifiable),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
         assert_eq!(report.last_verified, None);
+        assert_eq!(report.age, None);
+        assert!(report.due);
     }
 
     #[test]
     fn broken_only_history_is_stale() {
         let history = [verify("2026-07-16T12:00:00Z", Verdict::Broken)];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
         assert_eq!(report.last_verified, None);
+        assert!(report.due);
     }
 
     #[test]
     fn retirement_is_terminal_even_with_a_later_held() {
         // Documented decision: retirement is terminal for v1. A later Held does
-        // not revive a retired claim — retiring is a deliberate act, and a check
-        // re-running must not silently undo it. Only the *latest* adjudication
-        // decides, which is what makes this future-proof against amend/reopen.
+        // not revive a retired claim. m2: last_verified may still reflect the
+        // pre-retirement Held (history is history); due is false because terminal.
         let history = [
             verify("2026-07-01T12:00:00Z", Verdict::Held),
             retire("2026-07-05T12:00:00Z", "superseded by CI gate"),
             verify("2026-07-10T12:00:00Z", Verdict::Held),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
-        assert_eq!(report.status, Status::Retired);
-        assert!(!report.due, "a retired claim is terminal, not due");
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Retired,
+                last_verified: Some(ts("2026-07-10T12:00:00Z")),
+                age: Some(SignedDuration::from_hours(7 * 24)),
+                stale_at: None,
+                due: false,
+            }
+        );
     }
 
     #[test]
@@ -916,8 +1357,9 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Drifted),
             retire("2026-07-05T12:00:00Z", "decision reversed"),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Retired);
+        assert!(!report.due);
     }
 
     #[test]
@@ -925,10 +1367,9 @@ mod tests {
         // A large grace must not extend a plain Held past its max_age: grace only
         // buys time for a Broken/Unverifiable streak, never for an ordinary
         // aged-out verification. Held Jan 1, max_age 30d → stale by Feb 1
-        // regardless of a 90d grace, because the latest verdict is the Held
-        // itself, not a streak.
+        // regardless of a 90d grace, because the Held is the last word.
         let history = [verify("2026-01-01T12:00:00Z", Verdict::Held)];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Stale);
     }
 
@@ -941,9 +1382,11 @@ mod tests {
             verify("2026-02-01T12:00:00Z", Verdict::Broken),
             verify("2026-07-16T12:00:00Z", Verdict::Held),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.status, Status::Verified);
         assert_eq!(report.last_verified, Some(ts("2026-07-16T12:00:00Z")));
+        // Window is max_age from the fresh Held (no streak after it), not grace.
+        assert_eq!(report.stale_at, Some(ts("2026-08-15T12:00:00Z")));
     }
 
     #[test]
@@ -953,13 +1396,157 @@ mod tests {
             verify("2026-07-01T12:00:00Z", Verdict::Held),
             verify("2026-07-15T12:00:00Z", Verdict::Held),
         ];
-        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), days(90));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
         assert_eq!(report.last_verified, Some(ts("2026-07-15T12:00:00Z")));
         assert_eq!(report.status, Status::Verified);
     }
 
-    fn tempdir() -> TempDir {
-        TempDir::new()
+    // --- Future-dated entries (C4): never safer than reality. ---
+
+    #[test]
+    fn future_held_alone_is_stale_and_due() {
+        // C4: a Held timestamped after `now` cannot certify present freshness. It
+        // does not set last_verified/age, and the claim is stale and due.
+        let history = [verify("2026-08-01T12:00:00Z", Verdict::Held)];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(
+            report,
+            StatusReport {
+                status: Status::Stale,
+                last_verified: None,
+                age: None,
+                stale_at: None,
+                due: true,
+            }
+        );
+    }
+
+    #[test]
+    fn future_held_does_not_supersede_a_past_held() {
+        // Freshness rests on the most recent *past* Held; a future Held is ignored
+        // for last_verified/age, so it cannot make the claim look fresher.
+        let history = [
+            verify("2026-07-10T12:00:00Z", Verdict::Held),
+            verify("2026-08-01T12:00:00Z", Verdict::Held),
+        ];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.last_verified, Some(ts("2026-07-10T12:00:00Z")));
+        assert_eq!(report.age, Some(SignedDuration::from_hours(7 * 24)));
+    }
+
+    #[test]
+    fn future_held_never_makes_a_claim_safer_than_reality() {
+        // The guarantee behind C4: adding a future-dated entry can never yield a
+        // less-alarming status or turn `due` off. A stale claim with a future Held
+        // appended stays stale and due.
+        let base = [verify("2026-01-01T12:00:00Z", Verdict::Held)];
+        let with_future = [
+            verify("2026-01-01T12:00:00Z", Verdict::Held),
+            verify("2027-01-01T12:00:00Z", Verdict::Held),
+        ];
+        let now = ts("2026-07-17T12:00:00Z");
+        let base_report = compute_status(days(30), &base, now, grace(90));
+        let future_report = compute_status(days(30), &with_future, now, grace(90));
+        assert_eq!(base_report.status, Status::Stale);
+        assert_eq!(future_report.status, Status::Stale);
+        assert!(future_report.due);
+    }
+
+    #[test]
+    fn future_retire_does_not_calm_a_present_claim() {
+        // A future-dated retirement must not turn a due claim into a terminal,
+        // not-due Retired — that would be strictly safer than reality, which
+        // invariant #6 forbids. It stays stale and due until the retirement
+        // actually happens.
+        let history = [
+            verify("2026-01-01T12:00:00Z", Verdict::Held),
+            retire("2027-01-01T12:00:00Z", "future close"),
+        ];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Stale);
+        assert!(report.due);
+    }
+
+    #[test]
+    fn future_drifted_is_honored_because_it_only_raises_alarm() {
+        // A future Drifted may drive the claim to Drifted: honoring it can only
+        // increase alarm, never decrease it, so it is safe under invariant #6.
+        let history = [
+            verify("2026-07-01T12:00:00Z", Verdict::Held),
+            verify("2027-01-01T12:00:00Z", Verdict::Drifted),
+        ];
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Drifted);
+        assert!(report.due);
+    }
+
+    // --- Overflow safety (C2): never panic. ---
+
+    #[test]
+    fn huge_max_age_does_not_panic_and_is_verified() {
+        // C2: Days accepts up to u32::MAX; the resulting window overflows
+        // Timestamp::MAX. That is an unreachably distant deadline, so the claim is
+        // within its window (Verified) with no finite stale_at — and, above all,
+        // no panic.
+        let history = [verify("2026-07-01T12:00:00Z", Verdict::Held)];
+        let max_days = Days::from_nonzero(NonZeroU32::new(u32::MAX).unwrap());
+        let report = compute_status(max_days, &history, ts("2026-07-17T12:00:00Z"), grace(90));
+        assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.stale_at, None);
+        assert!(!report.due);
+    }
+
+    #[test]
+    fn huge_grace_on_a_streak_does_not_panic() {
+        // C2 via the grace path: a broken streak with a u32::MAX grace overflows
+        // the window; still Verified, no finite stale_at, no panic.
+        let history = [
+            verify("2026-07-01T12:00:00Z", Verdict::Held),
+            verify("2026-07-10T12:00:00Z", Verdict::Broken),
+        ];
+        let huge = Grace(Days::from_nonzero(NonZeroU32::new(u32::MAX).unwrap()));
+        let report = compute_status(days(30), &history, ts("2026-07-17T12:00:00Z"), huge);
+        assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.stale_at, None);
+    }
+
+    #[test]
+    fn held_near_timestamp_max_does_not_panic() {
+        // C2: a valid modest max_age but a Held so late that Held + window exceeds
+        // Timestamp::MAX. checked_add catches it; no panic, Verified, no finite
+        // deadline.
+        let history = [LogEntry {
+            at: Timestamp::MAX,
+            commit: "c".to_owned(),
+            actor: "ci".to_owned(),
+            event: Event::Verification {
+                verdict: Verdict::Held,
+                evidence: None,
+            },
+        }];
+        let report = compute_status(days(30), &history, Timestamp::MAX, grace(90));
+        assert_eq!(report.status, Status::Verified);
+        assert_eq!(report.stale_at, None);
+    }
+
+    // --- Grace as a usable constant, and the newtype guard (M8). ---
+
+    #[test]
+    fn grace_default_is_ninety_days_and_usable_as_a_constant() {
+        assert_eq!(Grace::DEFAULT.days().get(), 90);
+        // The whole point of M8: this compiles and runs without parsing a string.
+        let history = [
+            verify("2026-01-01T12:00:00Z", Verdict::Held),
+            verify("2026-02-01T12:00:00Z", Verdict::Broken),
+        ];
+        let report = compute_status(
+            days(30),
+            &history,
+            ts("2026-03-15T12:00:00Z"),
+            Grace::DEFAULT,
+        );
+        assert_eq!(report.status, Status::Verified);
     }
 
     /// A minimal self-cleaning temp directory, so the log tests touch a real
