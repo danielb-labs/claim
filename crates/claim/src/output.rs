@@ -85,10 +85,10 @@ pub fn note(format: Format, message: &str) {
 /// Print a warning that must reach a human regardless of output mode.
 ///
 /// Unlike [`note`], this is *not* suppressed in JSON mode: a warning is a signal
-/// the operator needs even when the primary output is machine-consumed (an
-/// `--unwitnessed` claim, say). It goes to stderr — never stdout — so it warns the
-/// human watching the terminal without touching the JSON a script parses. Prefixed
-/// `warning:` so it reads as one.
+/// the operator needs even when the primary output is machine-consumed (a store
+/// created outside a git repo, say). It goes to stderr — never stdout — so it warns
+/// the human watching the terminal without touching the JSON a script parses.
+/// Prefixed `warning:` so it reads as one.
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }

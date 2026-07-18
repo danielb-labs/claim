@@ -125,16 +125,14 @@ fn keep(
     true
 }
 
-/// Whether a claim has no passing verdict on record, or was explicitly recorded
-/// unwitnessed — the soft-debt view.
+/// Whether a claim has no passing verdict on record — never genuinely verified.
 ///
-/// "No passing verdict" is the never-witnessed / never-verified case: a claim
-/// hand-committed with no log, or one whose checks have only ever come back
-/// broken/drifted/unverifiable. An `--unwitnessed` add writes a `Held` but with an
-/// evidence note saying the red was never seen; that note is the acknowledged
-/// debt, so a claim carrying it counts as unverified even though it has a `Held`.
+/// This is the never-verified case: a claim hand-committed with no log, or one whose
+/// checks have only ever come back broken/drifted/unverifiable. A single `Held`
+/// anywhere in the history clears it — a passing check verifies the fact (invariant
+/// #5), so a claim with a pass is not epistemic debt, whatever else its log holds.
 fn is_unverified(history: &[LogEntry]) -> bool {
-    let has_passing = history.iter().any(|e| {
+    !history.iter().any(|e| {
         matches!(
             &e.event,
             claim_core::Event::Verification {
@@ -142,29 +140,7 @@ fn is_unverified(history: &[LogEntry]) -> bool {
                 ..
             }
         )
-    });
-    if !has_passing {
-        return true;
-    }
-    history.iter().any(evidence_admits_unwitnessed)
-}
-
-/// Whether an entry's evidence is the `unwitnessed:` debt marker.
-///
-/// `claim add --unwitnessed` records the birth `Held` with an evidence note whose
-/// first line is exactly `unwitnessed: ...` (see `commands::add::unwitnessed_note`).
-/// Matching the `unwitnessed:` *prefix* — not a bare `contains("unwitnessed")` —
-/// avoids flagging any claim whose evidence merely mentions the word (a human note
-/// saying "this was previously unwitnessed", say). The debt lives in the log, where
-/// it is committed and auditable, not in the definition file.
-fn evidence_admits_unwitnessed(entry: &LogEntry) -> bool {
-    matches!(
-        &entry.event,
-        claim_core::Event::Verification {
-            evidence: Some(note),
-            ..
-        } if note.starts_with("unwitnessed:")
-    )
+    })
 }
 
 /// Whether the term occurs in the claim's id or statement (case-sensitive
@@ -395,25 +371,19 @@ mod tests {
     }
 
     #[test]
-    fn is_unverified_false_for_a_witnessed_hold() {
+    fn is_unverified_false_for_any_passing_hold() {
+        // A single Held clears the debt regardless of its evidence: a passing check
+        // verifies the fact (invariant #5). There is no evidence marker that turns a
+        // pass back into debt.
         assert!(!is_unverified(&[held(None)]));
-    }
-
-    #[test]
-    fn is_unverified_true_for_an_unwitnessed_hold() {
-        // An --unwitnessed add writes a Held carrying the debt marker; it is still
-        // unverified debt despite the pass.
-        assert!(is_unverified(&[held(Some(
-            "unwitnessed: this claim was added with --unwitnessed"
-        ))]));
-    }
-
-    #[test]
-    fn is_unverified_ignores_evidence_that_merely_mentions_the_word() {
-        // A witnessed Held whose evidence just mentions "unwitnessed" in prose is
-        // NOT debt: only the `unwitnessed:` prefix marker counts (m2).
         assert!(!is_unverified(&[held(Some(
-            "this claim was previously unwitnessed but is now witnessed"
+            "witnessed-red: observed Drifted"
         ))]));
+    }
+
+    #[test]
+    fn is_unverified_true_when_broken_precedes_no_hold() {
+        // Broken then nothing else: still no pass on record, so still debt.
+        assert!(is_unverified(&[broken()]));
     }
 }

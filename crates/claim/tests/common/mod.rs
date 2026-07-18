@@ -175,8 +175,8 @@ impl TestRepo {
     /// `claim add`.
     ///
     /// Lets a test build a store with a precise shape — several claims, specific
-    /// triggers, chosen `supports` — without the witnessed-red dance `add`
-    /// requires. The `.md` extension and the `.claims/` prefix are added, so
+    /// triggers, chosen `supports` — and seed its verdict log directly, without
+    /// running `add`. The `.md` extension and the `.claims/` prefix are added, so
     /// `write_claim("payments/pin", ...)` lands at `.claims/payments/pin.md`.
     pub fn write_claim(&self, id: &str, frontmatter_and_body: &str) {
         self.write(&format!(".claims/{id}.md"), frontmatter_and_body);

@@ -157,7 +157,7 @@ pub fn render_and_validate(draft: &ClaimDraft, path: &str) -> claim_core::Result
     Ok((claim, text))
 }
 
-/// The primary `cmd` check of a parsed claim, for the witnessed-red runs.
+/// The primary `cmd` check of a parsed claim, for the establishing and witness runs.
 ///
 /// `claim add` authors exactly one check in v1, so this returns the first check
 /// with its kind narrowed for execution. Returns `None` only for the (unreachable

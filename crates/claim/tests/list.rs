@@ -167,43 +167,31 @@ fn text_term_searches_id_and_statement() {
 }
 
 #[test]
-fn unverified_surfaces_a_never_verified_and_an_unwitnessed_claim() {
+fn unverified_surfaces_claims_with_no_passing_verdict() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
 
     // Never verified: a claim with no log at all.
     repo.write_claim("never", &claim_file("never", "120d"));
 
-    // Unwitnessed: a Held carrying the debt marker.
-    repo.write_claim("debt", &claim_file("debt", "120d"));
-    let dir = repo.path().join(".claims/log/debt");
-    std::fs::create_dir_all(&dir).unwrap();
-    let entry = serde_json::json!({
-        "at": "2026-07-10T00:00:00Z",
-        "commit": "0".repeat(40),
-        "actor": "Test User <test@example.com>",
-        "event": {
-            "type": "verification",
-            "verdict": "held",
-            "evidence": "unwitnessed: this claim was added with --unwitnessed",
-        },
-    });
-    std::fs::write(
-        dir.join("2026-07-10T00-00-00Z-0000.json"),
-        serde_json::to_vec_pretty(&entry).unwrap(),
-    )
-    .unwrap();
+    // Only ever broken: still no pass on record, so still debt.
+    repo.write_claim("broke", &claim_file("broke", "120d"));
+    repo.write_verdict("broke", "2026-07-10T00:00:00Z", "broken");
 
-    // A genuinely verified claim, which must NOT appear.
+    // A genuinely verified claim, which must NOT appear — a passing check verifies
+    // the fact, full stop, whatever evidence it carries.
     repo.write_claim("solid", &claim_file("solid", "120d"));
     repo.write_verdict("solid", "2026-07-10T00:00:00Z", "held");
 
     let got = ids(&run_list(&repo, &["--unverified"]));
     assert!(got.contains(&"never".to_owned()), "never-verified is debt");
-    assert!(got.contains(&"debt".to_owned()), "unwitnessed hold is debt");
+    assert!(
+        got.contains(&"broke".to_owned()),
+        "only-broken is debt (no pass on record)"
+    );
     assert!(
         !got.contains(&"solid".to_owned()),
-        "a witnessed hold is not debt"
+        "a passing hold is not debt"
     );
 }
 

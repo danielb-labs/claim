@@ -45,8 +45,8 @@ pub enum Command {
     /// Scaffold a `.claims/` store in the current directory.
     Init(InitArgs),
 
-    /// Create a claim: run its check now, witness it failing, write the first log
-    /// entry.
+    /// Create a claim: run its check now, require it passes, write the first log
+    /// entry. `--witness-cmd` optionally witnesses the check going red in isolation.
     Add(AddArgs),
 
     /// Run checks and report holds/drifted/unverifiable/broken.
@@ -80,9 +80,9 @@ pub struct InitArgs {
 ///
 /// The flags cover the whole claim schema so an agent or script can author a claim
 /// non-interactively; when a flag is absent and stdin is a TTY, [`crate::commands::add`]
-/// falls back to prompting. The witnessed-red flags ([`AddArgs::witness_cmd`],
-/// [`AddArgs::unwitnessed`]) are the mechanized form of invariant #5 — see the
-/// command's module docs for the workflow.
+/// falls back to prompting. The default path runs the check once, requires `Held`,
+/// and writes — never touching the working tree. [`AddArgs::witness_cmd`] is the
+/// optional extra-confidence path (invariant #5); see the command's module docs.
 #[derive(Debug, clap::Args)]
 pub struct AddArgs {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
@@ -119,38 +119,18 @@ pub struct AddArgs {
     #[arg(long = "supports", value_name = "TARGET")]
     pub supports: Vec<String>,
 
-    /// A command that perturbs the tree so the fact becomes false, for the
-    /// scripted witnessed-red flow.
+    /// Optional. A command that makes the fact false, to witness the check going red
+    /// for extra confidence that it discriminates.
     ///
-    /// The default (invariant #5) is to observe the check actually go `Drifted`.
-    /// Non-interactively, this supplies that observation: the tool runs the green
-    /// check (expecting `Held`), then this command, then re-runs the check
-    /// (expecting `Drifted`), then restores the tree and confirms `Held` again. The
-    /// red is *observed*, never asserted. Restoration reverts tracked changes with
-    /// git unless `--restore-cmd` is given; it never runs `git clean`, so the
-    /// untracked store is never at risk.
-    #[arg(long, value_name = "CMD", conflicts_with = "unwitnessed")]
+    /// Not required: a passing check already verifies the fact (invariant #5). When
+    /// given, the tool applies this command in a *throwaway git worktree* detached at
+    /// HEAD, runs the check there expecting `Drifted`, and tears the worktree down —
+    /// so your working tree is never touched and no clean tree is required. The
+    /// observed red is recorded as evidence on the establishing verdict. Needs a
+    /// commit to check out, so it is refused on an unborn HEAD (commit first, or drop
+    /// the flag).
+    #[arg(long, value_name = "CMD")]
     pub witness_cmd: Option<String>,
-
-    /// A command that undoes `--witness-cmd`, restoring the tree to where the fact
-    /// holds again.
-    ///
-    /// Optional. When omitted, the tool reverts *tracked* changes with
-    /// `git checkout -- .`. Supply this when the perturbation created untracked
-    /// files, or when the repository has no commit yet (an unborn HEAD), where there
-    /// is no committed state for git to revert to. Only meaningful with
-    /// `--witness-cmd`.
-    #[arg(long, value_name = "CMD", requires = "witness_cmd")]
-    pub restore_cmd: Option<String>,
-
-    /// Record the claim without a witnessed failure, marking it unverified.
-    ///
-    /// The visible escape hatch (invariant #5) for a fact whose red genuinely
-    /// cannot be staged. The claim is recorded with an evidence note that its check
-    /// was never witnessed failing, so `claim list --unverified` (a later verb) can
-    /// surface it — it is never silently trusted.
-    #[arg(long)]
-    pub unwitnessed: bool,
 }
 
 /// The scriptable exit-code contract for `claim check`, shown under
@@ -229,8 +209,9 @@ pub struct ListArgs {
     #[arg(long)]
     pub stale: bool,
 
-    /// Keep only claims with no passing verdict on record, or explicitly recorded
-    /// unwitnessed: the acknowledged epistemic debt (soft-debt view).
+    /// Keep only claims with no passing verdict on record: never genuinely verified
+    /// (hand-committed with no log, or only ever broken/drifted). A single passing
+    /// check clears it.
     #[arg(long)]
     pub unverified: bool,
 

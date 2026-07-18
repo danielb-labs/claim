@@ -31,7 +31,7 @@
 //! width is `core.abbrev`-dependent, and the trust substrate must not vary with a
 //! user's config. Abbreviation is display-only ([`short_commit`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::GitError;
@@ -127,54 +127,142 @@ pub fn resolve_actor(dir: &Path) -> Result<String, GitError> {
     Ok(format!("{name} <{email}>"))
 }
 
-/// Whether the *tracked* working tree has uncommitted changes — unstaged edits or
-/// staged-but-uncommitted ones.
+/// A throwaway `git worktree` checked out at `HEAD`, for the optional witnessed-red
+/// dance without ever touching the caller's working tree.
 ///
-/// The default witnessed-red restore reverts every tracked file to the index, so it
-/// is only safe when the tracked tree starts clean; a pre-existing edit would be
-/// silently destroyed. `claim add` calls this before perturbing on the default path
-/// and refuses if it reports `true`. Untracked files are intentionally not counted
-/// (`-uno`): the restore never touches them, so their presence is not a hazard.
+/// `claim add --witness-cmd` proves a check can go red by perturbing a tree and
+/// observing `Drifted`. Doing that in the user's own tree would risk their
+/// uncommitted work; instead the perturbation is applied to an *isolated* checkout
+/// of `HEAD` created here. The witness command and the check both run against
+/// [`Worktree::path`], so the user's tree is never mutated, and no clean-tree
+/// requirement is needed.
 ///
-/// Combines `git diff --quiet` (working tree vs index) and `git diff --cached
-/// --quiet` (index vs HEAD); either being non-zero means dirty. On an unborn HEAD
-/// the `--cached` diff has no HEAD to compare against and reports the staged files
-/// as changes, which correctly reads as dirty — the default git restore cannot help
-/// there anyway.
-///
-/// # Errors
-///
-/// Returns [`GitError::Spawn`] only if git cannot be run at all (not installed); a
-/// non-zero *diff* exit is the "dirty" signal, not an error.
-pub fn tracked_tree_is_dirty(dir: &Path) -> Result<bool, GitError> {
-    // `diff --quiet` exits 1 when there is a difference, 0 when clean. Distinguish
-    // that from a real spawn failure via GitOutput::ok being about the *exit*, not
-    // the spawn (run_git already turns a spawn failure into an Err).
-    let unstaged = run_git(dir, &["diff", "--quiet"])?;
-    let staged = run_git(dir, &["diff", "--cached", "--quiet"])?;
-    Ok(!unstaged.ok || !staged.ok)
+/// The worktree is removed on [`Drop`] as a safety net, so an early return or panic
+/// mid-witness still tears it down. Prefer the explicit [`Worktree::remove`] where a
+/// removal failure should be surfaced; `Drop` only best-effort-cleans and cannot
+/// report. Removal uses `git worktree remove --force`, which deletes the checkout
+/// even though the perturbation left it dirty — this is a temp tree that exists only
+/// to be discarded.
+pub struct Worktree {
+    /// The repository the worktree belongs to, for the `git worktree remove` call.
+    repo: PathBuf,
+    /// The temporary checkout's path. `None` after [`Worktree::remove`] consumed it,
+    /// so `Drop` does not double-remove.
+    path: Option<PathBuf>,
 }
 
-/// Revert *tracked* working-tree modifications to their staged (index) state, with
-/// `git checkout -- .`.
+impl Worktree {
+    /// Create a detached worktree at `HEAD` under a fresh temp directory.
+    ///
+    /// `repo` is any path inside the repository. The checkout is *detached* at the
+    /// current `HEAD` commit, so it does not touch or move any branch. It requires a
+    /// born `HEAD`: an unborn repository (no commit yet) has nothing to check out,
+    /// and the error says so, so the caller can fall back to the no-witness path.
+    ///
+    /// The temp directory is created under the system temp root, *outside* the
+    /// repository, so the worktree checkout and its perturbation never appear in the
+    /// user's tree (not even as an ignored path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::Io`] if the temp directory cannot be created, and
+    /// [`GitError::CommandFailed`] / [`GitError::Spawn`] if `git worktree add` fails
+    /// (including the unborn-HEAD case, where there is no commit to detach at).
+    pub fn create_at_head(repo: &Path) -> Result<Self, GitError> {
+        let dir = unique_temp_dir()?;
+        let dir_str = dir.to_string_lossy().into_owned();
+        // `--detach` at HEAD: an anonymous checkout of the current commit that moves
+        // no branch. `--no-checkout` is deliberately not used — the witness needs the
+        // real files present to perturb.
+        let out = run_git(repo, &["worktree", "add", "--detach", &dir_str, "HEAD"])?;
+        if !out.ok {
+            // Clean up the empty temp dir we created before git failed, so a repeated
+            // failure does not litter temp. Best-effort: the real error is git's.
+            std::fs::remove_dir_all(&dir).ok();
+            return Err(GitError::CommandFailed {
+                args: out.args,
+                stderr: out.stderr.trim().to_owned(),
+            });
+        }
+        Ok(Worktree {
+            repo: repo.to_path_buf(),
+            path: Some(dir),
+        })
+    }
+
+    /// The isolated checkout's root — where the witness command and the check run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`Worktree::remove`], which is a use-after-free of the
+    /// worktree; the type is not meant to be used past its explicit removal.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("worktree path used after remove()")
+    }
+
+    /// Remove the worktree, surfacing any failure. Consumes `self` so `Drop` does not
+    /// also try to remove it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::CommandFailed`] / [`GitError::Spawn`] if `git worktree
+    /// remove` fails, so a caller that cares about a leaked checkout hears about it.
+    pub fn remove(mut self) -> Result<(), GitError> {
+        match self.path.take() {
+            Some(dir) => remove_worktree(&self.repo, &dir),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        // Best-effort teardown for the panic / early-return path; a caller wanting to
+        // observe failure calls `remove` instead. Errors are swallowed because Drop
+        // cannot report and a leaked temp worktree is not worth aborting over.
+        if let Some(dir) = self.path.take() {
+            remove_worktree(&self.repo, &dir).ok();
+        }
+    }
+}
+
+/// Remove a worktree checkout with `git worktree remove --force`, then prune the
+/// temp directory if git left anything behind.
 ///
-/// The default restore for the scripted witnessed-red flow when no `--restore-cmd`
-/// is supplied, used only after [`tracked_tree_is_dirty`] confirmed the tracked tree
-/// was clean before the perturbation — so it reverts exactly the perturbation and
-/// nothing of the author's. Deliberately narrow: it touches only tracked files and
-/// restores them from the *index* (not `HEAD`), so it can never delete the untracked
-/// `.claims/` store or any other untracked file — unlike a `git clean`, which this
-/// intentionally does not run. A perturbation that created *untracked* files is not
-/// undone here; the confirm-green run that follows catches an incomplete restore, so
-/// nothing is written against a still-perturbed tree.
+/// `--force` is required because the witness perturbation left the checkout dirty;
+/// the tree is disposable, so its dirtiness is not a reason to keep it. After git's
+/// own removal, a stray temp directory is cleared best-effort so no litter remains.
+fn remove_worktree(repo: &Path, dir: &Path) -> Result<(), GitError> {
+    let dir_str = dir.to_string_lossy().into_owned();
+    let result = run_git(repo, &["worktree", "remove", "--force", &dir_str])?.into_result();
+    // Whether or not git removed it, make sure the temp directory is gone.
+    std::fs::remove_dir_all(dir).ok();
+    result
+}
+
+/// A fresh, unique temporary directory *path* (not yet a worktree) under the system
+/// temp root, named so concurrent `claim add` runs never collide.
 ///
-/// # Errors
-///
-/// Returns [`GitError::CommandFailed`] if the checkout fails (an unborn HEAD with an
-/// empty index has nothing to restore, or `git` missing), so a botched restore is
-/// loud. On an unborn HEAD the author must supply `--restore-cmd` instead.
-pub fn revert_tracked_changes(dir: &Path) -> Result<(), GitError> {
-    run_git(dir, &["checkout", "--", "."])?.into_result()
+/// The directory is created empty and handed to `git worktree add`, which populates
+/// it. Uniqueness comes from the process id plus a monotonic counter, avoiding a
+/// dependency purely for temp-name generation.
+fn unique_temp_dir() -> Result<PathBuf, GitError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("claim-witness-{}-{n}", std::process::id());
+    let dir = std::env::temp_dir().join(name);
+    std::fs::create_dir(&dir).map_err(|source| GitError::Io {
+        context: format!(
+            "failed to create a temp worktree directory at {}",
+            dir.display()
+        ),
+        source,
+    })?;
+    Ok(dir)
 }
 
 /// Whether `dir` is inside a git working tree.

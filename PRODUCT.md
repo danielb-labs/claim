@@ -203,8 +203,8 @@ definition, and everything that has ever happened to it.
 **Where time lives, and who watches the clock.** The definition file holds
 only the policy: `max-age: 120d`. The events that policy is measured
 against live in the verdict log. `claim add` runs the new check on the
-spot — including the required witnessed failure — and writes the claim's
-first log entry; every later check appends another. So "when was this
+spot — requiring it passes — and writes the claim's establishing log
+entry; every later check appends another. So "when was this
 last verified" is always the timestamp of the latest passing entry in the
 log, never a field someone typed into the file. Staleness is then plain
 arithmetic, computed at read time by whoever asks: the CLI, the MCP
@@ -221,9 +221,11 @@ moment it merged, like any other, and with no passing verdict on record
 it is simply **stale**, and due immediately — the next clock-lane pass
 runs its checks and it becomes verified or drifted like anything else.
 `claim add` is just the way to skip that window: it runs the check at
-creation, so the claim is born verified. The one thing a hand-committed
-claim permanently lacks is a witnessed failure in its log; that shows on
-its page as a warning on the check, not as a different kind of claim.
+creation and requires it passes, so the claim is born verified. A passing
+check *is* the verification — a check is never marked "unverified" for a
+red nobody could stage (a world-fact's red is a future event, not a file
+to edit). Witnessing a check go red is an optional confidence signal
+(`--witness-cmd`), recorded as evidence, never a gate — see section 5.
 
 ## 4. The graph
 
@@ -303,8 +305,9 @@ account, no network (except for checks that themselves reach out).
 
 ```
 claim init                set up .claims/ in a repo
-claim add                 create a claim; runs the check now, demands the
-                          witnessed failure, writes the first log entry
+claim add                 create a claim; runs the check now, requires it
+                          passes, writes the establishing log entry
+                          (--witness-cmd optionally witnesses a red)
 claim check [--due|--all] run checks; prints holds/drifted/inconclusive/broken
 claim list                filter by text, path, status, staleness, supports
 claim log <id>            the claim's full history and evidence
@@ -323,8 +326,11 @@ Everything has `--json`. Agents are expected to be the heaviest readers.
 
 Check execution keeps the honesty rules from PROPOSAL.md, briefly: the
 tool owns exit-code mapping (a broken check is loud, never a false pass),
-and every new check must be witnessed failing once before `claim add`
-accepts it. v1 sidesteps trigger-guessing entirely by running every
+and `claim add` records a claim only when its check passes against reality
+(a `Drifted` or `Broken` check is refused). Witnessing the check go red is
+an optional confidence signal, not a gate — a fact whose red can't be
+staged is verified by its passing check, never marked unverified for it.
+v1 sidesteps trigger-guessing entirely by running every
 on-change check on every PR — seconds of CI for a corpus of greps, and it
 closes the "invalidating change landed in a file nobody watched" hole by
 construction, more simply than tracing ever would. Read-set tracing and
@@ -462,9 +468,11 @@ product.
   people who administer the repos. And if nobody consumes the queue at
   all, claims decay to stale and every query says so. The system degrades
   toward visible staleness, never toward false green.
-- **Verification is itself audited.** Witnessed-red at creation, loud
-  check-breakage, adversarial spot-audits of agent verdicts, and the
-  max-age backstop under everything. The system's invariant, one sentence:
+- **Verification is itself audited.** A passing check at creation (loud
+  check-breakage means a broken check never fakes a pass), optional
+  witnessed-red confidence where a red is stageable, adversarial
+  spot-audits of agent verdicts, and the max-age backstop under
+  everything. The system's invariant, one sentence:
   every claim either re-verifies or comes back to a human on a known
   clock. The failure mode is a nag, never a lie.
 
@@ -479,10 +487,10 @@ quarters. Value lands the first time a CLAUDE.md sentence goes red.
    body, `cmd` checks with the honest exit-code contract,
    `when: on-change | every Nd`, `max-age` (global default, per-claim
    override), `supports:` targets, `[[wiki-links]]`. Nothing else.
-2. **The CLI** — `init`, `add` (gates on the witnessed failure, logs the
-   birth verdict), `check`, `list`, `log`, `drift`, `amend`, `retire`,
-   `stats`. Everything `--json`. Statuses: verified, drifted, stale,
-   retired.
+2. **The CLI** — `init`, `add` (requires the check passes, logs the
+   establishing verdict; `--witness-cmd` optionally witnesses a red),
+   `check`, `list`, `log`, `drift`, `amend`, `retire`, `stats`. Everything
+   `--json`. Statuses: verified, drifted, stale, retired.
 3. **The verdict log** — one file per verdict under `.claims/log/<id>/`;
    trusted runs commit, fork-PR runs report only.
 4. **The on-change lane** — a GitHub Action recipe: run every cmd check
