@@ -1,5 +1,16 @@
 # claims — continuous verification for the agentic era
 
+> **Historical record — this is the original v1 design (v0.3).** It is kept as
+> written, to preserve the initial thinking; it is **not** the shipped
+> architecture. The product moved to a **v2 CLI/hub boundary**: the claim in git
+> is the truth, the CLI is a stateless verifier that reports verdicts and stores
+> nothing, and a per-environment hub owns the verdict stream, the schedule, and
+> staleness. Where this document commits verdicts to a log, models a CLI-computed
+> status, or gives claims a `when`/trigger and a top-level `max-age`, read the
+> current model in `docs/design/CLI-HUB-BOUNDARY.md` and `docs/design/PRODUCT.md`
+> instead. Nothing below is edited to match; treat it as the record of where the
+> design started.
+
 **Draft spec v0.3 — written to be reviewed.** Working name for the tool: `claim`
 (candidates: `warrant`, `grounds`, `tenet`). Everything here is up for argument;
 §10 lists the questions the authors most want challenged.

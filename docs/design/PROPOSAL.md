@@ -7,6 +7,15 @@ for facts.**
 
 ---
 
+> **Proposal-era draft, not the shipped schema.** This is the "why" document; its
+> argument stands, but some illustrations predate the build. The example frontmatter
+> below uses `recheck:` and a top-level `max-age` — the shipped claim file has
+> neither: `max-age` lives under an optional `hub:` subfield, and there is no
+> `recheck`/`when` field. §6 rule 2's "every check seen failing once" became optional
+> (`--witness-cmd`; a passing check against reality is the birth gate). The §8 v0.1
+> list names a `log` verb the CLI does not ship. See `PRODUCT.md` and
+> `CLI-HUB-BOUNDARY.md` for the shipped model.
+
 ## 1. The problem
 
 Every codebase has places where someone wrote down a reason for a decision:
@@ -254,11 +263,12 @@ Drift is not failure. Nobody's build goes red by default. Instead:
      tests?" Some should, after they've proven they matter, and with their
      reason carried along.
 
-Every check result and every decision is appended to a log with a
-timestamp, the commit, and who or what performed it. Over time that log is
-the thing a new team member or a new agent session can actually trust: not
-"someone once said X," but "X, last verified two weeks ago, verified 41
-times since 2026, amended once."
+Every check result is reported with a timestamp, the commit, and who or what
+performed it — telemetry a per-environment hub ingests, the way a CI system
+keeps its build results, never a file committed back to the repo. Over time
+that stream is the thing a new team member or a new agent session can actually
+trust: not "someone once said X," but "X, last verified two weeks ago, verified
+41 times since 2026, amended once."
 
 ## 6. The rules that keep it honest
 
@@ -293,12 +303,14 @@ These came out of the review of v0.3. Each one closes a specific hole.
    person being nagged, never a stale green light. The design rule in one
    sentence: the failure mode is a nag, never a lie.
 
-5. **Definitions and history live in different places.** The claim sits in
-   the decision file, reviewed like code. Check results append to a
-   machine-written log (git notes or a log directory), which is derived
-   data: rebuildable, ignorable in diffs, and never a merge conflict with a
-   human edit. CI running on a fork PR has no write access anyway, so PR
-   runs only report; trusted runs (main, the scheduled job) persist results.
+5. **The claim is the truth; a verdict is telemetry.** The claim sits in the
+   decision file, reviewed like code and committed to git. A check result is
+   not committed at all: the tool reports it (`--json` or human-readable), and a
+   per-environment hub ingests the stream — derived data, rebuildable, never a
+   merge conflict with a human edit, and never polluting a diff. This is why CI
+   running on a fork PR needs no write access: reporting is all any run does,
+   and trust for a verdict comes from the authenticated pipeline that produced
+   it, the way a green CI check is trusted without being written into the repo.
 
 6. **Drift arrives grouped by cause.** One refactor that breaks twelve
    claims is one review item listing twelve facts, not twelve items. A
@@ -343,10 +355,10 @@ imports X") can only change when a commit lands, so they run on merges,
 filtered by watched paths. World facts ("the vendor's rate limit is 100
 rps") don't care about your merges, so running them per-merge is pointless;
 they run on a schedule, batched. The tool ships one command,
-`claim check --due`, which is cheap to call and runs only what's due. Where
-you call it from (CI step, cron, an agent's session start) is your business.
-The tool has no scheduler, the same way git has no opinion about when you
-fetch.
+`claim check`, cheap to call. Which claims run, and when, is the caller's
+business — the hub knows what's due, the stateless CLI does not. Where you
+call it from (CI step, cron, an agent's session start) is up to you. The tool
+has no scheduler, the same way git has no opinion about when you fetch.
 
 ## 8. What to build first
 

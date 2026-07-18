@@ -112,7 +112,7 @@ The other invariants reframe, not break:
   a PR, a GitHub Action runs the checks and pushes the **authoritative, attested
   evidence** to the hub. Crucially, **this lives in the hub's own CI glue (a GitHub
   Action the hub ships), not in the core CLI.** The CLI stays hub-agnostic — it
-  verifies and emits `--json`; the hub's action wraps `claim check --all --json` and
+  verifies and emits `--json`; the hub's action wraps `claim check --json` and
   POSTs it with authentication. So the binary never grows a hub URL, token, or
   protocol, and the same binary points at a QA hub or a prod hub with zero change.
 
