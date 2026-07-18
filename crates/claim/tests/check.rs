@@ -263,7 +263,10 @@ fn highest_code_wins_across_a_mixed_store() {
 }
 
 #[test]
-fn an_agent_check_is_unverifiable_exit_one_never_a_pass() {
+fn an_agent_check_with_no_runner_is_unverifiable_exit_one_never_a_pass() {
+    // The default: with CLAIM_AGENT_CMD unset, an agent check is Unverifiable and no
+    // subprocess is spawned. `claim()` inherits the ambient environment, so this
+    // asserts the real default a user gets — never a fabricated pass.
     let repo = ready_repo();
     repo.write_claim(
         "agentic",
@@ -271,10 +274,236 @@ fn an_agent_check_is_unverifiable_exit_one_never_a_pass() {
     );
 
     repo.claim()
+        .env_remove("CLAIM_AGENT_CMD")
         .args(["check", "--all"])
         .assert()
         .code(1)
         .stdout(predicate::str::contains("unverifiable"));
+}
+
+/// A claim whose only check is an `agent` check. Its verdict comes entirely from
+/// whatever runner `CLAIM_AGENT_CMD` names (or, unset, Unverifiable).
+fn agent_claim(id: &str) -> String {
+    format!(
+        "---\nid: {id}\nchecks:\n  - kind: agent\n    instruction: is the CJK corruption still unfixed in libfoo 5.x?\n    when: on-change\nmax-age: 120d\n---\nWe pin libfoo at 4.2 because 5.x corrupts CJK PDFs.\n"
+    )
+}
+
+/// Write an executable mock agent runner into the repo and return the shell
+/// command string to point `CLAIM_AGENT_CMD` at it. The script reads and discards
+/// stdin, then prints `stdout_line`. No real model is ever involved.
+fn write_mock_runner(repo: &TestRepo, stdout_line: &str) -> String {
+    let script =
+        format!("#!/bin/sh\ncat >/dev/null\ncat <<'RUNNER_EOF'\n{stdout_line}\nRUNNER_EOF\n");
+    repo.write("mock-agent.sh", &script);
+    let path = repo.path().join("mock-agent.sh");
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    // Run via the absolute path; CLAIM_AGENT_CMD is a shell command, so no argv split.
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn agent_check_with_runner_reports_held_and_persists_the_evidence() {
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(
+        &repo,
+        r#"{"verdict":"held","evidence":"no CJK fix in the 5.x changelog","citations":["CHANGELOG.md"]}"#,
+    );
+
+    let output = repo
+        .claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["claims"][0]["checks"][0]["verdict"], "held");
+    let evidence = v["claims"][0]["checks"][0]["evidence"].as_str().unwrap();
+    assert!(evidence.contains("no CJK fix"), "evidence: {evidence}");
+    assert!(evidence.contains("CHANGELOG.md"), "citations: {evidence}");
+
+    // The held verdict and its evidence were written to the log.
+    let entries = repo.log_entries("agentic");
+    assert_eq!(entries[0]["event"]["verdict"], "held");
+    assert!(entries[0]["event"]["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("no CJK fix"));
+}
+
+#[test]
+fn agent_check_with_runner_reports_drifted() {
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(
+        &repo,
+        r#"{"verdict":"drifted","evidence":"libfoo 5.3 shipped the CJK fix"}"#,
+    );
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("drifted"));
+}
+
+#[test]
+fn agent_runner_malformed_output_is_broken_never_held() {
+    // A runner that exits 0 but prints prose instead of the verdict JSON must be
+    // Broken (exit 2), never a fabricated pass. This is the honesty guard against a
+    // misbehaving runner.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(&repo, "I looked into it but could not decide.");
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+
+    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
+}
+
+#[test]
+fn agent_runner_conflicting_verdicts_is_broken_never_a_chosen_pass() {
+    // C1 end-to-end: a narrating runner emits a tentative held then a corrected
+    // drifted. Neither wins — the run did not cleanly conclude, so it is Broken
+    // (exit 2), and no false Held is committed to the log.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(
+        &repo,
+        "Thinking out loud: {\"verdict\":\"held\"}\nOn reflection: {\"verdict\":\"drifted\",\"evidence\":\"5.3 fixed it\"}",
+    );
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+
+    let verdict = &repo.log_entries("agentic")[0]["event"]["verdict"];
+    assert_eq!(verdict, "broken", "conflicting verdicts must record broken");
+    assert_ne!(verdict, "held", "a conflicted run must never commit a held");
+}
+
+#[test]
+fn agent_runner_duplicate_verdict_key_is_broken() {
+    // M1 end-to-end: a single object with two `verdict` keys is ambiguous (serde
+    // would silently keep the last). Broken, never resolved toward held.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(&repo, r#"{"verdict":"drifted","verdict":"held"}"#);
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
+}
+
+#[test]
+fn agent_runner_stderr_decoy_is_not_a_verdict() {
+    // Finding #2 end-to-end: a well-formed held written to STDERR, with nothing
+    // parseable on stdout, must be Broken — stderr is diagnostics, never a verdict
+    // source.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    repo.write(
+        "stderr-decoy.sh",
+        "#!/bin/sh\ncat >/dev/null\necho '{\"verdict\":\"held\",\"evidence\":\"decoy\"}' >&2\necho 'working...'\n",
+    );
+    let path = repo.path().join("stderr-decoy.sh");
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", path.to_string_lossy().as_ref())
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
+}
+
+#[test]
+fn agent_runner_nonzero_exit_is_broken() {
+    // A runner that fails (non-zero exit) is Broken even if it printed a held.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    repo.write(
+        "failing-agent.sh",
+        "#!/bin/sh\ncat >/dev/null\necho '{\"verdict\":\"held\"}'\nexit 4\n",
+    );
+    let path = repo.path().join("failing-agent.sh");
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", path.to_string_lossy().as_ref())
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+}
+
+#[test]
+fn same_agent_claim_is_unverifiable_without_the_runner() {
+    // The A/B on one claim: with CLAIM_AGENT_CMD pointing at the mock it is held;
+    // with it unset the identical claim is Unverifiable. Proves the runner is what
+    // executes the check, and its absence never fakes a pass.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(&repo, r#"{"verdict":"held","evidence":"ok"}"#);
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all", "--report-only"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("held"));
+
+    repo.claim()
+        .env_remove("CLAIM_AGENT_CMD")
+        .args(["check", "--all", "--report-only"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("unverifiable"));
+}
+
+#[test]
+fn empty_agent_cmd_is_a_loud_error_not_a_silent_fallback() {
+    // A set-but-blank CLAIM_AGENT_CMD is a configuration mistake and must fail
+    // loudly, never quietly fall back to leaving agent checks unverifiable.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", "   ")
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("CLAIM_AGENT_CMD"));
 }
 
 #[test]

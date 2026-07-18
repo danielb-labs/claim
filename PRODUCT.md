@@ -509,12 +509,17 @@ quarters. Value lands the first time a CLAUDE.md sentence goes red.
 
 **Deliberately absent from v1 — each with the signal that builds it:**
 
-- *Agent checks* (and tiered checks, spot-audits) — build when checkless
-  claims with no possible cmd proxy reach a double-digit share of a real
-  corpus. The execution design is settled, so this is scheduling, not
-  research: the clock lane runs a configurable command (e.g.
-  `claude -p "<instruction>" --output-format json`) in the customer's own
-  CI, with the customer's own key and budget.
+- *Agent-check execution* has landed: `claim check` runs a `kind: agent`
+  check through an operator-supplied runner (set `CLAIM_AGENT_CMD` to a
+  command fed the prompt on stdin, emitting the verdict JSON on stdout),
+  mapping its output to a verdict under the same broken-never-passes
+  contract as `cmd`; unset, agent checks stay `Unverifiable` and nothing is
+  spawned, so a default run never contacts a model. The runner (e.g. a
+  wrapper around `claude -p "<instruction>" --output-format json`), its key,
+  and its budget are the customer's. See `docs/agent-checks.md`. What
+  remains deferred here — *tiered checks* and the *adversarial spot-audit*
+  of `held` verdicts — builds when checkless claims with no possible cmd
+  proxy reach a double-digit share of a real corpus.
 - *`suspect` and doubt propagation* — build when a postmortem shows a
   dependent claim acted on while its declared foundation was
   known-drifted. Until then, the drift report's one-hop supports listing

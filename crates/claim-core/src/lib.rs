@@ -19,7 +19,10 @@
 //! Running a check and turning the result into a verdict is [`check`]:
 //! [`check::run_check`] executes a command through the shell and maps its exit
 //! code to a [`verdict::Verdict`] under the honesty contract — a check that
-//! cannot run is `Broken`, never a pass. [`check::resolve_supports`] reports,
+//! cannot run is `Broken`, never a pass. An `agent` check runs the same way when
+//! the context carries an [`check::AgentRunner`], mapping the runner's structured
+//! output to a verdict under the same contract; with no runner it is
+//! `Unverifiable` and spawns nothing. [`check::resolve_supports`] reports,
 //! separately from the verdict, whether a claim's `supports` targets still
 //! resolve, so a deleted decision goes loud instead of leaving a claim green.
 
@@ -30,8 +33,8 @@ pub mod log;
 pub mod verdict;
 
 pub use check::{
-    resolve_supports, run_check, CheckContext, CheckOutcome, ProcessEnd, SupportResolution,
-    DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
+    build_agent_prompt, resolve_supports, run_check, AgentRunner, CheckContext, CheckOutcome,
+    ProcessEnd, SupportResolution, DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
 };
 pub use claim::{
     extract_embedded_claims, has_frontmatter_fence, parse_claim_file, Check, CheckKind, Claim,
