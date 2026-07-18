@@ -14,3 +14,9 @@ thiserror = { workspace = true }
 # YAML parser for claim frontmatter and embedded blocks. Chosen over the archived
 # `serde_yaml` and the alternative fork `serde_yaml_ng`; rationale in CLAUDE.md.
 serde_norway = { workspace = true }
+# Timestamps and duration arithmetic for the verdict log. Chosen over `time` and
+# `chrono` for its correctness-first design: `Timestamp` is an unambiguous UTC
+# instant, RFC 3339 (de)serialization round-trips losslessly, and `checked_add`
+# surfaces out-of-range arithmetic as an error instead of wrapping — the
+# properties a trust tool needs from the clock its staleness is measured against.
+jiff = { workspace = true }
