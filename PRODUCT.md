@@ -468,13 +468,14 @@ product.
   people who administer the repos. And if nobody consumes the queue at
   all, claims decay to stale and every query says so. The system degrades
   toward visible staleness, never toward false green.
-- **Verification is itself audited.** A passing check at creation (loud
-  check-breakage means a broken check never fakes a pass), optional
-  witnessed-red confidence where a red is stageable, adversarial
-  spot-audits of agent verdicts, and the max-age backstop under
-  everything. The system's invariant, one sentence:
-  every claim either re-verifies or comes back to a human on a known
-  clock. The failure mode is a nag, never a lie.
+- **Verification is itself audited.** The audit layers stack: a passing
+  check against reality at creation, optional witnessed-red confidence
+  where a red is stageable, adversarial spot-audits of agent verdicts, and
+  the max-age backstop under everything. And a broken check never fakes a
+  pass — loud check-breakage maps it to broken, not held (invariant #1).
+  The system's invariant, one sentence: every claim either re-verifies or
+  comes back to a human on a known clock. The failure mode is a nag, never
+  a lie.
 
 ## 7. What v1 contains
 

@@ -210,8 +210,8 @@ pub struct ListArgs {
     pub stale: bool,
 
     /// Keep only claims with no passing verdict on record: never genuinely verified
-    /// (hand-committed with no log, or only ever broken/drifted). A single passing
-    /// check clears it.
+    /// (hand-committed with no log, or only ever broken/drifted/unverifiable). A
+    /// single passing check clears it.
     #[arg(long)]
     pub unverified: bool,
 

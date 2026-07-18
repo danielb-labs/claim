@@ -342,3 +342,130 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
         args: args.join(" "),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A git repository with one commit, for exercising [`Worktree`]. Identity is set
+    /// locally so the commit succeeds in an environment with no global git config.
+    fn repo_with_a_commit() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Test"],
+            &["config", "user.email", "test@example.com"],
+            &["commit", "-q", "--allow-empty", "-m", "root"],
+        ] {
+            let out = run_git(path, args).unwrap();
+            assert!(out.ok, "git {args:?} failed: {}", out.stderr);
+        }
+        dir
+    }
+
+    /// The number of worktrees `git` reports for `repo`, including the main one. A
+    /// clean repo with no extra worktrees reports exactly 1.
+    fn worktree_count(repo: &Path) -> usize {
+        run_git(repo, &["worktree", "list", "--porcelain"])
+            .unwrap()
+            .stdout
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+    }
+
+    #[test]
+    fn create_at_head_checks_out_outside_the_repo() {
+        let repo = repo_with_a_commit();
+        let wt = Worktree::create_at_head(repo.path()).unwrap();
+
+        // The checkout is a real directory containing the committed tree...
+        assert!(wt.path().is_dir(), "the worktree path is a directory");
+        // ...and it lives OUTSIDE the repository, so a perturbation there can never
+        // appear in the user's tree. Compared canonically, since macOS resolves the
+        // temp root through /private and the two forms would otherwise not match.
+        let repo_canon = std::fs::canonicalize(repo.path()).unwrap();
+        let wt_canon = std::fs::canonicalize(wt.path()).unwrap();
+        assert!(
+            !wt_canon.starts_with(&repo_canon),
+            "worktree {} must not be inside the repo {}",
+            wt_canon.display(),
+            repo_canon.display()
+        );
+        // git now tracks two worktrees: the main one and this checkout.
+        assert_eq!(worktree_count(repo.path()), 2);
+
+        wt.remove().unwrap();
+    }
+
+    #[test]
+    fn remove_tears_down_the_worktree() {
+        let repo = repo_with_a_commit();
+        let wt = Worktree::create_at_head(repo.path()).unwrap();
+        let path = wt.path().to_path_buf();
+        assert_eq!(worktree_count(repo.path()), 2);
+
+        wt.remove().unwrap();
+
+        // The checkout directory is gone and git is back to only the main worktree.
+        assert!(!path.exists(), "the worktree checkout was deleted");
+        assert_eq!(
+            worktree_count(repo.path()),
+            1,
+            "git is back to only the main worktree"
+        );
+    }
+
+    #[test]
+    fn drop_after_an_early_return_leaves_nothing() {
+        // The panic / early-return safety net: a Worktree dropped without an explicit
+        // remove (as happens when the witness observation returns early) must still
+        // tear the checkout down, leaking neither a git worktree entry nor a temp dir.
+        let repo = repo_with_a_commit();
+        let path = {
+            let wt = Worktree::create_at_head(repo.path()).unwrap();
+            let path = wt.path().to_path_buf();
+            assert_eq!(worktree_count(repo.path()), 2);
+            path
+            // `wt` drops here, at the end of the block.
+        };
+
+        assert!(!path.exists(), "Drop deleted the worktree checkout");
+        assert_eq!(
+            worktree_count(repo.path()),
+            1,
+            "Drop left git with only the main worktree"
+        );
+    }
+
+    #[test]
+    fn remove_then_drop_does_not_double_remove() {
+        // `remove` consumes self and clears the path, so the subsequent implicit Drop
+        // must be a no-op — no second `git worktree remove` against a gone checkout.
+        let repo = repo_with_a_commit();
+        let wt = Worktree::create_at_head(repo.path()).unwrap();
+        wt.remove().unwrap(); // consumes wt; Drop cannot fire on a moved value.
+        assert_eq!(worktree_count(repo.path()), 1);
+    }
+
+    #[test]
+    fn create_at_head_on_an_unborn_head_is_a_clear_error() {
+        // An unborn repo (git init, no commit) has no commit to check out, so the
+        // worktree cannot be created. The caller relies on this failing loudly to fall
+        // back to the no-witness path.
+        let dir = TempDir::new().unwrap();
+        run_git(dir.path(), &["init", "-q"]).unwrap();
+
+        // Match on the Result rather than `unwrap_err`, so `Worktree` needs no Debug
+        // impl just for a test.
+        match Worktree::create_at_head(dir.path()) {
+            Err(GitError::CommandFailed { .. }) => {}
+            Err(other) => panic!("an unborn HEAD should yield a CommandFailed, got {other:?}"),
+            Ok(_) => panic!("creating a worktree on an unborn HEAD must fail"),
+        }
+        // No worktree was registered and no temp dir was left behind.
+        assert_eq!(worktree_count(dir.path()), 1);
+    }
+}

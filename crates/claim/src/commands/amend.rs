@@ -18,15 +18,15 @@
 //! (preserved) log with git provenance, so the amended claim is verified against the
 //! tree the amendment was made on, not merely asserted.
 //!
-//! # Why there is no witnessed-red dance here (deliberate)
+//! # Why there is no `--witness-cmd` option here
 //!
 //! A passing check verifies the fact (invariant #5): witnessing a check go red is an
 //! optional confidence signal, never a gate. Amend takes the same path as `add`'s
 //! default — apply the overlay, run the amended check, require `Held`, write — and
-//! offers no witness flag, because amend most often runs mid-drift on a dirty tree,
-//! where the value is fixing the fact with the least ceremony. (If a later item wants
-//! parity with `add`'s optional `--witness-cmd`, it belongs here as a convenience,
-//! run in an isolated worktree, never a gate.)
+//! simply does not offer the witness flag, because amend most often runs mid-drift on
+//! a dirty tree, where the value is fixing the fact with the least ceremony. (If a
+//! later item wants parity with `add`'s optional `--witness-cmd`, it belongs here as
+//! a convenience, run in an isolated worktree, never a gate.)
 //!
 //! # The overlay, and what must change
 //!
@@ -82,8 +82,8 @@ struct AmendReport {
     to_commit: Vec<String>,
 }
 
-/// Run `claim amend`. See the module docs for the require-`Held` guarantee and the
-/// deliberate absence of witnessed-red.
+/// Run `claim amend`. See the module docs for the require-`Held` guarantee and why
+/// amend offers no `--witness-cmd`.
 ///
 /// # Errors
 ///

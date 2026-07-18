@@ -178,6 +178,12 @@ fn unverified_surfaces_claims_with_no_passing_verdict() {
     repo.write_claim("broke", &claim_file("broke", "120d"));
     repo.write_verdict("broke", "2026-07-10T00:00:00Z", "broken");
 
+    // Only ever drifted, with no initial Held: also no pass on record, so also debt.
+    // (The seeded `gone` claim opens with a Held, so it does not cover this case.)
+    repo.write_claim("driftonly", &claim_file("driftonly", "120d"));
+    repo.write_verdict("driftonly", "2026-07-09T00:00:00Z", "drifted");
+    repo.write_verdict("driftonly", "2026-07-10T00:00:00Z", "drifted");
+
     // A genuinely verified claim, which must NOT appear — a passing check verifies
     // the fact, full stop, whatever evidence it carries.
     repo.write_claim("solid", &claim_file("solid", "120d"));
@@ -188,6 +194,10 @@ fn unverified_surfaces_claims_with_no_passing_verdict() {
     assert!(
         got.contains(&"broke".to_owned()),
         "only-broken is debt (no pass on record)"
+    );
+    assert!(
+        got.contains(&"driftonly".to_owned()),
+        "only-drifted is debt (no pass on record)"
     );
     assert!(
         !got.contains(&"solid".to_owned()),

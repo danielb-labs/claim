@@ -20,16 +20,12 @@
 //! Witnessing a check go red is no longer required — a passing check is enough. But
 //! an author who *can* stage the red may still ask for the extra confidence that the
 //! check discriminates (a `grep` for the wrong string passes forever while proving
-//! nothing). `--witness-cmd` supplies a command that makes the fact false; the tool
-//! then:
-//!
-//! 1. Creates a throwaway `git worktree` detached at `HEAD`, *outside* the
-//!    repository, so nothing below runs against the user's tree.
-//! 2. Runs the witness command there, perturbing that isolated checkout.
-//! 3. Runs the check there and requires `Drifted` — an *observed* red. A check that
-//!    still `Held` does not detect this fact going false and is refused; a `Broken`
-//!    means the perturbation broke execution and is refused.
-//! 4. Tears the worktree down (even on failure).
+//! nothing). Given `--witness-cmd`, the tool creates a throwaway `git worktree`
+//! detached at `HEAD` *outside* the repository, runs the witness command there to
+//! perturb that isolated checkout, re-runs the check there and requires an *observed*
+//! `Drifted` (a still-`Held` check does not detect the fact going false and is
+//! refused; a `Broken` means the perturbation broke execution and is refused), then
+//! tears the worktree down even on failure.
 //!
 //! The observed red is recorded as an evidence note on the establishing entry. The
 //! user's working tree is never mutated, so `--witness-cmd` needs no clean-tree
@@ -587,7 +583,7 @@ fn show_evidence(format: Format, label: &str, outcome: &CheckOutcome) {
     }
 }
 
-/// A lowercase label for a verdict, for narration.
+/// A display label for a verdict, for narration.
 fn verdict_label(v: Verdict) -> &'static str {
     match v {
         Verdict::Held => "Held",

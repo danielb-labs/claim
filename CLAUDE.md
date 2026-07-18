@@ -38,14 +38,12 @@ discussion.
 4. **A write to the truth is a commit.** The tool appends verdicts as files that
    get committed. There is no side channel, no database, no API that writes
    claims. If a feature seems to need one, it's the wrong feature for v1.
-5. **A passing check verifies the fact.** `claim add` records a claim when its
-   check reports `Held` against reality — that is the whole of verification, and
-   the establishing verdict is written full stop. A `Drifted` (already false) or
-   `Broken` (can't run) is refused, but a check is *never* penalized or marked
-   "unverified" for a red that can't be staged — world-facts and agent checks
-   have no red to fabricate. Witnessing a check go red is an *optional* confidence
-   signal (`--witness-cmd`), run in a throwaway worktree so it never touches the
-   user's tree, and recorded as evidence, never required.
+5. **A passing check verifies the fact.** `claim add` writes the establishing
+   verdict when its check reports `Held` against reality; `Drifted` (already
+   false) and `Broken` (can't run) are refused. A check is never penalized or
+   marked "unverified" for a red that can't be staged — world-facts and agent
+   checks have no red to fabricate, and a pass against reality is the whole of
+   verification.
 6. **The failure mode is a nag, never a lie.** Every path — a broken check, an
    unverifiable streak, a check that was never written, a deleted decision — must
    degrade toward a human being asked to look, never toward a stale green light.
