@@ -37,6 +37,15 @@ claim check --all
 CLAIM_AGENT_CMD='my-agent-runner --model some-model' claim check --all
 ```
 
+### Cost scales with how many agent checks run
+
+The runner is invoked once per agent check that runs — so `check --all` runs it for
+**every** agent check in the store, multiplying the per-check model cost on a large
+corpus. The default selection, `check --due`, runs only the checks whose cadence has
+elapsed, which for agent checks (typically `when: every Nd`) is the far smaller set
+that is actually due. Prefer `--due` for scheduled runs and reserve `--all` for
+deliberate full sweeps; the per-check spend is the operator's.
+
 ## The `CLAIM_AGENT_CMD` contract
 
 `CLAIM_AGENT_CMD` is a **shell command** (run as `sh -c`). For each `agent` check
@@ -47,7 +56,10 @@ the tool:
 2. Runs your command, feeding the prompt on **stdin** (never as a shell argument,
    so a long natural-language instruction is never subject to shell quoting or
    injection).
-3. Reads your command's **stdout**, expecting the verdict JSON.
+3. Reads your command's **stdout**, expecting the verdict JSON. The verdict is
+   parsed from **stdout only**; stderr is captured for diagnostics but is never a
+   verdict source, so a `{"verdict":...}` fragment in a stderr log can never be
+   mistaken for the answer.
 4. Bounds the run exactly like a `cmd` check: a working-directory of the store
    root, a wall-clock timeout, a process group killed on timeout so no grandchild
    is orphaned, and a cap on retained output.
@@ -81,8 +93,21 @@ The runner must print a single JSON object:
   Appended to the evidence in the log.
 
 The object may be wrapped in surrounding prose — a model that narrates before
-answering is fine. The tool locates the first balanced `{…}` span that parses to a
-valid verdict object. If it finds none, the check is `Broken`.
+answering is fine. The tool scans **every** balanced `{…}` span on stdout for one
+carrying a `verdict`; a stray object with no `verdict` is skipped. But it never
+guesses when the answer is ambiguous:
+
+- **Zero** verdict-bearing objects → `Broken`.
+- **More than one distinct verdict** across the objects (a model that emits a
+  tentative `held` then a corrected `drifted`) → `Broken`, not the first and not the
+  last. A run that did not settle on one answer is not a pass. Emitting the same
+  verdict more than once is fine — only *disagreeing* verdicts conflict.
+- A single object with a **duplicate `verdict` key**
+  (`{"verdict":"drifted","verdict":"held"}`, which a JSON parser would silently
+  resolve to the last value) → `Broken`. Ambiguity is never resolved toward a value.
+
+Emit exactly one object, your final answer — the directive the tool sends the runner
+says so, precisely to avoid the conflict cases above.
 
 ## The exact verdict mapping
 
@@ -95,14 +120,18 @@ valid verdict object. If it finds none, the check is `Broken`.
 | Exits non-zero | `Broken` (its output is discarded, even a `held`) |
 | Exits 0, stdout has no parseable verdict object | `Broken` |
 | Exits 0, `verdict` missing or not one of the three | `Broken` |
-| Exits 0, `verdict: "held"` | `Held` |
-| Exits 0, `verdict: "drifted"` | `Drifted` |
-| Exits 0, `verdict: "unverifiable"` | `Unverifiable` |
+| Exits 0, two objects with distinct verdicts | `Broken` (conflicting) |
+| Exits 0, one object with a duplicate `verdict` key | `Broken` (ambiguous) |
+| Exits 0, a `verdict` only on stderr | `Broken` (stderr is not a source) |
+| Exits 0, one distinct `verdict: "held"` on stdout | `Held` |
+| Exits 0, one distinct `verdict: "drifted"` on stdout | `Drifted` |
+| Exits 0, one distinct `verdict: "unverifiable"` on stdout | `Unverifiable` |
 
 Note the load-bearing rows: a runner that exits non-zero while printing
-`{"verdict":"held"}`, or exits 0 while printing prose or `{"verdict":"maybe"}`, is
-`Broken`. A runner cannot fake a pass by claiming one — it must exit 0 *and* emit a
-well-formed, valid verdict.
+`{"verdict":"held"}`, exits 0 while printing prose or `{"verdict":"maybe"}`, emits
+two disagreeing verdicts, or hides a `held` on stderr, is `Broken`. A runner cannot
+fake a pass by claiming one — it must exit 0 *and* emit exactly one well-formed,
+valid, unambiguous verdict on stdout.
 
 A blank `CLAIM_AGENT_CMD` (set but only whitespace) is a configuration mistake and
 is rejected loudly (exit 2), rather than silently falling back to leaving agent
@@ -110,9 +139,9 @@ checks unverifiable.
 
 ## An example mock runner
 
-The runner is any executable that follows the stdin→stdout contract. This trivial
-script (used by the test suite) reads and discards the prompt and prints a canned
-verdict — useful for wiring up and testing the plumbing without a real model:
+The runner is any executable that follows the stdin→stdout contract. This script
+(used by the test suite) reads and discards the prompt and prints a canned verdict —
+useful for wiring up and testing the plumbing without a real model:
 
 ```sh
 #!/bin/sh

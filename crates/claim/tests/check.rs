@@ -376,6 +376,74 @@ fn agent_runner_malformed_output_is_broken_never_held() {
 }
 
 #[test]
+fn agent_runner_conflicting_verdicts_is_broken_never_a_chosen_pass() {
+    // C1 end-to-end: a narrating runner emits a tentative held then a corrected
+    // drifted. Neither wins — the run did not cleanly conclude, so it is Broken
+    // (exit 2), and no false Held is committed to the log.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(
+        &repo,
+        "Thinking out loud: {\"verdict\":\"held\"}\nOn reflection: {\"verdict\":\"drifted\",\"evidence\":\"5.3 fixed it\"}",
+    );
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+
+    let verdict = &repo.log_entries("agentic")[0]["event"]["verdict"];
+    assert_eq!(verdict, "broken", "conflicting verdicts must record broken");
+    assert_ne!(verdict, "held", "a conflicted run must never commit a held");
+}
+
+#[test]
+fn agent_runner_duplicate_verdict_key_is_broken() {
+    // M1 end-to-end: a single object with two `verdict` keys is ambiguous (serde
+    // would silently keep the last). Broken, never resolved toward held.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    let runner = write_mock_runner(&repo, r#"{"verdict":"drifted","verdict":"held"}"#);
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", &runner)
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
+}
+
+#[test]
+fn agent_runner_stderr_decoy_is_not_a_verdict() {
+    // Finding #2 end-to-end: a well-formed held written to STDERR, with nothing
+    // parseable on stdout, must be Broken — stderr is diagnostics, never a verdict
+    // source.
+    let repo = ready_repo();
+    repo.write_claim("agentic", &agent_claim("agentic"));
+    repo.write(
+        "stderr-decoy.sh",
+        "#!/bin/sh\ncat >/dev/null\necho '{\"verdict\":\"held\",\"evidence\":\"decoy\"}' >&2\necho 'working...'\n",
+    );
+    let path = repo.path().join("stderr-decoy.sh");
+    std::fs::set_permissions(
+        &path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    repo.claim()
+        .env("CLAIM_AGENT_CMD", path.to_string_lossy().as_ref())
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("broken"));
+    assert_eq!(repo.log_entries("agentic")[0]["event"]["verdict"], "broken");
+}
+
+#[test]
 fn agent_runner_nonzero_exit_is_broken() {
     // A runner that fails (non-zero exit) is Broken even if it printed a held.
     let repo = ready_repo();

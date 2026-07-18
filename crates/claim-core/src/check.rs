@@ -431,10 +431,10 @@ fn run_agent(instruction: &str, ctx: &CheckContext) -> CheckOutcome {
 
     let prompt = build_agent_prompt(instruction);
     let started = Instant::now();
-    let (end, output) = run_process(command, Some(prompt.into_bytes()), ctx);
+    let (end, stdout, stderr) = run_process(command, Some(prompt.into_bytes()), ctx);
     let duration = started.elapsed();
 
-    classify_agent(end, output, ctx.output_cap, duration)
+    classify_agent(end, stdout, stderr, ctx.output_cap, duration)
 }
 
 /// Build the child process for an [`AgentRunner`], with no shell for the argv form.
@@ -466,7 +466,13 @@ fn build_runner_command(runner: &AgentRunner) -> std::result::Result<Command, St
     }
 }
 
-/// Map an agent runner's process outcome and captured stdout to a verdict.
+/// Map an agent runner's process outcome and captured streams to a verdict.
+///
+/// The verdict is parsed from **`stdout` only**; `stderr` is the runner's
+/// diagnostics and is never a verdict source — a decoy `{"verdict":"held"}` written
+/// to stderr cannot become a pass. `stderr` is used solely to enrich the evidence on
+/// a broken outcome, so a human debugging a failed runner still sees what it
+/// complained about.
 ///
 /// Split out from [`run_agent`] so the honesty mapping is unit-testable without
 /// spawning: given a [`ProcessEnd`] and the bytes the runner wrote, does the right
@@ -474,30 +480,34 @@ fn build_runner_command(runner: &AgentRunner) -> std::result::Result<Command, St
 ///
 /// - Any process end other than a clean `exit 0` is [`Verdict::Broken`]; the
 ///   runner did not cleanly answer and its output is not consulted.
-/// - On `exit 0`, the captured stdout is parsed for the verdict object. A parse
-///   failure — no object, missing `verdict`, or an unrecognized `verdict` value —
-///   is [`Verdict::Broken`], with the raw output kept as evidence so a human can
-///   see what the runner actually said.
+/// - On `exit 0`, `stdout` is parsed for the verdict object. A parse failure — no
+///   object, a missing/malformed/unrecognized `verdict`, a duplicate `verdict` key,
+///   or conflicting verdicts — is [`Verdict::Broken`], with the raw output kept as
+///   evidence so a human can see what the runner actually said.
 #[cfg(unix)]
 fn classify_agent(
     end: ProcessEnd,
-    output: Captured,
+    stdout: Captured,
+    stderr: Captured,
     cap: usize,
     duration: Duration,
 ) -> CheckOutcome {
     if !matches!(end, ProcessEnd::Exited { code: 0 }) {
         // The runner crashed, was signalled, timed out, or exited non-zero. Its
-        // output — even a well-formed `held` — is discarded: a check that could not
-        // run cannot report a pass (invariant #1).
+        // output — even a well-formed `held` on stdout — is discarded: a check that
+        // could not run cannot report a pass (invariant #1). Both streams are kept as
+        // evidence so the failure is diagnosable.
+        let mut combined = stdout;
+        combined.extend(stderr, cap);
         return CheckOutcome {
             verdict: Verdict::Broken,
             end,
-            evidence: evidence_from(output, cap),
+            evidence: evidence_from(combined, cap),
             duration,
         };
     }
 
-    let raw = String::from_utf8_lossy(&output.bytes);
+    let raw = String::from_utf8_lossy(&stdout.bytes);
     match parse_agent_response(&raw) {
         Ok(response) => {
             // A well-formed verdict with no evidence text records `None` rather than
@@ -513,15 +523,22 @@ fn classify_agent(
             }
         }
         Err(reason) => {
-            // Exit 0 but the output was not a well-formed verdict. This is the
-            // malicious/broken-runner guard: a runner that prints prose, an empty
-            // body, or `{"verdict":"maybe"}` is Broken, never a fabricated Held. The
-            // raw output is retained (capped) so the failure is diagnosable.
+            // Exit 0 but stdout was not a well-formed, unambiguous verdict. This is
+            // the malicious/broken-runner guard: prose, an empty body,
+            // `{"verdict":"maybe"}`, conflicting verdicts, or a stderr-only decoy is
+            // Broken, never a fabricated Held. Both streams are retained (capped) so
+            // the failure is diagnosable.
             let mut note = format!("agent runner produced no usable verdict: {reason}");
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                note.push_str("\nruntime output: ");
-                note.push_str(trimmed);
+            let stdout_trimmed = raw.trim();
+            if !stdout_trimmed.is_empty() {
+                note.push_str("\nstdout: ");
+                note.push_str(stdout_trimmed);
+            }
+            let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+            let stderr_trimmed = stderr_text.trim();
+            if !stderr_trimmed.is_empty() {
+                note.push_str("\nstderr: ");
+                note.push_str(stderr_trimmed);
             }
             CheckOutcome {
                 verdict: Verdict::Broken,
@@ -534,6 +551,7 @@ fn classify_agent(
 }
 
 /// A parsed, validated agent verdict response.
+#[derive(Debug)]
 struct AgentResponse {
     verdict: Verdict,
     evidence: String,
@@ -564,64 +582,182 @@ impl AgentResponse {
 /// Parse a runner's stdout into a validated [`AgentResponse`], or a reason it is
 /// not a usable verdict.
 ///
-/// The runner is asked to emit a single JSON object, but a model may wrap it in
-/// prose, so the object is located robustly: the first balanced `{…}` span that
-/// deserializes to the schema wins. If none does, this fails — a failure that maps
-/// to [`Verdict::Broken`], so garbled or prose-only output never becomes a pass.
-/// Validation is strict: `verdict` must be present and one of the three allowed
-/// strings; `evidence` and `citations` are optional and default to empty, because
-/// the verdict is the honesty-critical field and missing evidence is a weaker
-/// answer, not a broken one.
+/// The runner is asked to emit exactly one JSON object, but a model may wrap it in
+/// prose or reason out loud before its final answer, so **every** balanced `{…}`
+/// span that carries a `verdict` is examined — not just the first, and not just the
+/// last, because both are gameable by a model that emits a tentative verdict and
+/// then a corrected one. The rule the honesty core turns on:
+///
+/// - Zero verdict-bearing objects → error (garbled or prose-only output).
+/// - A verdict-bearing object whose `verdict` is malformed — not a string, not one
+///   of the three values, or a span with a *duplicate* `verdict` key (which
+///   `serde_json` would silently resolve to the last value) — → error. Ambiguity is
+///   never resolved toward a value.
+/// - More than one *distinct* verdict across the objects → error ("conflicting
+///   verdicts"). A run that did not cleanly conclude one thing is not a pass.
+/// - Exactly one distinct verdict across every bearing object → that verdict, with
+///   the evidence and citations of the first object that carried it.
+///
+/// Every error maps to [`Verdict::Broken`], so a narrating, conflicted, or garbled
+/// runner never reads as a pass. `evidence` and `citations` are optional and
+/// default to empty: the verdict is the honesty-critical field, and missing
+/// evidence is a weaker answer, not a broken one.
 fn parse_agent_response(raw: &str) -> std::result::Result<AgentResponse, String> {
+    let mut found: Option<AgentResponse> = None;
     for candidate in json_object_candidates(raw) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+        let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(candidate)
+        else {
             continue;
         };
-        let serde_json::Value::Object(map) = value else {
+        // A candidate object that parses but carries no `verdict` is not an answer;
+        // skip it (a model may emit a stray `{}` or an aside object before or after
+        // the real one) rather than failing on it.
+        if !map.contains_key("verdict") {
             continue;
-        };
-        // A candidate object that parses but carries no `verdict` is not the object
-        // we are looking for; keep scanning in case the real one is later, rather
-        // than failing on a stray `{}` a model emitted before the answer.
-        let Some(verdict_value) = map.get("verdict") else {
-            continue;
-        };
-        let Some(verdict_str) = verdict_value.as_str() else {
-            return Err("the 'verdict' field is not a string".to_owned());
-        };
-        let verdict = match verdict_str {
-            "held" => Verdict::Held,
-            "drifted" => Verdict::Drifted,
-            "unverifiable" => Verdict::Unverifiable,
-            other => {
+        }
+        // A single object with a duplicate `verdict` key is ambiguous: `serde_json`
+        // silently kept the last, so the parsed map cannot be trusted to represent
+        // the model's answer. Broken, never resolved toward a value.
+        if duplicate_verdict_key(candidate) {
+            return Err(
+                "an output object has more than one 'verdict' key, which is ambiguous".to_owned(),
+            );
+        }
+        let verdict = parse_verdict_value(&map["verdict"])?;
+        let response = agent_response_from(&map, verdict);
+        match &found {
+            // A second, disagreeing verdict means the runner did not cleanly conclude
+            // one thing. Broken — never a chosen pass, in either direction.
+            Some(prior) if prior.verdict != verdict => {
                 return Err(format!(
-                    "'verdict' was '{other}', not one of held, drifted, unverifiable"
+                    "runner emitted conflicting verdicts ('{}' and '{}')",
+                    verdict_str(prior.verdict),
+                    verdict_str(verdict)
                 ));
             }
-        };
-        let evidence = map
-            .get("evidence")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let citations = map
-            .get("citations")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        return Ok(AgentResponse {
-            verdict,
-            evidence,
-            citations,
-        });
+            // A repeat of the same verdict is consistent; keep the first (its
+            // evidence).
+            Some(_) => {}
+            None => found = Some(response),
+        }
     }
-    Err("no JSON object with a 'verdict' field was found in the output".to_owned())
+    found.ok_or_else(|| "no JSON object with a 'verdict' field was found in the output".to_owned())
+}
+
+/// Map a `verdict` JSON value to a [`Verdict`], or a reason it is not one of the
+/// three allowed strings. Never returns [`Verdict::Broken`] — that is the caller's
+/// mapping for the error case; this only recognizes a valid answer.
+fn parse_verdict_value(value: &serde_json::Value) -> std::result::Result<Verdict, String> {
+    let Some(s) = value.as_str() else {
+        return Err("the 'verdict' field is not a string".to_owned());
+    };
+    match s {
+        "held" => Ok(Verdict::Held),
+        "drifted" => Ok(Verdict::Drifted),
+        "unverifiable" => Ok(Verdict::Unverifiable),
+        other => Err(format!(
+            "'verdict' was '{other}', not one of held, drifted, unverifiable"
+        )),
+    }
+}
+
+/// The lowercase wire name of a verdict, for error messages naming what conflicted.
+fn verdict_str(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Held => "held",
+        Verdict::Drifted => "drifted",
+        Verdict::Unverifiable => "unverifiable",
+        Verdict::Broken => "broken",
+    }
+}
+
+/// Build an [`AgentResponse`] from a parsed object and its already-validated verdict.
+fn agent_response_from(
+    map: &serde_json::Map<String, serde_json::Value>,
+    verdict: Verdict,
+) -> AgentResponse {
+    let evidence = map
+        .get("evidence")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let citations = map
+        .get("citations")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    AgentResponse {
+        verdict,
+        evidence,
+        citations,
+    }
+}
+
+/// Whether a single JSON object span contains more than one `"verdict"` key at its
+/// top level.
+///
+/// `serde_json` silently keeps the last of duplicate keys, so a
+/// `{"verdict":"drifted","verdict":"held"}` would deserialize to `held` and hide
+/// the conflict — a false-pass vector. This scans the object's raw span, tracking
+/// string literals (so a `"verdict"` inside a value string does not count) and
+/// brace depth (so a `"verdict"` key in a nested object does not count), and returns
+/// `true` when two top-level `verdict` keys are seen. A key is a `"verdict"` string
+/// immediately followed (after optional whitespace) by a `:`.
+fn duplicate_verdict_key(span: &str) -> bool {
+    let bytes = span.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_start = 0usize;
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+                // A key sits at object depth 1 (inside the outer braces, not nested)
+                // and is followed by a colon. Check the just-closed string literal.
+                if depth == 1
+                    && &span[string_start..i] == "verdict"
+                    && next_nonspace_is_colon(bytes, i + 1)
+                {
+                    count += 1;
+                    if count > 1 {
+                        return true;
+                    }
+                }
+            }
+        } else if b == b'"' {
+            in_string = true;
+            string_start = i + 1;
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth = depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the next non-whitespace byte at or after `from` is a `:`.
+fn next_nonspace_is_colon(bytes: &[u8], from: usize) -> bool {
+    bytes[from..]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b':')
 }
 
 /// Every balanced-brace `{…}` span in `raw`, outermost-first, as candidate JSON
@@ -634,7 +770,7 @@ fn parse_agent_response(raw: &str) -> std::result::Result<AgentResponse, String>
 /// literals are skipped (with escape handling) so a `{` or `}` inside an evidence
 /// string does not desynchronize the depth count. This is a locator, not a full
 /// tokenizer: `serde_json` is the actual validator, and a span that is not valid
-/// JSON is simply skipped.
+/// JSON is skipped.
 fn json_object_candidates(raw: &str) -> Vec<&str> {
     let bytes = raw.as_bytes();
     let mut spans = Vec::new();
@@ -698,8 +834,9 @@ fn json_object_candidates(raw: &str) -> Vec<&str> {
 /// same fields and the same three verdict values, or a runner told one thing would
 /// be judged by another.
 const AGENT_RESPONSE_DIRECTIVE: &str = "\
-Respond with a single JSON object and nothing else that must be parsed, in this shape:
+Respond on stdout with exactly one JSON object and no other text, in this shape:
   {\"verdict\": \"held\" | \"drifted\" | \"unverifiable\", \"evidence\": \"<why>\", \"citations\": [\"<source>\", ...]}
+Emit only your final verdict object. Do not print any earlier, draft, or intermediate JSON object: more than one object, or two objects that disagree, is treated as a failure to decide (broken), not a pass.
 Rules:
 - \"held\": the fact stated above is still true.
 - \"drifted\": the fact is now false.
@@ -844,23 +981,30 @@ const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
 /// ([`run_agent`]) reuses the identical process-group, timeout, group-kill, and
 /// bounded-capture behavior instead of duplicating it — the one place a check
 /// becomes a process must behave the same for every kind.
+///
+/// A `cmd` check's evidence is its combined stdout+stderr, so the two separate
+/// captures [`run_process`] returns are merged here (within the cap). The agent path
+/// keeps them apart, because it parses a verdict from stdout only.
 #[cfg(unix)]
 fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
     let mut command = Command::new("sh");
     command.arg("-c").arg(run).stdin(Stdio::null());
-    run_process(command, None, ctx)
+    let (end, mut stdout, stderr) = run_process(command, None, ctx);
+    stdout.extend(stderr, ctx.output_cap);
+    (end, stdout)
 }
 
 /// Drive a fully-configured child process to a terminal outcome: spawn it in its
 /// own group, optionally feed `stdin` bytes, capture bounded stdout+stderr, and
 /// enforce the timeout.
 ///
-/// Returns the terminal [`ProcessEnd`] and the captured output. This is the only
-/// function that touches the process; all judgement is downstream of it, so the
-/// honesty rules stay readable and testable apart from the I/O. The caller sets
-/// `command`'s program, args, and stdin disposition; this function forces the
-/// working directory, piped stdout/stderr, and the process group, so no caller can
-/// forget the no-orphan setup.
+/// Returns the terminal [`ProcessEnd`] and the captured `(stdout, stderr)`, kept
+/// separate so a caller that parses one stream (the agent path parses a verdict from
+/// stdout only) is never fooled by the other. This is the only function that touches
+/// the process; all judgement is downstream of it, so the honesty rules stay
+/// readable and testable apart from the I/O. The caller sets `command`'s program,
+/// args, and stdin disposition; this function forces the working directory, piped
+/// stdout/stderr, and the process group, so no caller can forget the no-orphan setup.
 ///
 /// When `stdin` is `Some(bytes)`, the command is spawned with a piped stdin and the
 /// bytes are written on a dedicated thread. Writing on a thread (rather than before
@@ -884,7 +1028,7 @@ fn run_process(
     mut command: Command,
     stdin: Option<Vec<u8>>,
     ctx: &CheckContext,
-) -> (ProcessEnd, Captured) {
+) -> (ProcessEnd, Captured, Captured) {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
     use wait_timeout::ChildExt;
@@ -911,6 +1055,7 @@ fn run_process(
                 ProcessEnd::SpawnFailed {
                     reason: e.to_string(),
                 },
+                Captured::empty(),
                 Captured::empty(),
             )
         }
@@ -986,11 +1131,18 @@ fn run_process(
     // harmless: the group emptied itself.
     kill_group(pgid);
 
-    let captured = collect_output(out_reader, err_reader, &done_rx, cap);
-    (end, captured)
+    let (stdout, stderr) = collect_output(out_reader, err_reader, &done_rx);
+    (end, stdout, stderr)
 }
 
-/// Collect the two readers' captured output with a bounded wait.
+/// Collect the two readers' captured output with a bounded wait, keeping stdout and
+/// stderr *separate*.
+///
+/// Returns `(stdout, stderr)`. Keeping the streams apart is load-bearing for the
+/// agent path: a verdict is parsed from stdout only, so a diagnostic a runner writes
+/// to stderr — even one containing a `{"verdict":...}` fragment — can never be
+/// mistaken for the runner's answer. The cmd path combines them itself for its
+/// evidence; separation costs it nothing.
 ///
 /// The child is already reaped and its group killed, so any reader that is not
 /// finished is blocked on a pipe held open by a process that escaped the group.
@@ -1004,8 +1156,7 @@ fn collect_output(
     out_reader: Option<Reader>,
     err_reader: Option<Reader>,
     done_rx: &std::sync::mpsc::Receiver<()>,
-    cap: usize,
-) -> Captured {
+) -> (Captured, Captured) {
     let expected = out_reader.is_some() as usize + err_reader.is_some() as usize;
     let deadline = Instant::now() + READER_JOIN_GRACE;
     for _ in 0..expected {
@@ -1015,11 +1166,9 @@ fn collect_output(
         }
     }
 
-    let mut captured = out_reader.map_or_else(Captured::empty, Reader::take);
-    if let Some(err) = err_reader {
-        captured.extend(err.take(), cap);
-    }
-    captured
+    let stdout = out_reader.map_or_else(Captured::empty, Reader::take);
+    let stderr = err_reader.map_or_else(Captured::empty, Reader::take);
+    (stdout, stderr)
 }
 
 /// Kill an entire process group by its leader's pid.
@@ -1688,7 +1837,7 @@ mod tests {
         let reader = spawn_reader(stdout, DEFAULT_OUTPUT_CAP, tx);
 
         let started = Instant::now();
-        let captured = collect_output(Some(reader), None, &rx, DEFAULT_OUTPUT_CAP);
+        let (stdout_captured, _stderr) = collect_output(Some(reader), None, &rx);
         let elapsed = started.elapsed();
 
         // Bounded by the grace, not the sleeper's 30s lifetime.
@@ -1699,7 +1848,7 @@ mod tests {
         );
         // The unfinished reader was detached and its capture flagged as an escapee.
         assert!(
-            captured.escapee,
+            stdout_captured.escapee,
             "a detached reader's capture must be marked as an escapee"
         );
 
@@ -2218,16 +2367,22 @@ mod tests {
 
     // --- Agent classification and parsing, unit-level (no spawn). ---
 
-    #[test]
-    fn classify_agent_maps_clean_exit_and_parsed_verdict() {
-        let held = Captured {
-            bytes: br#"{"verdict":"held","evidence":"ok"}"#.to_vec(),
+    /// A `Captured` from raw bytes (not truncated, not an escapee), for driving
+    /// `classify_agent` in unit tests without spawning.
+    fn captured(bytes: &[u8]) -> Captured {
+        Captured {
+            bytes: bytes.to_vec(),
             truncated: false,
             escapee: false,
-        };
+        }
+    }
+
+    #[test]
+    fn classify_agent_maps_clean_exit_and_parsed_verdict() {
         let outcome = classify_agent(
             ProcessEnd::Exited { code: 0 },
-            held,
+            captured(br#"{"verdict":"held","evidence":"ok"}"#),
+            Captured::empty(),
             DEFAULT_OUTPUT_CAP,
             Duration::ZERO,
         );
@@ -2238,14 +2393,10 @@ mod tests {
     fn classify_agent_never_maps_a_nonzero_exit_to_held() {
         // Even with a perfectly-formed held on stdout, a non-zero exit is Broken.
         for code in [1, 2, 42, 127, 137] {
-            let held = Captured {
-                bytes: br#"{"verdict":"held","evidence":"ok"}"#.to_vec(),
-                truncated: false,
-                escapee: false,
-            };
             let outcome = classify_agent(
                 ProcessEnd::Exited { code },
-                held,
+                captured(br#"{"verdict":"held","evidence":"ok"}"#),
+                Captured::empty(),
                 DEFAULT_OUTPUT_CAP,
                 Duration::ZERO,
             );
@@ -2268,18 +2419,35 @@ mod tests {
                 reason: "x".to_owned(),
             },
         ] {
-            let held = Captured {
-                bytes: br#"{"verdict":"held"}"#.to_vec(),
-                truncated: false,
-                escapee: false,
-            };
-            let outcome = classify_agent(end.clone(), held, DEFAULT_OUTPUT_CAP, Duration::ZERO);
+            let outcome = classify_agent(
+                end.clone(),
+                captured(br#"{"verdict":"held"}"#),
+                Captured::empty(),
+                DEFAULT_OUTPUT_CAP,
+                Duration::ZERO,
+            );
             assert_eq!(
                 outcome.verdict,
                 Verdict::Broken,
                 "end {end:?} must be Broken"
             );
         }
+    }
+
+    #[test]
+    fn classify_agent_parses_stdout_only_never_a_stderr_decoy() {
+        // Finding #2: a decoy verdict on stderr must not be read as the answer.
+        // stdout carries no parseable verdict; stderr carries a well-formed held.
+        // The result is Broken (stdout had no verdict), never Held.
+        let outcome = classify_agent(
+            ProcessEnd::Exited { code: 0 },
+            captured(b"working on it...\n"),
+            captured(br#"{"verdict":"held","evidence":"decoy on stderr"}"#),
+            DEFAULT_OUTPUT_CAP,
+            Duration::ZERO,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_ne!(outcome.verdict, Verdict::Held);
     }
 
     #[test]
@@ -2316,14 +2484,115 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_response_finds_the_object_after_a_stray_brace() {
-        // A model that emits `{}` or a JSON snippet before the real answer must not
-        // stop the parser: it scans on until it finds an object carrying `verdict`.
+    fn parse_agent_response_skips_non_verdict_objects_and_reads_the_sole_verdict() {
+        // Non-verdict objects (a stray `{}`, an aside) are skipped; with exactly one
+        // verdict-bearing object anywhere in the output, that verdict is read. Its
+        // position (here, last) is irrelevant — the invariant is "exactly one distinct
+        // verdict", not "first" or "last". The conflict tests below prove position
+        // does not decide a winner when two verdicts disagree.
+        let sole_first =
+            r#"{"verdict":"drifted","evidence":"found"} then aside {} and {"note":"x"}"#;
+        let response = parse_agent_response(sole_first).unwrap();
+        assert_eq!(response.verdict, Verdict::Drifted);
+        assert_eq!(response.evidence, "found");
+
+        let sole_last =
+            r#"warmup {} then {"note":"aside"} and finally {"verdict":"held","evidence":"f"}"#;
+        assert_eq!(
+            parse_agent_response(sole_last).unwrap().verdict,
+            Verdict::Held
+        );
+    }
+
+    #[test]
+    fn parse_agent_response_repeated_same_verdict_is_consistent() {
+        // The same verdict emitted twice (a model that restated its answer) is not a
+        // conflict; it resolves to that verdict, keeping the first object's evidence.
         let raw =
-            r#"warmup {} then {"note":"aside"} and finally {"verdict":"held","evidence":"found"}"#;
+            r#"{"verdict":"held","evidence":"first"} ... {"verdict":"held","evidence":"again"}"#;
         let response = parse_agent_response(raw).unwrap();
         assert_eq!(response.verdict, Verdict::Held);
-        assert_eq!(response.evidence, "found");
+        assert_eq!(response.evidence, "first");
+    }
+
+    // --- C1: a narrating/conflicted runner never resolves to a chosen pass. ---
+
+    #[test]
+    fn parse_agent_response_conflicting_held_then_drifted_is_broken() {
+        // The Critical case: a model reasons out loud, emitting a tentative held then
+        // its corrected drifted. Neither "first" nor "last" may win — conflicting
+        // verdicts are an error (→ Broken), never a chosen pass.
+        let raw = r#"Thinking: {"verdict":"held"} ... on reflection {"verdict":"drifted"}"#;
+        let err = parse_agent_response(raw).unwrap_err();
+        assert!(err.contains("conflicting"), "reason: {err}");
+    }
+
+    #[test]
+    fn parse_agent_response_conflicting_held_then_unverifiable_is_broken() {
+        let raw =
+            r#"{"verdict":"held","evidence":"a"} then {"verdict":"unverifiable","evidence":"b"}"#;
+        assert!(parse_agent_response(raw)
+            .unwrap_err()
+            .contains("conflicting"));
+    }
+
+    #[test]
+    fn parse_agent_response_conflicting_order_independent() {
+        // The reverse order is equally Broken: the tool does not prefer whichever
+        // verdict appears first (or last).
+        let drift_first = r#"{"verdict":"drifted"} ... {"verdict":"held"}"#;
+        assert!(parse_agent_response(drift_first).is_err());
+        let held_first = r#"{"verdict":"held"} ... {"verdict":"drifted"}"#;
+        assert!(parse_agent_response(held_first).is_err());
+    }
+
+    #[test]
+    fn parse_agent_response_duplicate_verdict_key_is_broken() {
+        // M1: serde silently keeps the last of duplicate keys, so
+        // `{"verdict":"drifted","verdict":"held"}` would deserialize to held. Detect
+        // the duplicate key in the raw span and treat it as ambiguous → Broken, never
+        // resolved toward a value.
+        let raw = r#"{"verdict":"drifted","verdict":"held"}"#;
+        let err = parse_agent_response(raw).unwrap_err();
+        assert!(err.contains("more than one 'verdict' key"), "reason: {err}");
+
+        // The reverse spelling is equally Broken; the value order does not matter.
+        assert!(parse_agent_response(r#"{"verdict":"held","verdict":"drifted"}"#).is_err());
+    }
+
+    #[test]
+    fn duplicate_verdict_key_ignores_nested_and_string_occurrences() {
+        // Only a *top-level* duplicate `verdict` key is a conflict. A single top-level
+        // key is fine even when the word "verdict" appears inside a value string or a
+        // nested object.
+        assert!(!duplicate_verdict_key(
+            r#"{"verdict":"held","evidence":"the verdict is in"}"#
+        ));
+        assert!(!duplicate_verdict_key(
+            r#"{"verdict":"held","meta":{"verdict":"nested"}}"#
+        ));
+        assert!(duplicate_verdict_key(
+            r#"{"verdict":"drifted","verdict":"held"}"#
+        ));
+    }
+
+    #[test]
+    fn parse_agent_response_single_clean_object_reads_its_verdict() {
+        // A single clean object anywhere resolves to its verdict — the ordinary case
+        // the conflict rule must not regress.
+        let response = parse_agent_response(r#"Here: {"verdict":"held","evidence":"ok"}"#).unwrap();
+        assert_eq!(response.verdict, Verdict::Held);
+    }
+
+    #[test]
+    fn parse_agent_response_nested_verdict_in_metadata_is_not_a_conflict() {
+        // A `verdict` nested inside a value object is metadata, not a second answer:
+        // the object locator advances past the whole outer object (so the nested one
+        // is never a separate top-level candidate) and the duplicate-key check counts
+        // only top-level keys. The top-level verdict decides, unambiguously.
+        let raw = r#"{"verdict":"held","meta":{"verdict":"drifted","note":"prior draft"}}"#;
+        let response = parse_agent_response(raw).unwrap();
+        assert_eq!(response.verdict, Verdict::Held);
     }
 
     #[test]
@@ -2340,12 +2609,22 @@ mod tests {
     fn agent_prompt_carries_the_instruction_and_the_contract() {
         let prompt = build_agent_prompt("Is libfoo still pinned at 4.2?");
         assert!(prompt.contains("Is libfoo still pinned at 4.2?"));
-        // The three verdict values must all appear so the runner is told the exact
-        // vocabulary the parser enforces.
-        assert!(prompt.contains("held"));
-        assert!(prompt.contains("drifted"));
-        assert!(prompt.contains("unverifiable"));
-        assert!(prompt.contains("verdict"));
+        // Every field name the parser reads and every verdict value it accepts must
+        // appear, so a rename of any of them in the directive is caught here rather
+        // than silently telling the runner one schema while judging it by another.
+        for token in [
+            "verdict",
+            "evidence",
+            "citations",
+            "held",
+            "drifted",
+            "unverifiable",
+        ] {
+            assert!(prompt.contains(token), "prompt must mention '{token}'");
+        }
+        // The directive must instruct exactly-one-object and forbid drafts, the
+        // source-level defense against the conflicting-verdict case.
+        assert!(prompt.contains("exactly one JSON object"));
     }
 
     #[test]
