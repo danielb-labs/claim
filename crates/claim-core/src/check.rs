@@ -340,7 +340,7 @@ pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
 /// Execute a `cmd` check's `run` string and classify the result.
 ///
 /// The command is run through the platform shell so pipes, globs, and quoting in
-/// the `run` string behave as an author expects (PRODUCT.md's examples rely on
+/// the `run` string behave as an author expects (docs/design/PRODUCT.md's examples rely on
 /// shell features). The shell interprets syntax only; the exit-code-to-verdict
 /// mapping and negation are the tool's, per invariants #1 and #2.
 fn run_cmd(run: &str, negate: bool, ctx: &CheckContext) -> CheckOutcome {
@@ -1352,7 +1352,7 @@ fn drain_into<R: Read>(mut reader: R, cap: usize, shared: &std::sync::Mutex<Capt
 /// is gone" — not a check failure. Folding it into `Broken` would conflate "the
 /// check could not run" with "the decision vanished", and the CLI needs to say
 /// which. A claim with an unresolved support goes loud instead of staying quietly
-/// green (PRODUCT.md section 4).
+/// green (docs/design/PRODUCT.md section 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportResolution {
     /// The target as written in the claim's `supports` list.

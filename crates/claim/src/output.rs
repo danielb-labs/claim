@@ -1,7 +1,7 @@
 //! Output plumbing: the one place a verb chooses between human text and `--json`.
 //!
 //! Every command owes both a readable human form and a stable machine form
-//! (PRODUCT.md section 5, "everything has `--json`"). Rather than let each verb
+//! (docs/design/PRODUCT.md section 5, "everything has `--json`"). Rather than let each verb
 //! re-derive that choice — and risk one command printing JSON to stderr or
 //! forgetting the flag — this module carries the selected [`Format`] and offers the
 //! two emit paths a verb uses. `init` and `add` are the first users; the plumbing

@@ -1,4 +1,4 @@
-//! `claim stats`: the pilot instrumentation (PRODUCT.md section 9).
+//! `claim stats`: the pilot instrumentation (docs/design/PRODUCT.md section 9).
 //!
 //! The day-90 verdict on v1 rests on two kill metrics — a false-alarm rate above
 //! one in three fired drifts, or an authoring cost well over five minutes a claim,
@@ -16,7 +16,7 @@
 //! - **Left to human input, never fabricated:** the false-alarm rate and
 //!   minutes-per-claim. The verb surfaces the denominators it *does* have — the
 //!   total count of fired `Drifted` verdicts (the false-alarm denominator, measured
-//!   over individual drift events per PRODUCT.md section 9) and the total claim
+//!   over individual drift events per docs/design/PRODUCT.md section 9) and the total claim
 //!   count (the authoring-time denominator) — and states plainly that the numerators
 //!   need external input. A later item may add a `--false-alarm` marker or capture
 //!   authoring time; until then, inventing either number would be exactly the
@@ -193,7 +193,7 @@ impl Accumulator {
             overdue: self.overdue,
             oldest_last_verified: self.oldest_last_verified.map(|t| t.to_string()),
             // The false-alarm denominator is *fired drift events*, not claims that
-            // ever drifted: PRODUCT.md section 9 measures the rate over individual
+            // ever drifted: docs/design/PRODUCT.md section 9 measures the rate over individual
             // drifts (a flappy claim firing ten drifts is ten chances to be a false
             // alarm), and the note asks a human to classify "each fired drift".
             needs_human_input: KillMetrics::describe(self.verdict_drifted, self.total),
@@ -255,7 +255,7 @@ struct VerdictBreakdown {
     broken: usize,
 }
 
-/// The two PRODUCT.md section-9 kill metrics, reported honestly: the denominators
+/// The two docs/design/PRODUCT.md section-9 kill metrics, reported honestly: the denominators
 /// the store supplies, and the human input each numerator still needs. Serialized as
 /// data (not prose the caller must parse) so an agent can see the rate is *absent*,
 /// not zero.
@@ -275,7 +275,7 @@ impl KillMetrics {
     /// store *can* supply and naming the input its numerator needs.
     ///
     /// `fired_drifts` is the total count of `Drifted` verdicts recorded across the
-    /// corpus (individual drift events), the denominator PRODUCT.md section 9's
+    /// corpus (individual drift events), the denominator docs/design/PRODUCT.md section 9's
     /// false-alarm rate is measured over — distinct from `drifts_caught`, the count
     /// of unique claims that ever drifted, which the report carries separately.
     fn describe(fired_drifts: usize, total: usize) -> Self {
@@ -349,7 +349,7 @@ fn human(stats: &Stats) {
         None => println!("Oldest last-verified:                     (no claim has ever passed)"),
     }
     println!();
-    println!("Kill metrics (PRODUCT.md section 9) — need human input, not fabricated:");
+    println!("Kill metrics (docs/design/PRODUCT.md section 9) — need human input, not fabricated:");
     print_unavailable(
         "false-alarm rate",
         &stats.needs_human_input.false_alarm_rate,

@@ -1,9 +1,10 @@
 # CLAUDE.md — how we build `claim`
 
 This file is binding for every agent and person who writes code here. Read it
-before touching anything. The product design lives in `PRODUCT.md` (what v1 is),
-`PROPOSAL.md` (why it exists, and why existing tools don't solve it), and
-`SPEC.md` (original notes). This file is only about *how the code gets built*.
+before touching anything. The product design lives under `docs/design/`:
+`PRODUCT.md` (what v1 is), `PROPOSAL.md` (why it exists, and why existing tools
+don't solve it), and `SPEC.md` (original notes); parked decisions and deferred
+work are in `TODO.md`. This file is only about *how the code gets built*.
 
 ## What we're building
 

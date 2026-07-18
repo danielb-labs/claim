@@ -46,7 +46,7 @@ Two properties are load-bearing:
 
 - **`--report-only` writes nothing and needs no git identity.** A fork PR's CI has no
   write token; this mode still runs every check and still reports, it just persists no
-  verdict (PRODUCT.md section 3: fork-PR runs report only; trusted runs persist). The
+  verdict (docs/design/PRODUCT.md section 3: fork-PR runs report only; trusted runs persist). The
   comment step is additionally gated off for fork PRs, so a contribution from a fork
   gets its checks and an advisory job summary without the workflow ever handling a
   write token.
@@ -144,7 +144,7 @@ The escalation ladder in v1 has exactly two rungs, and neither blocks a merge:
 1. **The on-change PR comment** — advisory, at the moment of maximal context.
 2. **The clock-lane standing issue** — the durable nag that outlives any single PR.
 
-There is deliberately **no gate and no block** in v1 (PRODUCT.md section 5). A drifted
+There is deliberately **no gate and no block** in v1 (docs/design/PRODUCT.md section 5). A drifted
 fact routes to the people who own the decision; it does not stop the person who
 happened to trigger it. The upper rungs — a nag that escalates with time-unhandled,
 then the owning team's own merge gate, then a hard block — are policy per claim class,

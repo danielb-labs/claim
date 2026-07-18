@@ -1,6 +1,6 @@
 //! `claim log <id>`: one claim's full definition and its verdict history.
 //!
-//! The join PRODUCT.md section 3 describes: the definition (statement, checks,
+//! The join docs/design/PRODUCT.md section 3 describes: the definition (statement, checks,
 //! max-age, supports) plus every log entry in chronological order — each with its
 //! timestamp, verdict or adjudication, actor, commit, and evidence. A thin wrapper
 //! over [`claim_core::read_entries`] and the parsed claim, so the CLI never

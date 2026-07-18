@@ -21,6 +21,6 @@ Never verified (no passing verdict):      1
 Overdue now (stale or drifted):           3
 Oldest last-verified:                     2026-01-01T00:00:00Z
 
-Kill metrics (PRODUCT.md section 9) — need human input, not fabricated:
+Kill metrics (docs/design/PRODUCT.md section 9) — need human input, not fabricated:
   false-alarm rate: not available — denominator 1 (total Drifted verdicts recorded); needs a human (or a later `--false-alarm` marker) to classify each fired drift as a real drift or a false alarm; the store does not record that judgement
   minutes per claim: not available — denominator 5 (total claims); needs authoring wall-clock time, which the tool never observed; a later item may capture it at `claim add` time

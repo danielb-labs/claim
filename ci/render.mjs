@@ -31,7 +31,7 @@ export const ISSUE_MARKER = "<!-- claim-bot:clock -->";
 // could not run, so we know nothing — invariant #1, a broken check is never a pass
 // and is surfaced most prominently. `drifted` means the fact is no longer true.
 // `unresolved` means a `supports` target (a decision the claim justifies) vanished —
-// the claim went loud rather than staying quietly green (PRODUCT.md section 4).
+// the claim went loud rather than staying quietly green (docs/design/PRODUCT.md section 4).
 const CATEGORY = {
   broken: { key: "broken", heading: "Broken checks", rank: 3 },
   drifted: { key: "drifted", heading: "Drifted claims", rank: 2 },
@@ -230,7 +230,7 @@ function groupByCategory(items) {
 function ownersLine(owners) {
   if (owners.length === 0) {
     // An unowned claim is a routing dead-letter, a first-class problem, not a
-    // dropped notification (PRODUCT.md section 5). Say so instead of omitting it.
+    // dropped notification (docs/design/PRODUCT.md section 5). Say so instead of omitting it.
     return "_owner: unknown (no CODEOWNERS match — routing dead-letter)_";
   }
   return "owner: " + owners.join(" ");

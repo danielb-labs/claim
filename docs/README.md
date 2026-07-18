@@ -15,6 +15,10 @@ the parts you touch.
   that stops a misbehaving runner from faking a pass.
 - [`dogfooding.md`](dogfooding.md) — how this repository verifies its own
   load-bearing decisions with `claim`, and how to run those checks.
+- [`design/`](design/) — the product and design canon: `PRODUCT.md` (what v1 is),
+  `PROPOSAL.md` (why it exists), `SPEC.md` (original notes), and `TODO.md` (parked
+  decisions and deferred work). These describe the *product*; the docs above and
+  `--help` describe *using the tool as built*.
 
 The authoritative flag reference is always `claim <verb> --help`; the CLI table
 in `index.html` mirrors it as of the current release.
