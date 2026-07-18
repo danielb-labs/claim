@@ -64,6 +64,9 @@ pub enum Command {
     /// Pilot metrics: status and verdict counts, drifts caught, staleness.
     Stats(StatsArgs),
 
+    /// Render the `supports` graph: each decision or claim, and the claims backing it.
+    Graph(GraphArgs),
+
     /// Open the product documentation bundled into this binary.
     Docs(DocsArgs),
 }
@@ -287,6 +290,14 @@ EXIT CODES:
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DRIFT_EXIT_HELP)]
 pub struct DriftArgs {}
+
+/// Arguments to `claim graph`: render the store's `supports` graph.
+///
+/// No options in v1 — it reads the whole store from the current directory and prints
+/// the edges (ASCII grouped by target, or `--json` node/edge list). Richer views —
+/// filtering, transitive support, real visualization — belong to the hub, not here.
+#[derive(Debug, clap::Args)]
+pub struct GraphArgs {}
 
 /// Arguments to `claim retire <id>`: close a claim on purpose.
 ///

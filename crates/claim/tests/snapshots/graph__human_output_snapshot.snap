@@ -1,0 +1,12 @@
+---
+source: crates/claim/tests/graph.rs
+expression: "String::from_utf8(out).unwrap()"
+---
+DECISION.md#x
+  └─ a
+DECISION.md#y
+  └─ b
+b
+  └─ a
+
+Not connected (1): c

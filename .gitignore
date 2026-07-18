@@ -1,3 +1,5 @@
 /target
 **/*.rs.bk
 .DS_Store
+# Claude Code's session state and agent worktrees — never repo content.
+.claude/

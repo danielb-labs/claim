@@ -587,6 +587,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
         <tr><td><code>claim amend</code></td><td>Resolve drift by fixing a claim&rsquo;s statement and check, keeping its history <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim retire</code></td><td>Close a claim on purpose with a note; its status becomes <code>retired</code> <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim stats</code></td><td>Pilot metrics: status and verdict counts, drifts caught, staleness <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim graph</code></td><td>Render the <code>supports</code> graph &mdash; each decision or claim, and the claims backing it <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim docs</code></td><td>Open the documentation bundled into this binary (version-locked to the tool you ran) <span class="chip done">shipped</span></td></tr>
       </tbody>
     </table>
@@ -649,6 +650,14 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     oldest last-verified time. The two &ldquo;kill metrics&rdquo; from the product design &mdash;
     false-alarm rate and minutes per claim &mdash; are reported as needing human input rather than
     fabricated, because the store does not observe them.</p>
+
+    <h3>claim graph</h3>
+    <p>Renders the store&rsquo;s <code>supports</code> graph: nodes are the claims and the decision refs
+    (or other claims) they back, edges are <code>claim &rarr; target</code>. The default is an ASCII view
+    grouped by target &mdash; each decision, then the claims backing it &mdash; and <code>--json</code>
+    emits a <code>{nodes, edges}</code> list an agent can traverse. Both are deterministic (sorted), so the
+    output diffs cleanly. It is deliberately light: filtering, transitive support, and real visualization
+    belong to the hub, not the standalone CLI.</p>
 
     <h3>claim docs</h3>
     <p>Locates this documentation site &mdash; the very page you are reading &mdash; from a copy
