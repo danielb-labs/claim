@@ -86,6 +86,17 @@ instead of hanging the tool, and **`libc`** for the one syscall std does not exp
 `killpg` — killing a timed-out check's whole process group so `sleep 100 | foo`
 leaves no orphaned grandchild (std's `process_group(0)` creates the group but gives
 no way to signal it); both unix-only and rationale in `crates/claim-core/Cargo.toml`.
+For the MCP server (item 07), **`rmcp`** — the official Model Context Protocol Rust
+SDK (github.com/modelcontextprotocol/rust-sdk) — which owns the protocol so the
+server stays a thin shell over core: it provides the JSON-RPC framing, the tool
+request/response shapes, and the stdio transport agents connect over, and its
+`macros` feature turns a plain method into a registered tool with a generated schema
+(`server` + `transport-io` + `macros` only; no client, no HTTP); **`tokio`**, the
+async runtime rmcp serves on; and **`schemars`**, which rmcp uses to derive each
+tool's input schema from its request type — rationale in
+`crates/claim-mcp/Cargo.toml`. (The store and git-provenance logic the CLI and the
+server both need lives in the shared **`claim-store`** workspace crate, extracted in
+item 07 so the two front doors read one store and attribute verdicts identically.)
 Adding any other dependency requires a one-line justification in the crate's
 `Cargo.toml` and a note in the review — every dependency is attack surface and
 maintenance.
