@@ -1603,4 +1603,323 @@ See [[libfoo-cjk-repro]] for the reproduction.
     fn days_display_round_trips() {
         assert_eq!(Days(nz(30)).to_string(), "30d");
     }
+
+    /// Parse a standalone claim, expecting failure, and return its error.
+    fn expect_err(text: &str) -> Error {
+        parse_claim_file("the/file.md", text).expect_err("expected a parse error")
+    }
+
+    #[test]
+    fn embedded_arrow_inside_a_value_does_not_truncate_the_block() {
+        // A `-->` inside a YAML string must not be mistaken for the closing fence:
+        // truncating here would silently drop the second check with no error, the
+        // exact "nag never a lie" break the fence-on-own-line rule prevents.
+        let host = "A fact.\n<!-- claim\nid: silent\nchecks:\n  - kind: agent\n    instruction: A --> B\n  - kind: cmd\n    run: second\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].checks.len(), 2);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "A --> B".to_owned()
+            }
+        );
+        assert_eq!(
+            claims[0].checks[1].kind,
+            CheckKind::Cmd {
+                run: "second".to_owned(),
+                negate: false
+            }
+        );
+    }
+
+    #[test]
+    fn indented_arrow_alone_in_block_scalar_does_not_truncate_the_block() {
+        // A `-->` alone on an indented line is block-scalar content, not the fence.
+        // Only an unindented `-->` closes the block. Matching on a trimmed line
+        // (leading whitespace stripped) would truncate here and silently drop the
+        // second check -- the same "nag never a lie" break as an inline arrow, via
+        // an indented one.
+        let host = "Fact.\n<!-- claim\nid: x\nchecks:\n  - kind: agent\n    instruction: |\n      line one\n      -->\n      line three\n  - kind: cmd\n    run: second\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].checks.len(), 2);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "line one\n-->\nline three\n".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn embedded_closer_must_be_alone_on_its_line() {
+        // A line that starts with `-->` but has trailing content is not a closer;
+        // only a `-->` alone on its line terminates the block. Here the arrow-led
+        // line lives inside a block scalar and must be carried into the value.
+        let host = "A fact.\n<!-- claim\nid: x\nchecks:\n  - kind: agent\n    instruction: |\n      step one\n      --> keep scanning\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "step one\n--> keep scanning\n".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn indented_dashes_in_a_block_scalar_are_not_the_closing_fence() {
+        // A `---` line inside a `|` block scalar is indented data, not the fence;
+        // a trimmed compare would truncate the frontmatter here and then reject it.
+        let text = "---\nid: a\nchecks:\n  - kind: agent\n    instruction: |\n      first line\n      ---\n      third line\n---\nStatement.\n";
+        let claim = parse_claim_file("f.md", text).unwrap();
+        assert_eq!(
+            claim.checks[0].kind,
+            CheckKind::Agent {
+                instruction: "first line\n---\nthird line\n".to_owned()
+            }
+        );
+        assert_eq!(claim.statement, "Statement.");
+    }
+
+    #[test]
+    fn embedded_keyword_needs_a_boundary() {
+        // `<!-- claims ...` and `<!-- claimant` are ordinary comments, not blocks,
+        // so an innocent comment is not turned into a whole-file parse error.
+        let host = "See the docs.\n<!-- claims are documented in docs/claims.md -->\nMore text.\n";
+        let claims = extract_embedded_claims("README.md", host).unwrap();
+        assert!(claims.is_empty());
+
+        let host2 = "<!-- claimant details below -->\n";
+        assert!(extract_embedded_claims("f.md", host2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dense_openers_without_newlines_are_bounded_and_correct() {
+        // Many `<!-- claim` substrings on a single newline-free line, none of them
+        // real openers (each followed by non-boundary text), must all be skipped
+        // and yield no claims — exercising the bounded backward scan.
+        let host = "<!-- claimA <!-- claimB <!-- claimC ".repeat(50);
+        assert!(extract_embedded_claims("f.md", &host).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unterminated_embedded_block_fails() {
+        // A block the author opened but never closed with a `-->` on its own line is
+        // a loud error, never a silently dropped claim (invariant #6).
+        let host = "A fact.\n<!-- claim\nid: x\nchecks:\n  - kind: cmd\n    run: a\n";
+        let err = extract_embedded_claims("host.md", host).expect_err("expected error");
+        let r = parse_reason(&err);
+        assert!(r.contains("unterminated") && r.contains("claim"), "{r}");
+        assert_eq!(parse_path(&err), "host.md");
+    }
+
+    #[test]
+    fn one_bad_embedded_block_fails_whole_extraction() {
+        // A malformed block must fail extraction, not be silently skipped: a host
+        // file dropping a claim it meant to declare is the quiet failure we forbid.
+        // The bad block uses a space in its id, which the id validator rejects.
+        let host = "Good.\n<!-- claim\nid: ok\nchecks:\n  - kind: cmd\n    run: a\n-->\n\nBad.\n<!-- claim\nid: bad id\nchecks:\n  - kind: cmd\n    run: a\n-->\n";
+        let err = extract_embedded_claims("host.md", host).expect_err("expected error");
+        let r = parse_reason(&err);
+        assert!(r.contains("bad id") && r.contains("contains ' '"), "{r}");
+    }
+
+    #[test]
+    fn harvests_wiki_links_deduped_and_ordered() {
+        let s = "See [[alpha]] and [[beta]], then [[alpha]] again, and [[  spaced  ]].";
+        let links = harvest_wiki_links(s);
+        assert_eq!(
+            links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            ["alpha", "beta", "spaced"]
+        );
+    }
+
+    #[test]
+    fn empty_wiki_link_brackets_are_not_links() {
+        assert!(harvest_wiki_links("nothing [[]] here and [[   ]] either").is_empty());
+    }
+
+    #[test]
+    fn unbalanced_wiki_brackets_do_not_capture_greedily() {
+        // A stray `[[` before a real link must not swallow the real target.
+        let links = harvest_wiki_links("[[ open without close and [[real]]");
+        assert_eq!(
+            links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            ["real"]
+        );
+    }
+
+    #[test]
+    fn wiki_links_do_not_span_a_newline() {
+        // A `[[` whose `]]` is on a later line is not a link.
+        let links = harvest_wiki_links("open [[start\nend]] and a real [[link]] here");
+        assert_eq!(
+            links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            ["link"]
+        );
+    }
+
+    #[test]
+    fn wiki_link_triple_brackets_takes_innermost() {
+        // `[[[x]]]` yields `x`, not `[x` with a stray leading bracket.
+        let links = harvest_wiki_links("nested [[[x]]] here");
+        assert_eq!(links.iter().map(|w| w.as_str()).collect::<Vec<_>>(), ["x"]);
+    }
+
+    #[test]
+    fn day_count_boundary_and_overflow() {
+        assert_eq!(parse_day_count("1d").unwrap(), nz(1));
+        assert_eq!(
+            parse_day_count(&format!("{}d", u32::MAX)).unwrap(),
+            nz(u32::MAX)
+        );
+        // One past u32 is rejected with a distinct "too large" message, not folded
+        // into the generic non-numeric error and not silently truncated.
+        let err = parse_day_count("4294967296d").unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn day_count_rejects_noncanonical_numbers() {
+        // Signs, leading zeros, and surrounding or embedded whitespace are
+        // rejected as firmly as `12.5d`, so `u32::from_str`'s leniency never leaks.
+        for bad in ["+30d", "-30d", "030d", " 30d", "\t30d", "3 0d", "30 d"] {
+            assert!(parse_day_count(bad).is_err(), "expected '{bad}' rejected");
+        }
+        // The leading-zero message points at the canonical spelling.
+        assert!(parse_day_count("007d")
+            .unwrap_err()
+            .contains("leading zero"));
+        // An all-zero count is reported as non-positive, not as a leading zero.
+        assert!(parse_day_count("000d").unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn misspelled_negate_is_rejected_not_silently_ignored() {
+        // `negated:` must not parse as `negate: false` and silently flip the
+        // check's sense; an unknown field on a check is an error naming the field.
+        let err = expect_err(
+            "---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    negated: true\n---\nS.\n",
+        );
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0]") && r.contains("unknown field 'negated'"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn field_belonging_to_another_kind_is_rejected() {
+        // `run` on a human check, `instruction` on a cmd check: each names the
+        // stray field and the kind it does not belong to.
+        let human_run = expect_err("---\nid: a\nchecks:\n  - kind: human\n    run: x\n---\nS.\n");
+        let r = parse_reason(&human_run);
+        assert!(
+            r.contains("unknown field 'run'") && r.contains("'human'"),
+            "{r}"
+        );
+
+        let cmd_instruction = expect_err(
+            "---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    instruction: y\n---\nS.\n",
+        );
+        let r = parse_reason(&cmd_instruction);
+        assert!(
+            r.contains("unknown field 'instruction'") && r.contains("'cmd'"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn malformed_yaml_fails_with_yaml_reason() {
+        let err = expect_err("---\nid: a\nchecks: [unclosed\n---\nS.\n");
+        assert!(
+            parse_reason(&err).contains("invalid YAML"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn id_wrong_type_fails() {
+        let err = expect_err("---\nid: 42\nchecks:\n  - kind: cmd\n    run: x\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.starts_with("id:") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn non_string_top_level_key_fails() {
+        let err = expect_err("---\n42: x\nid: a\nchecks:\n  - kind: cmd\n    run: x\n---\nS.\n");
+        assert!(
+            parse_reason(&err).contains("non-string field name"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn frontmatter_that_is_a_sequence_or_scalar_fails() {
+        let seq = expect_err("---\n- a\n- b\n---\nS.\n");
+        let r = parse_reason(&seq);
+        assert!(
+            r.contains("must be a YAML mapping") && r.contains("a list"),
+            "{r}"
+        );
+
+        let scalar = expect_err("---\njust a string\n---\nS.\n");
+        let r = parse_reason(&scalar);
+        assert!(
+            r.contains("must be a YAML mapping") && r.contains("a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn check_element_not_a_mapping_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - just-a-string\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.starts_with("checks[0]:") && r.contains("expected a mapping"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn kind_non_string_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: [cmd]\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0].kind") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn human_prompt_wrong_type_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: human\n    prompt: [a, b]\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0].prompt") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_with_crlf_line_endings_parses() {
+        let text =
+            "---\r\nid: a\r\nchecks:\r\n  - kind: cmd\r\n    run: x\r\n---\r\nStatement.\r\n";
+        let claim = parse_claim_file("f.md", text).unwrap();
+        assert_eq!(claim.id.as_str(), "a");
+    }
+
+    #[test]
+    fn leading_bom_before_fence_parses() {
+        let text = "\u{feff}---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n---\nS.\n";
+        let claim = parse_claim_file("f.md", text).unwrap();
+        assert_eq!(claim.id.as_str(), "a");
+    }
 }
