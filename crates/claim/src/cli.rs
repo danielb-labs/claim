@@ -64,7 +64,8 @@ pub enum Command {
     /// Pilot metrics: status and verdict counts, drifts caught, staleness.
     Stats(StatsArgs),
 
-    /// Render the `supports` graph: each decision or claim, and the claims backing it.
+    /// Render the `supports` graph: each claim and the decisions or claims it backs
+    /// (`--backers` flips it to each target and the claims backing it).
     Graph(GraphArgs),
 
     /// Open the product documentation bundled into this binary.
@@ -293,11 +294,20 @@ pub struct DriftArgs {}
 
 /// Arguments to `claim graph`: render the store's `supports` graph.
 ///
-/// No options in v1 — it reads the whole store from the current directory and prints
-/// the edges (ASCII grouped by target, or `--json` node/edge list). Richer views —
-/// filtering, transitive support, real visualization — belong to the hub, not here.
+/// It reads the whole store from the current directory and prints the edges. The
+/// default ASCII view groups by claim — each claim, then the targets it supports, a
+/// target that is itself a claim tagged `[claim]`; `--backers` flips to the inverse
+/// (each target, then the claims backing it). `--json` emits a direction-agnostic
+/// node/edge list unaffected by `--backers`. Richer views — filtering, transitive
+/// support, real visualization — belong to the hub, not here.
 #[derive(Debug, clap::Args)]
-pub struct GraphArgs {}
+pub struct GraphArgs {
+    /// Group by target instead of by claim: show each decision or claim and the claims
+    /// that back it ("who backs this?"), the inverse of the default grouped-by-claim
+    /// view. Ignored under `--json`, whose node/edge list is direction-agnostic.
+    #[arg(long)]
+    pub backers: bool,
+}
 
 /// Arguments to `claim retire <id>`: close a claim on purpose.
 ///
