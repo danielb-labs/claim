@@ -49,11 +49,13 @@ fn add_writes_the_claim_file_and_establishing_log() {
         .stdout(predicate::str::contains("git -C "))
         .stdout(predicate::str::contains(" add "));
 
-    // The claim file landed at the id-derived path and parses back.
+    // The claim file landed at the id-derived path and parses back. The single-scalar
+    // frontmatter fields are rendered quoted (the injection-hardening: a newline in a
+    // scalar is refused, and the value is quoted so it cannot confuse the scanner).
     assert!(repo.exists(".claims/libfoo-pin.md"));
     let file = repo.read(".claims/libfoo-pin.md");
-    assert!(file.contains("id: libfoo-pin"));
-    assert!(file.contains("max-age: 120d"));
+    assert!(file.contains("id: \"libfoo-pin\""));
+    assert!(file.contains("max-age: \"120d\""));
     assert!(file.contains("We pin libfoo at 4.2."));
 
     // Exactly one birth entry: the establishing Held. The default path witnesses no
@@ -253,8 +255,8 @@ fn negate_when_and_supports_render_and_round_trip() {
     let file = repo.read(".claims/payments/pin.md");
     assert!(file.contains("negate: true"), "negate is rendered: {file}");
     assert!(
-        file.contains("when: every 30d"),
-        "trigger is rendered: {file}"
+        file.contains("when: \"every 30d\""),
+        "trigger is rendered quoted: {file}"
     );
     // A decision ref with a `#` is quoted so YAML does not read it as a comment.
     assert!(
@@ -375,6 +377,64 @@ fn rejects_a_check_that_is_broken() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("Broken"));
+    assert!(!repo.exists(".claims/x.md"));
+}
+
+#[test]
+fn a_broken_refusal_prints_the_check_diagnostic() {
+    // Regression: on a refused establish `add` must show the check's evidence in human
+    // mode, "so the author sees why" — a broken command's diagnostic (the shell's
+    // "not found") is exactly the actionable line a refusal must not swallow. The
+    // refactor once dropped it by moving the evidence print to the success path only.
+    let repo = ready_repo();
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            "definitely-not-a-real-binary-xyzzy",
+            "--max-age",
+            "30d",
+        ])
+        .assert()
+        .code(2)
+        // The narration labels the refused verdict and the evidence carries the
+        // shell's own diagnostic, so the author can act on it.
+        .stderr(predicate::str::contains("[check] Broken"))
+        .stderr(predicate::str::contains(
+            "definitely-not-a-real-binary-xyzzy",
+        ))
+        .stderr(predicate::str::contains("not found"));
+    assert!(!repo.exists(".claims/x.md"));
+}
+
+#[test]
+fn a_drifted_refusal_prints_the_check_evidence() {
+    // The same contract on a Drifted refusal: the check's output (here the grep is
+    // silent, but the verdict label is still narrated) must be surfaced before the
+    // error, not swallowed.
+    let repo = ready_repo();
+    // A check whose output is visible on drift: grep a line that is not present but
+    // echo a diagnostic to stderr first, so there is evidence to show.
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            "echo 'pin is 4.2 not 9.9' >&2; grep -q 'libfoo==9.9' requirements.txt",
+            "--max-age",
+            "30d",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("[check] Drifted"))
+        .stderr(predicate::str::contains("pin is 4.2 not 9.9"));
     assert!(!repo.exists(".claims/x.md"));
 }
 
@@ -794,6 +854,84 @@ fn witness_cmd_is_refused_on_an_unborn_head() {
     assert!(
         !repo.exists(".claims/fresh.md"),
         "nothing written on refusal"
+    );
+}
+
+#[test]
+fn witness_cmd_does_not_run_when_the_establishing_check_is_doomed() {
+    // Regression: `--witness-cmd` must run only AFTER the id is confirmed new and the
+    // establishing check holds — it must NOT fire for an add that is already going to
+    // be refused. Here the establishing check is already Drifted (the pin is not 9.9),
+    // so the add fails fast; a side-effecting witness command must never execute.
+    let repo = ready_repo();
+    // A witness that records that it ran, at an absolute path OUTSIDE the isolated
+    // worktree, so its execution would be visible in the real repo.
+    let sentinel = repo.path().join("witness-ran-sentinel");
+    let witness = format!(
+        "touch {}; echo 'libfoo==5.0' > requirements.txt",
+        sentinel.display()
+    );
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "doomed",
+            "--statement",
+            "S.",
+            "--run",
+            "grep -q 'libfoo==9.9' requirements.txt", // already drifted
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            &witness,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("Drifted"));
+
+    assert!(
+        !sentinel.exists(),
+        "the witness command must not run for an add whose establishing check is doomed"
+    );
+    assert!(
+        !repo.exists(".claims/doomed.md"),
+        "nothing is written for a doomed add"
+    );
+}
+
+#[test]
+fn witness_cmd_does_not_run_for_a_duplicate_id() {
+    // The same fail-fast guarantee for a duplicate id: the witness (a side-effecting
+    // command) must not run when the add is doomed by an id that already exists.
+    let repo = ready_repo();
+    let base = [
+        "add",
+        "--id",
+        "dup",
+        "--statement",
+        "S.",
+        "--run",
+        HOLDS,
+        "--max-age",
+        "30d",
+    ];
+    repo.claim().args(base).assert().success();
+
+    let sentinel = repo.path().join("dup-witness-sentinel");
+    let witness = format!(
+        "touch {}; echo 'libfoo==5.0' > requirements.txt",
+        sentinel.display()
+    );
+    repo.claim()
+        .args(base)
+        .args(["--witness-cmd", &witness])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("already exists"));
+    assert!(
+        !sentinel.exists(),
+        "the witness command must not run when the id already exists"
     );
 }
 

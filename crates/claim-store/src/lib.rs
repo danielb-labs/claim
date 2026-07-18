@@ -18,6 +18,9 @@
 //!   and the MCP `create` tool call, so the two front doors take the same steps to
 //!   record a claim (run the check, require `Held`, write the file and birth
 //!   verdict, never commit) and cannot disagree about what authoring means.
+//! - [`render_claim`] — the one renderer that turns a claim's fields into the
+//!   `.claims/*.md` text, so `claim add` and `create` emit byte-identical files and
+//!   the injection-hardening of the frontmatter lives in exactly one place.
 //! - [`claim_matches_path`] — the "claims about these paths" prefix match both
 //!   `claim list` and the MCP `query` tool share, so the two cannot answer a path
 //!   query differently.
@@ -27,13 +30,17 @@
 //! error — without matching on prose. Everything terminal-, argument-, and
 //! output-shaped stays in the binaries; this crate is pure store-and-git logic.
 
+mod agent;
 mod author;
 mod error;
 pub mod git;
 mod path;
+mod render;
 mod store;
 
+pub use agent::{agent_runner_from_env, AgentCmdError, CLAIM_AGENT_CMD_ENV};
 pub use author::{author_claim, AuthorError, Authored, Provenance};
 pub use error::{GitError, StoreError};
 pub use path::{claim_matches_path, under_prefix};
+pub use render::{render_claim, CheckRender, ClaimRender, RenderError};
 pub use store::{discover, LoadError, LoadedClaim, Store, StoreLoad, CLAIMS_DIR, LOG_DIR};

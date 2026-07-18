@@ -35,7 +35,9 @@ use claim_core::{
     parse_claim_file, resolve_supports, CheckContext, Claim, ClaimId, Timestamp, Verdict,
 };
 use claim_store::git::short_commit;
-use claim_store::{author_claim, AuthorError, Store, StoreLoad};
+use claim_store::{
+    author_claim, render_claim, AuthorError, CheckRender, ClaimRender, Store, StoreLoad,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -202,8 +204,11 @@ pub fn run_create(
 ) -> Result<CreateResponse, CreateError> {
     let (claim, file_text) = build_claim(store, request)?;
 
-    let authored =
-        author_claim(store, &claim, &file_text, load, ctx, now, None).map_err(|e| match e {
+    // `create` has no `on_established` work, so the hook is a no-op — the witness dance
+    // is a CLI-only affordance. The gate (dup + require-Held) still lives entirely in
+    // `author_claim`, so `create` can never write a claim whose check did not hold.
+    let authored = author_claim(store, &claim, &file_text, load, ctx, now, |_| Ok(None)).map_err(
+        |e| match e {
             AuthorError::DuplicateId { .. } | AuthorError::IdAlreadyDeclared { .. } => {
                 CreateError::Duplicate(e.to_string())
             }
@@ -219,7 +224,12 @@ pub fn run_create(
             },
             AuthorError::Provenance(g) => CreateError::Provenance(g.to_string()),
             AuthorError::Write(w) => CreateError::Write(w),
-        })?;
+            // `create` passes a no-op hook, so it can never abort after the establish.
+            AuthorError::WitnessAborted => {
+                unreachable!("create's on_established hook never aborts")
+            }
+        },
+    )?;
 
     let claim_file = rel(store, &authored.claim_file);
     let log_file = rel(store, &authored.log_file);
@@ -230,8 +240,11 @@ pub fn run_create(
         verdict: verdict_word(authored.establishing.verdict).to_owned(),
         commit: short_commit(&authored.provenance.commit),
         actor: authored.provenance.actor,
+        // The store root is single-quoted so a path with spaces still yields a
+        // runnable `git -C` command; the claim/log paths and id are tool-controlled
+        // (validated ids, store-relative paths) and carry no spaces.
         commit_hint: format!(
-            "git -C {} add {claim_file} {log_file} && git commit -m \"Add claim {}\"",
+            "git -C '{}' add {claim_file} {log_file} && git commit -m \"Add claim {}\"",
             store.root().display(),
             claim.id,
         ),
@@ -244,21 +257,36 @@ pub fn run_create(
 /// Turn a request into a validated [`Claim`] and the exact file text to write.
 ///
 /// The exactly-one-of-`run`/`instruction` rule is enforced here, before rendering.
-/// The rendered text is validated by parsing it back through
-/// [`parse_claim_file`] — the same single validation path `claim add` uses — so a
-/// malformed id, an empty statement, a bad `max-age`, or an invalid trigger surfaces
-/// as the parser's own field-named error, never a hand-rolled check that could drift
-/// from the schema.
+/// The text comes from the shared [`render_claim`] (so `create` and `claim add` emit
+/// byte-identical files and share the frontmatter injection-hardening), and is
+/// validated by parsing it back through [`parse_claim_file`] — the single validation
+/// path — so a malformed id, an empty statement, a bad `max-age`, or an invalid
+/// trigger surfaces as the parser's own field-named error, and a newline-bearing
+/// scalar is refused by the renderer before any text is produced.
 fn build_claim(store: &Store, request: &CreateRequest) -> Result<(Claim, String), CreateError> {
     let when = request.when.as_deref().unwrap_or("on-change");
     let check = match (&request.run, &request.instruction) {
-        (Some(run), None) => CheckText::cmd(run, request.negate),
-        (None, Some(instruction)) => CheckText::agent(instruction),
+        (Some(run), None) => CheckRender::Cmd {
+            run,
+            negate: request.negate,
+        },
+        (None, Some(instruction)) => CheckRender::Agent { instruction },
         (Some(_), Some(_)) => return Err(CreateError::CheckKind { found: "both" }),
         (None, None) => return Err(CreateError::CheckKind { found: "neither" }),
     };
 
-    let text = render_claim(request, &check, when);
+    let render = ClaimRender {
+        id: &request.id,
+        max_age: &request.max_age,
+        check,
+        when,
+        supports: &request.supports,
+        statement: &request.statement,
+    };
+    // A newline/control character in id/max-age/when is refused here, before any text
+    // is produced — the injection guard both front doors share.
+    let text = render_claim(&render).map_err(|e| CreateError::Invalid(e.to_string()))?;
+
     // The id must parse before it can name the file path the parser error will cite.
     // Its validity is re-checked by parse_claim_file anyway; parsing it here only
     // picks a sensible path for the error message, falling back to a placeholder.
@@ -270,98 +298,6 @@ fn build_claim(store: &Store, request: &CreateRequest) -> Result<(Claim, String)
     let claim =
         parse_claim_file(&file_rel, &text).map_err(|e| CreateError::Invalid(e.to_string()))?;
     Ok((claim, text))
-}
-
-/// A single check's YAML lines, already quoted, for one of the two authored kinds.
-struct CheckText {
-    kind: &'static str,
-    /// The `run`/`instruction` payload line (`run: "…"` or `instruction: "…"`).
-    payload: String,
-    /// A `negate: true` line for a cmd check, else empty.
-    negate: String,
-}
-
-impl CheckText {
-    fn cmd(run: &str, negate: bool) -> Self {
-        CheckText {
-            kind: "cmd",
-            payload: format!("    run: {}\n", yaml_double_quoted(run)),
-            negate: if negate {
-                "    negate: true\n".to_owned()
-            } else {
-                String::new()
-            },
-        }
-    }
-
-    fn agent(instruction: &str) -> Self {
-        CheckText {
-            kind: "agent",
-            payload: format!("    instruction: {}\n", yaml_double_quoted(instruction)),
-            negate: String::new(),
-        }
-    }
-}
-
-/// Render the claim's `.claims/*.md` text: `---`-fenced YAML frontmatter, then the
-/// statement body. Minimal and canonical, mirroring the CLI's renderer; the result is
-/// validated by the caller's round-trip through the parser, so a rendering slip is
-/// caught before anything is written, never after.
-fn render_claim(request: &CreateRequest, check: &CheckText, when: &str) -> String {
-    let mut out = String::new();
-    out.push_str("---\n");
-    out.push_str(&format!("id: {}\n", request.id));
-    out.push_str("checks:\n");
-    out.push_str(&format!("  - kind: {}\n", check.kind));
-    out.push_str(&check.payload);
-    out.push_str(&check.negate);
-    out.push_str(&format!("    when: {when}\n"));
-    out.push_str(&format!("max-age: {}\n", request.max_age));
-    if !request.supports.is_empty() {
-        out.push_str("supports:\n");
-        for target in &request.supports {
-            out.push_str(&format!("  - {}\n", yaml_scalar(target)));
-        }
-    }
-    out.push_str("---\n");
-    out.push_str(request.statement.trim());
-    out.push('\n');
-    out
-}
-
-/// A YAML scalar safe unquoted when it has no special leading char or interior colon,
-/// and double-quoted otherwise. Conservative: when in doubt, quote. Mirrors the CLI's
-/// `yaml_scalar` so `supports` targets render identically across the two front doors.
-fn yaml_scalar(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.contains([':', '#', '"', '\'', '\n'])
-        || s.starts_with([
-            ' ', '-', '?', '[', ']', '{', '}', '&', '*', '!', '|', '>', '@', '`',
-        ])
-        || s.ends_with(' ');
-    if needs_quote {
-        yaml_double_quoted(s)
-    } else {
-        s.to_owned()
-    }
-}
-
-/// A YAML double-quoted scalar with `\` and `"` escaped. Used for the check payload
-/// (a command or instruction is dense with characters YAML treats specially).
-fn yaml_double_quoted(s: &str) -> String {
-    let mut q = String::with_capacity(s.len() + 2);
-    q.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => q.push_str("\\\\"),
-            '"' => q.push_str("\\\""),
-            '\n' => q.push_str("\\n"),
-            '\t' => q.push_str("\\t"),
-            other => q.push(other),
-        }
-    }
-    q.push('"');
-    q
 }
 
 /// Warn for each `supports` target that does not resolve now, phrased for the agent
@@ -769,18 +705,32 @@ mod tests {
 
     #[test]
     fn a_cmd_check_with_metacharacters_round_trips() {
-        // A command dense with YAML-special characters (`:`, `#`, quotes, a pipe) must
-        // render and parse back so the claim holds — the round-trip through the parser
-        // is what proves the quoting is right.
+        // A command dense with YAML-special characters (`:`, `#`, a pipe, single AND
+        // embedded double quotes) must render and parse back so the claim holds — the
+        // embedded `"` exercises the double-quote escape in the shared renderer.
         let s = TestStore::new();
         let load = s.store.load_all().unwrap();
         let request = req(
             "meta",
             "S.",
-            Some("grep -q 'libfoo==4.2' requirements.txt || echo 'x: y # z'"),
+            Some("grep -q 'libfoo==4.2' requirements.txt || echo \"x: y # z\""),
             None,
         );
         let resp = run_create(&s.store, &request, &load, &ctx(&s), ts()).unwrap();
         assert_eq!(resp.verdict, "held");
+    }
+
+    #[test]
+    fn a_crafted_max_age_cannot_inject_a_phantom_supports_edge() {
+        // The integrity guard the shared renderer enforces: a `max_age` crafted to
+        // carry a newline and a fake `supports:` block is refused before any text is
+        // produced, so it cannot slip a valid-but-unrequested edge past the round-trip.
+        let s = TestStore::new();
+        let load = s.store.load_all().unwrap();
+        let mut request = req("inj", "S.", Some("true"), None);
+        request.max_age = "30d\nsupports:\n  - injected".to_owned();
+        let err = run_create(&s.store, &request, &load, &ctx(&s), ts()).unwrap_err();
+        assert!(matches!(err, CreateError::Invalid(_)), "got {err:?}");
+        assert!(!s.root().join(".claims/inj.md").exists(), "nothing written");
     }
 }

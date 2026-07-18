@@ -9,8 +9,8 @@
 //! functions, which are unit-tested without this shell. Nothing here decides
 //! whether a claim is fresh or whether a verdict may be recorded.
 
-use claim_core::{AgentRunner, CheckContext, ClaimId, Timestamp};
-use claim_store::{discover, Store, StoreError, StoreLoad};
+use claim_core::{CheckContext, ClaimId, Timestamp};
+use claim_store::{agent_runner_from_env, discover, Store, StoreError, StoreLoad};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ErrorData, Implementation, ServerCapabilities, ServerInfo};
@@ -141,53 +141,19 @@ impl ClaimServer {
     ) -> Result<Json<CreateResponse>, ErrorData> {
         let store = discover_store()?;
         let load = load_store(&store)?;
-        // The agent runner, if any, comes from CLAIM_AGENT_CMD — the same opt-in as
-        // `claim check`. With none, an agent check is unverifiable and the create is
-        // refused: a claim cannot be established by a check that could not run.
-        let ctx = CheckContext::new(store.root()).with_agent_runner(agent_runner_from_env()?);
+        // The agent runner, if any, comes from CLAIM_AGENT_CMD via the shared reader —
+        // the same opt-in `claim check` uses, so the two agree on the contract. With
+        // none, an agent check is unverifiable and the create is refused: a claim
+        // cannot be established by a check that could not run. A blank/non-UTF-8 value
+        // is a misconfigured environment, not a request fault, so it is internal_error.
+        let runner =
+            agent_runner_from_env().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let ctx = CheckContext::new(store.root()).with_agent_runner(runner);
         let now = now();
         match run_create(&store, &request, &load, &ctx, now) {
             Ok(response) => Ok(Json(response)),
             Err(e) => Err(create_error_to_mcp(&e)),
         }
-    }
-}
-
-/// The environment variable that supplies the runner for an `agent` check, the same
-/// opt-in `claim check` uses: a shell command fed the verdict prompt on stdin,
-/// emitting the verdict JSON on stdout. Unset — the default — means no runner, so an
-/// agent check is `Unverifiable` and `create` refuses it rather than reaching a model.
-const CLAIM_AGENT_CMD_ENV: &str = "CLAIM_AGENT_CMD";
-
-/// Resolve the agent runner from [`CLAIM_AGENT_CMD_ENV`], if set.
-///
-/// A whitespace-only value is rejected loudly rather than silently ignored — a run
-/// that meant to configure a runner but set it to blank must not quietly leave agent
-/// checks unverifiable. Unset returns `Ok(None)` — the ordinary default. A set value
-/// is a [`AgentRunner::Shell`] so an operator can express the runner as a one-liner,
-/// exactly as the CLI does.
-///
-/// # Errors
-///
-/// Returns an [`ErrorData::internal_error`] when the variable is set to a non-UTF-8
-/// value or to blank whitespace: the request is fine, the *environment* is
-/// misconfigured, so it is not a caller mistake to fix by resending.
-fn agent_runner_from_env() -> Result<Option<AgentRunner>, ErrorData> {
-    match std::env::var(CLAIM_AGENT_CMD_ENV) {
-        Ok(cmd) if cmd.trim().is_empty() => Err(ErrorData::internal_error(
-            format!(
-                "{CLAIM_AGENT_CMD_ENV} is set but empty; unset it to leave agent checks \
-                 unverifiable, or set it to a runner command that reads the prompt on stdin and \
-                 prints the verdict JSON on stdout"
-            ),
-            None,
-        )),
-        Ok(cmd) => Ok(Some(AgentRunner::Shell(cmd))),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ErrorData::internal_error(
-            format!("{CLAIM_AGENT_CMD_ENV} is set to a non-UTF-8 value"),
-            None,
-        )),
     }
 }
 

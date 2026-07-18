@@ -115,36 +115,66 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     let existing = store.load_all()?;
     warn_unresolved_supports(&store, &existing, &claim);
 
-    // Optional: witness the check going red in an isolated worktree, for extra
-    // confidence that it discriminates. Never touches the caller's tree. This runs
-    // before the shared establish-and-write: on failure it refuses here, writing
-    // nothing, exactly as a refused establishing run would. When it succeeds, its
-    // observed-red note is folded onto the birth entry as evidence.
     let check = primary_cmd_check(&claim)
         .context("claim add authors a single cmd check; this claim has none to run")?;
-    let witness_note = if let Some(witness_cmd) = &args.witness_cmd {
-        // The isolated worktree needs a commit to check out; resolve it before the
-        // dance so an unborn HEAD is refused with the fix rather than failing mid-git.
-        let head = git::resolve_commit(store.root())?;
-        witness_in_isolation(&store, &head, check, witness_cmd, format)?;
-        Some(witness_note())
-    } else {
-        None
-    };
 
     note(format, "Running the check against the current tree...");
     let ctx = CheckContext::new(store.root());
     let now = Timestamp::now();
-    let authored = author_claim(
+
+    // The optional `--witness-cmd` dance runs as the `on_established` hook — after
+    // `author_claim` has confirmed the id is new and the establishing check holds — so
+    // its isolated worktree and side-effecting witness command never fire for an add
+    // that a duplicate id or a non-holding check has already doomed (fail fast before
+    // any side effect). On success its observed-red note is folded onto the birth
+    // entry. A witness failure is a CLI contract error whose `ErrorKind` the JSON
+    // output must preserve, so it is stashed here and re-raised after `author_claim`
+    // returns, rather than flattened through `AuthorError`.
+    let mut witness_error: Option<anyhow::Error> = None;
+    let on_established = |_outcome: &CheckOutcome| -> Result<Option<String>, AuthorError> {
+        let Some(witness_cmd) = &args.witness_cmd else {
+            return Ok(None);
+        };
+        let head = git::resolve_commit(store.root()).map_err(AuthorError::Provenance)?;
+        match witness_in_isolation(&store, &head, check, witness_cmd, format) {
+            Ok(()) => Ok(Some(witness_note())),
+            Err(e) => {
+                // Stash the real (kind-bearing) error and abort the write with a
+                // sentinel; the stash is re-raised below so `main` sees the original.
+                witness_error = Some(e);
+                Err(AuthorError::WitnessAborted)
+            }
+        }
+    };
+
+    let authored = match author_claim(
         &store,
         &claim,
         &file_text,
         &existing,
         &ctx,
         now,
-        witness_note,
-    )
-    .map_err(map_author_error)?;
+        on_established,
+    ) {
+        Ok(authored) => authored,
+        Err(AuthorError::WitnessAborted) => {
+            return Err(witness_error.expect("WitnessAborted is set only after stashing the error"))
+        }
+        Err(e) => {
+            // Restore main's contract: a refused establish shows the check's
+            // evidence in human mode so the author sees *why* (e.g. `sh: cmd: not
+            // found`), before the error itself. `map_author_error` only renders the
+            // message and kind, so the evidence must be surfaced here where the
+            // format is known.
+            if let AuthorError::NotHeld {
+                verdict, evidence, ..
+            } = &e
+            {
+                show_refused_evidence(format, *verdict, evidence.as_deref());
+            }
+            return Err(map_author_error(e));
+        }
+    };
 
     show_evidence(format, "check", &authored.establishing);
     report_created(
@@ -156,11 +186,25 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     )
 }
 
+/// Narrate a refused establishing check's verdict and evidence in human mode, before
+/// the error is raised — the "so the author sees why" contract the establishing run
+/// has always kept. Silent in `--json` mode, where the message and evidence would
+/// contaminate the single error object on stderr; the JSON error carries the reason in
+/// its message instead.
+fn show_refused_evidence(format: Format, verdict: Verdict, evidence: Option<&str>) {
+    note(format, &format!("  [check] {}", verdict_label(verdict)));
+    if let Some(ev) = evidence {
+        for line in ev.lines() {
+            note(format, &format!("    | {line}"));
+        }
+    }
+}
+
 /// Map a shared [`AuthorError`] onto the CLI's [`ErrorKind`]s, so the `--json` error
-/// object carries the stable `kind` an agent branches on. The witnessed-red refusal
-/// never reaches here (it fails earlier in [`run`]); a `NotHeld` from the
-/// establishing run is classified by *which* verdict was observed, matching the
-/// distinct `drifted-green`/`broken-green` kinds the CLI has always used.
+/// object carries the stable `kind` an agent branches on. `WitnessAborted` never
+/// reaches here (it is handled in [`run`], which re-raises the stashed witness error);
+/// a `NotHeld` from the establishing run is classified by *which* verdict was observed,
+/// matching the distinct `drifted-green`/`broken-green` kinds the CLI has always used.
 fn map_author_error(err: AuthorError) -> anyhow::Error {
     match err {
         // The two duplicate cases keep their distinct "already exists at" / "already
@@ -169,9 +213,7 @@ fn map_author_error(err: AuthorError) -> anyhow::Error {
         dup @ (AuthorError::DuplicateId { .. } | AuthorError::IdAlreadyDeclared { .. }) => {
             app(ErrorKind::DuplicateId, dup.to_string())
         }
-        // A `Drifted` fact is already false; a `Broken`/`Unverifiable` check could not
-        // run. Both refuse the establish, and each keeps its distinct
-        // `drifted-green`/`broken-green` kind the CLI has always used.
+        // A `Drifted` fact is already false against the current tree.
         AuthorError::NotHeld {
             verdict: Verdict::Drifted,
             status,
@@ -184,22 +226,42 @@ fn map_author_error(err: AuthorError) -> anyhow::Error {
                  first."
             ),
         ),
+        // A `Broken` check could not run: the command errored.
         AuthorError::NotHeld {
-            verdict: verdict @ (Verdict::Broken | Verdict::Unverifiable),
+            verdict: Verdict::Broken,
             status,
             ..
         } => app(
             ErrorKind::BrokenGreen,
             format!(
-                "the check is {} against the current tree ({status}): it cannot run, so it cannot \
-                 be trusted. Fix the command first.",
-                verdict_label(verdict)
+                "the check is Broken against the current tree ({status}): it cannot run, so it \
+                 cannot be trusted. Fix the command first."
+            ),
+        ),
+        // `Unverifiable` here means an agent/human check reached `add`, which authors
+        // only cmd checks in v1 — a distinct message from Broken, restoring main's.
+        AuthorError::NotHeld {
+            verdict: Verdict::Unverifiable,
+            status,
+            ..
+        } => app(
+            ErrorKind::BrokenGreen,
+            format!(
+                "the check is Unverifiable ({status}): claim add authors cmd checks, which never \
+                 return this; this indicates an agent/human check, not supported by add in v1."
             ),
         ),
         AuthorError::NotHeld {
             verdict: Verdict::Held,
             ..
         } => unreachable!("author_claim returns NotHeld only for a non-Held verdict"),
+        // The caller-hook sentinel is handled in `run` before this maps anything; if it
+        // ever reached here it would be a logic error, so name it rather than defaulting.
+        AuthorError::WitnessAborted => {
+            unreachable!(
+                "WitnessAborted is intercepted in run() and re-raised as the witness error"
+            )
+        }
         // Provenance (no git identity, corrupt HEAD) and Write (I/O) are environment
         // faults with no specific contract kind; they surface as `other` with the
         // shared crate's message, whose cause chain names the fix.

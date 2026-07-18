@@ -130,6 +130,14 @@ pub enum AuthorError {
     /// entry).
     #[error("could not write the claim: {0}")]
     Write(String),
+
+    /// The `on_established` hook aborted the write after the establishing check held.
+    /// A sentinel the *caller* returns from its hook to stop authoring while keeping
+    /// its own richer error (e.g. the CLI's `--witness-cmd` failure, whose stable
+    /// `ErrorKind` must survive) out of band; `author_claim` writes nothing and
+    /// propagates it. Never produced by `author_claim` itself.
+    #[error("authoring was aborted after the establishing check by the caller's hook")]
+    WitnessAborted,
 }
 
 impl AuthorError {
@@ -157,11 +165,6 @@ impl AuthorError {
 /// and the caller's supports warning share one load). `now` is a parameter so the
 /// recorded instant is deterministic under test.
 ///
-/// `extra_evidence` is folded ahead of the check's own evidence on the birth entry,
-/// for a caller that has an additional note to record — `claim add --witness-cmd`
-/// records the red it observed in isolation here. It is `None` for the ordinary
-/// path.
-///
 /// The order is deliberate and load-bearing:
 ///
 /// 1. **Duplicate-id refusal**, before anything runs — a second claim under the same
@@ -171,9 +174,19 @@ impl AuthorError {
 /// 3. **The establishing run**, requiring `Held` — the honesty gate (invariant #5).
 ///    `Drifted`/`Broken`/`Unverifiable` are refused with the observed evidence,
 ///    writing nothing.
-/// 4. **The write**, only on `Held` — the claim file with `create_new` (so a file
-///    that appeared since the duplicate check is never clobbered) and one birth
-///    verdict.
+/// 4. **`on_established`**, only after `Held` and only if steps 1–3 passed — a hook
+///    for a caller that must do work *between* a confirmed establish and the write and
+///    that must NOT run when the add is going to be refused. `claim add --witness-cmd`
+///    perturbs an isolated worktree here, so its side-effecting command never runs for
+///    an add that a duplicate id or a non-holding check has already doomed. The hook
+///    returns an optional evidence note (folded ahead of the check's own evidence on
+///    the birth entry) or aborts the write with an [`AuthorError`].
+/// 5. **The write**, only after the hook succeeds — the claim file with `create_new`
+///    (so a file that appeared since the duplicate check is never clobbered) and one
+///    birth verdict.
+///
+/// The ordinary path with no hook work passes an `on_established` that returns
+/// `Ok(None)`.
 ///
 /// The caller keeps the establishing [`CheckOutcome`] via [`Authored`] for its own
 /// narration; the evidence on a refusal rides in [`AuthorError::NotHeld`].
@@ -183,7 +196,9 @@ impl AuthorError {
 /// Returns the matching [`AuthorError`] for each rule it fails, and never writes a
 /// claim when it returns `Err`. A [`AuthorError::NotHeld`] carries the refused
 /// verdict and its evidence; a [`AuthorError::DuplicateId`] names the conflict; a
-/// [`AuthorError::Provenance`] or [`AuthorError::Write`] is an environment fault.
+/// [`AuthorError::Provenance`] or [`AuthorError::Write`] is an environment fault; and
+/// an `on_established` that fails aborts before the write with whatever
+/// [`AuthorError`] it returns.
 pub fn author_claim(
     store: &Store,
     claim: &Claim,
@@ -191,7 +206,7 @@ pub fn author_claim(
     existing: &StoreLoad,
     ctx: &CheckContext,
     now: Timestamp,
-    extra_evidence: Option<String>,
+    on_established: impl FnOnce(&CheckOutcome) -> Result<Option<String>, AuthorError>,
 ) -> Result<Authored, AuthorError> {
     reject_duplicate(store, existing, claim)?;
 
@@ -207,6 +222,11 @@ pub fn author_claim(
     if outcome.verdict != Verdict::Held {
         return Err(AuthorError::not_held(&outcome));
     }
+
+    // The hook runs only now — after the id is confirmed new and the check is confirmed
+    // to hold — so a caller's side-effecting work (the `--witness-cmd` dance) never
+    // fires for an add that is already going to be refused.
+    let extra_evidence = on_established(&outcome)?;
 
     write_claim_and_log(
         store,
@@ -392,7 +412,10 @@ mod tests {
         );
         let existing = repo.store.load_all().unwrap();
 
-        let out = author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), None).unwrap();
+        let out = author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap();
 
         assert_eq!(out.establishing.verdict, Verdict::Held);
         assert!(out.claim_file.exists(), "the claim file was written");
@@ -414,8 +437,10 @@ mod tests {
         let (c, text) = claim("x", "S.", "grep -q 'libfoo==9.9' requirements.txt");
         let existing = repo.store.load_all().unwrap();
 
-        let err =
-            author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), None).unwrap_err();
+        let err = author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -442,8 +467,10 @@ mod tests {
         let (c, text) = claim("x", "S.", "this-binary-does-not-exist-anywhere");
         let existing = repo.store.load_all().unwrap();
 
-        let err =
-            author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), None).unwrap_err();
+        let err = author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -466,8 +493,10 @@ mod tests {
         let c = claim_core::parse_claim_file(".claims/a.md", text).unwrap();
         let existing = repo.store.load_all().unwrap();
 
-        let err =
-            author_claim(&repo.store, &c, text, &existing, &repo.ctx(), ts(), None).unwrap_err();
+        let err = author_claim(&repo.store, &c, text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -486,13 +515,24 @@ mod tests {
         let repo = TestRepo::new();
         let (c, text) = claim("dup", "S.", "true");
         let existing = repo.store.load_all().unwrap();
-        author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), None).unwrap();
+        author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap();
 
         // Re-load so the second author sees the first claim.
         let existing = repo.store.load_all().unwrap();
         let (c2, text2) = claim("dup", "S2.", "true");
-        let err =
-            author_claim(&repo.store, &c2, &text2, &existing, &repo.ctx(), ts(), None).unwrap_err();
+        let err = author_claim(
+            &repo.store,
+            &c2,
+            &text2,
+            &existing,
+            &repo.ctx(),
+            ts(),
+            |_| Ok(None),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, AuthorError::DuplicateId { .. }),
             "got {err:?}"
@@ -504,7 +544,10 @@ mod tests {
         let repo = TestRepo::new();
         let (c, text) = claim("pin", "S.", "true");
         let existing = repo.store.load_all().unwrap();
-        author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), None).unwrap();
+        author_claim(&repo.store, &c, &text, &existing, &repo.ctx(), ts(), |_| {
+            Ok(None)
+        })
+        .unwrap();
 
         // The claim file and verdict are on disk but uncommitted: a write to the truth
         // is a commit the caller makes.

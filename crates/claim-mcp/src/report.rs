@@ -190,8 +190,10 @@ pub fn run_report(
         verdict: verdict_word(verdict).to_owned(),
         commit: short_commit(&commit),
         actor,
+        // The store root is single-quoted so a path with spaces still yields a runnable
+        // `git -C` command; the log path and id are tool-controlled and carry no spaces.
         commit_hint: format!(
-            "git -C {} add {log_file} && git commit -m \"claim: record {} verdict for {}\"",
+            "git -C '{}' add {log_file} && git commit -m \"claim: record {} verdict for {}\"",
             store.root().display(),
             verdict_word(verdict),
             request.id,
