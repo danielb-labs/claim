@@ -155,13 +155,26 @@ pub struct AddArgs {
     pub witness_cmd: Option<String>,
 }
 
-/// The scriptable exit-code contract for `claim check`, shown under
-/// `--help`/`--long-help` so a CI author sees it without reading the source.
+/// The scriptable exit-code contract and the agent-runner env var for
+/// `claim check`, shown under `--help`/`--long-help` so a CI author sees both
+/// without reading the source.
 const CHECK_EXIT_HELP: &str = "\
 EXIT CODES (highest applicable wins, 2 > 1 > 0):
   0  every check held and every support resolved
   1  a drifted or unverifiable verdict, or an unresolved support (review needed)
-  2  a broken check, an unloadable/duplicate-id claim file, or a tool error";
+  2  a broken check, an unloadable/duplicate-id claim file, or a tool error
+
+ENVIRONMENT:
+  CLAIM_AGENT_CMD  Opt in to executing 'kind: agent' checks. Set it to a shell
+                   command that receives the verdict prompt on stdin and prints a
+                   single JSON object on stdout:
+                     {\"verdict\":\"held\"|\"drifted\"|\"unverifiable\",
+                      \"evidence\":\"...\",\"citations\":[\"...\"]}
+                   A crash, timeout, non-zero exit, or malformed output is Broken,
+                   never a pass. Unset (the default), agent checks are Unverifiable
+                   and no runner is spawned. The runner is yours to provide (e.g. a
+                   wrapper around a model CLI); its cost and budget are your
+                   responsibility. See docs/agent-checks.md.";
 
 /// Arguments to `claim check`: the verify loop.
 ///

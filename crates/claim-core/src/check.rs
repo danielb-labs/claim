@@ -16,10 +16,13 @@
 //!   pass, so a `negate` check whose binary is missing stays `Broken` — never a
 //!   false green. The command is never wrapped in a shell `!`, which would let a
 //!   missing binary invert to success.
-//! - **#6, the failure mode is a nag.** An `agent` or `human` check is not
-//!   silently treated as passing: [`run_check`] returns [`Verdict::Unverifiable`]
-//!   with a note that it needs a lane not built in v1, so the claim ages toward a
-//!   human instead of faking freshness.
+//! - **#6, the failure mode is a nag.** A `human` check, and an `agent` check with
+//!   no runner configured, is not silently treated as passing: [`run_check`]
+//!   returns [`Verdict::Unverifiable`] with a note that it needs a lane the run was
+//!   not given, so the claim ages toward a human instead of faking freshness. When
+//!   an [`AgentRunner`] *is* configured, an `agent` check runs it under the same
+//!   honesty mapping as `cmd`: a crash, a timeout, or output that is not a
+//!   well-formed verdict is [`Verdict::Broken`], never a fabricated pass.
 //!
 //! **Authorization.** A check's `run` string is executed via the platform shell
 //! with no sandboxing here. This is authorized by construction: the command lives
@@ -87,7 +90,9 @@ pub struct CheckContext {
     /// The directory the command runs in. A `cmd` check's `run` string is
     /// interpreted relative to this, so it must be the root the claim's paths are
     /// written against. A missing or non-directory path makes the check
-    /// [`Verdict::Broken`] (a spawn failure), never a pass.
+    /// [`Verdict::Broken`] (a spawn failure), never a pass. An `agent` runner is
+    /// spawned in this directory too, so an instruction that inspects the tree
+    /// reads the same root the claim's paths are written against.
     pub cwd: PathBuf,
     /// The wall-clock budget. On expiry the check's process group is killed and
     /// the verdict is [`Verdict::Broken`]. See [`DEFAULT_TIMEOUT`].
@@ -96,22 +101,71 @@ pub struct CheckContext {
     /// evidence. Output past this is dropped and the evidence notes truncation.
     /// See [`DEFAULT_OUTPUT_CAP`].
     pub output_cap: usize,
+    /// The runner an [`CheckKind::Agent`] check is executed by, if any. `None` —
+    /// the default — means agent checks are *not executed*: they return
+    /// [`Verdict::Unverifiable`] with a "no agent runner configured" note, never a
+    /// fabricated pass, and no subprocess is spawned. This is what makes agent
+    /// execution strictly opt-in: a run that was handed no runner cannot spawn one
+    /// or reach a model. See [`AgentRunner`].
+    pub agent_runner: Option<AgentRunner>,
+}
+
+/// How an [`CheckKind::Agent`] check is executed: the operator-supplied command
+/// that receives the verdict prompt on stdin and must emit the verdict JSON on
+/// stdout.
+///
+/// This is deliberately an operator's concern, not the tool's: `claim-core` never
+/// embeds a model client or a network call. The runner is whatever wrapper the
+/// operator provides around a model CLI (its cost and credentials theirs to own),
+/// and the tool's single job is to feed it the prompt, bound its run exactly like a
+/// `cmd` check, and map its structured answer to a [`Verdict`] under the same
+/// honesty contract — a crash, a timeout, or malformed output is [`Verdict::Broken`],
+/// never a pass. The contract the runner must satisfy is documented on
+/// [`build_agent_prompt`] and `docs/agent-checks.md`.
+#[derive(Debug, Clone)]
+pub enum AgentRunner {
+    /// An argv: `program[0]` executed directly with `program[1..]` as its
+    /// arguments, no shell involved. The prompt is written to the program's stdin.
+    /// An empty argv is a spawn failure (`Broken`), never a pass.
+    Argv(Vec<String>),
+    /// A shell command run as `sh -c <command>`, for a runner an operator finds
+    /// easier to express as a one-liner (a pipeline, an env-substituted flag). The
+    /// prompt is written to the shell's stdin. This is the *runner* command an
+    /// operator configured and reviewed, not a claim's `run`; it is never wrapped
+    /// in a `!` and its exit code is classified by the tool, so the negation and
+    /// broken-never-passes invariants still hold.
+    Shell(String),
 }
 
 impl CheckContext {
-    /// A context rooted at `cwd` with the default timeout and output cap.
+    /// A context rooted at `cwd` with the default timeout and output cap and no
+    /// agent runner.
     ///
     /// The one field with no sensible default is where the check runs, so it is
-    /// the only argument; [`timeout`](CheckContext::timeout) and
-    /// [`output_cap`](CheckContext::output_cap) can be overwritten after
-    /// construction.
+    /// the only argument; [`timeout`](CheckContext::timeout),
+    /// [`output_cap`](CheckContext::output_cap), and
+    /// [`agent_runner`](CheckContext::agent_runner) can be overwritten after
+    /// construction. Agent checks are unverifiable until a runner is set, so the
+    /// default context never spawns an agent.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         CheckContext {
             cwd: cwd.into(),
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
+            agent_runner: None,
         }
+    }
+
+    /// The same context with `runner` set as the agent runner.
+    ///
+    /// A convenience for the CLI, which builds one context and, if `CLAIM_AGENT_CMD`
+    /// is set, attaches the runner it parsed. Passing `None` leaves agent checks
+    /// unverifiable, the same as never calling this.
+    #[must_use]
+    pub fn with_agent_runner(mut self, runner: Option<AgentRunner>) -> Self {
+        self.agent_runner = runner;
+        self
     }
 }
 
@@ -246,11 +300,15 @@ impl CheckOutcome {
 /// process — notably `claim-mcp` — must be aware that this handler exists
 /// process-wide, not scoped to this call.
 ///
-/// Only [`CheckKind::Cmd`] is executed. An [`CheckKind::Agent`] or
-/// [`CheckKind::Human`] check returns [`Verdict::Unverifiable`] with a note that
-/// it needs a lane not built in v1: it is *not* silently passed, so the claim
-/// ages toward a human (invariant #6). The exhaustive `match` on [`CheckKind`]
-/// means a future kind cannot be added without a decision here being forced.
+/// A [`CheckKind::Cmd`] check is always executed. A [`CheckKind::Agent`] check is
+/// executed only when the context carries an [`AgentRunner`]
+/// ([`CheckContext::agent_runner`]); with no runner it returns
+/// [`Verdict::Unverifiable`] with a "no agent runner configured" note, and *no*
+/// subprocess is spawned — agent execution is strictly opt-in, so a default run
+/// never reaches a model. A [`CheckKind::Human`] check is never executed. A
+/// not-executed check is *not* silently passed, so the claim ages toward a human
+/// (invariant #6). The exhaustive `match` on [`CheckKind`] means a future kind
+/// cannot be added without a decision here being forced.
 ///
 /// This is the primitive every verb that runs a check builds on: `claim add` and
 /// `claim amend` call it against the current tree expecting [`Verdict::Held`], and
@@ -263,18 +321,7 @@ impl CheckOutcome {
 pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
     match &check.kind {
         CheckKind::Cmd { run, negate } => run_cmd(run, *negate, ctx),
-        CheckKind::Agent { .. } => CheckOutcome {
-            verdict: Verdict::Unverifiable,
-            end: ProcessEnd::NotExecuted {
-                note: "agent investigation lane, not built in v1".to_owned(),
-            },
-            evidence: Some(
-                "agent checks are not executed in v1; this claim needs the agent \
-                 investigation lane, which is not built yet"
-                    .to_owned(),
-            ),
-            duration: Duration::ZERO,
-        },
+        CheckKind::Agent { instruction } => run_agent(instruction, ctx),
         CheckKind::Human { .. } => CheckOutcome {
             verdict: Verdict::Unverifiable,
             end: ProcessEnd::NotExecuted {
@@ -326,6 +373,371 @@ fn run_cmd(run: &str, negate: bool, ctx: &CheckContext) -> CheckOutcome {
         evidence: evidence_from(output, ctx.output_cap),
         duration,
     }
+}
+
+/// Execute an `agent` check by running the configured [`AgentRunner`] and mapping
+/// its structured answer to a verdict under the same broken-never-passes contract
+/// as `cmd`.
+///
+/// This is the second place a check becomes a judgement, so invariant #1 is
+/// enforced here as strictly as in [`classify_exit`]. The mapping is total and
+/// leaves no path from a misbehaving or malicious runner to a false [`Verdict::Held`]:
+///
+/// - No runner configured → [`Verdict::Unverifiable`], and nothing is spawned. A
+///   default run cannot reach a model.
+/// - Runner fails to spawn, is killed by a signal, times out, or exits non-zero →
+///   [`Verdict::Broken`]. The runner could not cleanly answer, so its output is not
+///   trusted — even a `{"verdict":"held"}` on a non-zero exit is discarded.
+/// - Runner exits 0 but its stdout is not a well-formed verdict object with a valid
+///   `verdict` field → [`Verdict::Broken`]. Malformed output is a runner that
+///   failed to produce an answer, never a guessed pass.
+/// - Runner exits 0 with a valid object → `held`/`drifted`/`unverifiable` maps to
+///   the matching verdict, and its `evidence` and `citations` become the outcome's
+///   evidence.
+///
+/// Negation is intentionally not applied to an agent verdict: an agent check has no
+/// `negate` field (see [`CheckKind::Agent`]), because the runner reports the
+/// verdict directly rather than through an exit code that a claim might need to
+/// invert.
+#[cfg(unix)]
+fn run_agent(instruction: &str, ctx: &CheckContext) -> CheckOutcome {
+    let Some(runner) = &ctx.agent_runner else {
+        return CheckOutcome {
+            verdict: Verdict::Unverifiable,
+            end: ProcessEnd::NotExecuted {
+                note: "no agent runner configured".to_owned(),
+            },
+            evidence: Some(
+                "no agent runner is configured, so this agent check was not executed; set \
+                 CLAIM_AGENT_CMD to a runner that reads the prompt on stdin and emits the \
+                 verdict JSON on stdout"
+                    .to_owned(),
+            ),
+            duration: Duration::ZERO,
+        };
+    };
+
+    let command = match build_runner_command(runner) {
+        Ok(command) => command,
+        Err(reason) => {
+            return CheckOutcome {
+                verdict: Verdict::Broken,
+                end: ProcessEnd::SpawnFailed { reason },
+                evidence: None,
+                duration: Duration::ZERO,
+            };
+        }
+    };
+
+    let prompt = build_agent_prompt(instruction);
+    let started = Instant::now();
+    let (end, output) = run_process(command, Some(prompt.into_bytes()), ctx);
+    let duration = started.elapsed();
+
+    classify_agent(end, output, ctx.output_cap, duration)
+}
+
+/// Build the child process for an [`AgentRunner`], with no shell for the argv form.
+///
+/// An `Argv` runs its program directly, so a runner path with spaces or special
+/// characters is never re-parsed by a shell. An empty argv has no program to run
+/// and is a spawn failure (`Broken`), never a pass. A `Shell` runner is the
+/// operator's own reviewed one-liner, run as `sh -c`. Stdin disposition is left to
+/// [`run_process`], which sets a pipe because the prompt is fed on stdin.
+#[cfg(unix)]
+fn build_runner_command(runner: &AgentRunner) -> std::result::Result<Command, String> {
+    match runner {
+        AgentRunner::Argv(argv) => {
+            let (program, args) = argv
+                .split_first()
+                .ok_or_else(|| "the agent runner argv is empty; nothing to execute".to_owned())?;
+            let mut command = Command::new(program);
+            command.args(args);
+            Ok(command)
+        }
+        AgentRunner::Shell(script) => {
+            if script.trim().is_empty() {
+                return Err("the agent runner command is empty; nothing to execute".to_owned());
+            }
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            Ok(command)
+        }
+    }
+}
+
+/// Map an agent runner's process outcome and captured stdout to a verdict.
+///
+/// Split out from [`run_agent`] so the honesty mapping is unit-testable without
+/// spawning: given a [`ProcessEnd`] and the bytes the runner wrote, does the right
+/// verdict fall out? The rule, in order:
+///
+/// - Any process end other than a clean `exit 0` is [`Verdict::Broken`]; the
+///   runner did not cleanly answer and its output is not consulted.
+/// - On `exit 0`, the captured stdout is parsed for the verdict object. A parse
+///   failure — no object, missing `verdict`, or an unrecognized `verdict` value —
+///   is [`Verdict::Broken`], with the raw output kept as evidence so a human can
+///   see what the runner actually said.
+#[cfg(unix)]
+fn classify_agent(
+    end: ProcessEnd,
+    output: Captured,
+    cap: usize,
+    duration: Duration,
+) -> CheckOutcome {
+    if !matches!(end, ProcessEnd::Exited { code: 0 }) {
+        // The runner crashed, was signalled, timed out, or exited non-zero. Its
+        // output — even a well-formed `held` — is discarded: a check that could not
+        // run cannot report a pass (invariant #1).
+        return CheckOutcome {
+            verdict: Verdict::Broken,
+            end,
+            evidence: evidence_from(output, cap),
+            duration,
+        };
+    }
+
+    let raw = String::from_utf8_lossy(&output.bytes);
+    match parse_agent_response(&raw) {
+        Ok(response) => {
+            // A well-formed verdict with no evidence text records `None` rather than
+            // an empty string, matching the cmd path's "no output → no evidence"
+            // convention; a verdict with evidence records it, capped.
+            let note = response.evidence_note();
+            let evidence = (!note.is_empty()).then(|| cap_evidence(note, cap));
+            CheckOutcome {
+                verdict: response.verdict,
+                end,
+                evidence,
+                duration,
+            }
+        }
+        Err(reason) => {
+            // Exit 0 but the output was not a well-formed verdict. This is the
+            // malicious/broken-runner guard: a runner that prints prose, an empty
+            // body, or `{"verdict":"maybe"}` is Broken, never a fabricated Held. The
+            // raw output is retained (capped) so the failure is diagnosable.
+            let mut note = format!("agent runner produced no usable verdict: {reason}");
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                note.push_str("\nruntime output: ");
+                note.push_str(trimmed);
+            }
+            CheckOutcome {
+                verdict: Verdict::Broken,
+                end,
+                evidence: Some(cap_evidence(note, cap)),
+                duration,
+            }
+        }
+    }
+}
+
+/// A parsed, validated agent verdict response.
+struct AgentResponse {
+    verdict: Verdict,
+    evidence: String,
+    citations: Vec<String>,
+}
+
+impl AgentResponse {
+    /// The evidence note recorded in the verdict log: the runner's stated evidence
+    /// followed by its citations, one per line. Kept human-readable because the
+    /// evidence is the point of an agent check — a person reading the log sees the
+    /// reasoning and the sources, not a bare verdict.
+    fn evidence_note(&self) -> String {
+        let mut note = self.evidence.clone();
+        if !self.citations.is_empty() {
+            if !note.is_empty() {
+                note.push('\n');
+            }
+            note.push_str("citations:");
+            for citation in &self.citations {
+                note.push_str("\n- ");
+                note.push_str(citation);
+            }
+        }
+        note
+    }
+}
+
+/// Parse a runner's stdout into a validated [`AgentResponse`], or a reason it is
+/// not a usable verdict.
+///
+/// The runner is asked to emit a single JSON object, but a model may wrap it in
+/// prose, so the object is located robustly: the first balanced `{…}` span that
+/// deserializes to the schema wins. If none does, this fails — a failure that maps
+/// to [`Verdict::Broken`], so garbled or prose-only output never becomes a pass.
+/// Validation is strict: `verdict` must be present and one of the three allowed
+/// strings; `evidence` and `citations` are optional and default to empty, because
+/// the verdict is the honesty-critical field and missing evidence is a weaker
+/// answer, not a broken one.
+fn parse_agent_response(raw: &str) -> std::result::Result<AgentResponse, String> {
+    for candidate in json_object_candidates(raw) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+            continue;
+        };
+        let serde_json::Value::Object(map) = value else {
+            continue;
+        };
+        // A candidate object that parses but carries no `verdict` is not the object
+        // we are looking for; keep scanning in case the real one is later, rather
+        // than failing on a stray `{}` a model emitted before the answer.
+        let Some(verdict_value) = map.get("verdict") else {
+            continue;
+        };
+        let Some(verdict_str) = verdict_value.as_str() else {
+            return Err("the 'verdict' field is not a string".to_owned());
+        };
+        let verdict = match verdict_str {
+            "held" => Verdict::Held,
+            "drifted" => Verdict::Drifted,
+            "unverifiable" => Verdict::Unverifiable,
+            other => {
+                return Err(format!(
+                    "'verdict' was '{other}', not one of held, drifted, unverifiable"
+                ));
+            }
+        };
+        let evidence = map
+            .get("evidence")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let citations = map
+            .get("citations")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(AgentResponse {
+            verdict,
+            evidence,
+            citations,
+        });
+    }
+    Err("no JSON object with a 'verdict' field was found in the output".to_owned())
+}
+
+/// Every balanced-brace `{…}` span in `raw`, outermost-first, as candidate JSON
+/// objects.
+///
+/// A model may print the required object amid prose (`Here is my answer: {…}`), so
+/// the parser cannot assume the whole output is JSON. This yields each top-level
+/// `{…}` span — brace depth tracked so a nested object does not end the span early
+/// — for [`parse_agent_response`] to try in turn. Braces inside JSON string
+/// literals are skipped (with escape handling) so a `{` or `}` inside an evidence
+/// string does not desynchronize the depth count. This is a locator, not a full
+/// tokenizer: `serde_json` is the actual validator, and a span that is not valid
+/// JSON is simply skipped.
+fn json_object_candidates(raw: &str) -> Vec<&str> {
+    let bytes = raw.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        let mut j = i;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else if b == b'"' {
+                in_string = true;
+            } else if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                // The scan enters the inner loop at a `{`, which sets `depth` to 1
+                // before any `}` is seen, and breaks the instant `depth` returns to
+                // 0 — so `depth` is always at least 1 here and this cannot underflow.
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(j + 1);
+                    break;
+                }
+            }
+            j += 1;
+        }
+        match end {
+            Some(e) => {
+                spans.push(&raw[start..e]);
+                // Continue scanning after this object so a second object later in the
+                // output is also considered.
+                i = e;
+            }
+            // An unbalanced `{` cannot start a valid object; skip past it.
+            None => i = start + 1,
+        }
+    }
+    spans
+}
+
+/// The fixed directive appended to an agent check's instruction, stating the exact
+/// response the runner must produce.
+///
+/// Kept as a constant, and asserted in tests, because the response schema is a
+/// contract: the parser in [`parse_agent_response`] and this prompt must name the
+/// same fields and the same three verdict values, or a runner told one thing would
+/// be judged by another.
+const AGENT_RESPONSE_DIRECTIVE: &str = "\
+Respond with a single JSON object and nothing else that must be parsed, in this shape:
+  {\"verdict\": \"held\" | \"drifted\" | \"unverifiable\", \"evidence\": \"<why>\", \"citations\": [\"<source>\", ...]}
+Rules:
+- \"held\": the fact stated above is still true.
+- \"drifted\": the fact is now false.
+- \"unverifiable\": the evidence is insufficient or conflicting to decide.
+Report \"held\" only if you are confident the fact still holds. When in doubt, use \"unverifiable\" rather than guessing. Put your reasoning in \"evidence\" and cite your sources in \"citations\".";
+
+/// Build the full prompt sent to an [`AgentRunner`] on stdin: the claim's
+/// instruction, then the fixed response directive.
+///
+/// The instruction is passed on stdin, not as a shell argument, so a long
+/// natural-language instruction is never subject to shell quoting or injection —
+/// the runner reads exactly these bytes. The directive is appended (not prepended)
+/// so the instruction leads and the machine-readable contract follows, and it names
+/// the same field and verdict values the response parser enforces, so a runner is
+/// never told one schema and judged by another.
+#[must_use]
+pub fn build_agent_prompt(instruction: &str) -> String {
+    format!("{instruction}\n\n{AGENT_RESPONSE_DIRECTIVE}\n")
+}
+
+/// Truncate an evidence note to `cap` bytes on a char boundary, marking truncation.
+///
+/// Mirrors the cmd path's cap ([`evidence_from`]) so an agent's evidence cannot
+/// bloat the verdict log any more than a command's output can. Truncation is at a
+/// char boundary so the retained text is always valid UTF-8.
+fn cap_evidence(note: String, cap: usize) -> String {
+    if note.len() <= cap {
+        return note;
+    }
+    let mut end = cap;
+    while end > 0 && !note.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = note[..end].to_owned();
+    truncated.push_str(&format!(
+        "\n[evidence truncated at {cap} bytes; the runner produced more]"
+    ));
+    truncated
 }
 
 /// Map a process outcome to a verdict, before negation — the exit-code contract.
@@ -423,11 +835,40 @@ struct Captured {
 #[cfg(unix)]
 const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Spawn the shell command, capture bounded output, and enforce the timeout.
+/// Spawn a `cmd` check's shell command with no stdin, capture bounded output, and
+/// enforce the timeout.
+///
+/// A thin builder over [`run_process`]: it constructs the `sh -c <run>` command
+/// with stdin detached (a `cmd` check reads nothing) and hands the shared
+/// execution machinery the rest. Factored this way so the agent path
+/// ([`run_agent`]) reuses the identical process-group, timeout, group-kill, and
+/// bounded-capture behavior instead of duplicating it — the one place a check
+/// becomes a process must behave the same for every kind.
+#[cfg(unix)]
+fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(run).stdin(Stdio::null());
+    run_process(command, None, ctx)
+}
+
+/// Drive a fully-configured child process to a terminal outcome: spawn it in its
+/// own group, optionally feed `stdin` bytes, capture bounded stdout+stderr, and
+/// enforce the timeout.
 ///
 /// Returns the terminal [`ProcessEnd`] and the captured output. This is the only
 /// function that touches the process; all judgement is downstream of it, so the
-/// honesty rules stay readable and testable apart from the I/O.
+/// honesty rules stay readable and testable apart from the I/O. The caller sets
+/// `command`'s program, args, and stdin disposition; this function forces the
+/// working directory, piped stdout/stderr, and the process group, so no caller can
+/// forget the no-orphan setup.
+///
+/// When `stdin` is `Some(bytes)`, the command is spawned with a piped stdin and the
+/// bytes are written on a dedicated thread. Writing on a thread (rather than before
+/// the wait) is the same anti-deadlock discipline the readers use: a runner that
+/// emits more than a pipe buffer of output before draining its stdin would
+/// otherwise wedge a foreground write. The writer thread is never joined — like a
+/// stuck reader it is bounded by the group-kill, so a runner that ignores its stdin
+/// cannot stall the timeout.
 ///
 /// Liveness is the load-bearing property here, and it is why the readers are
 /// drained through shared buffers with a *bounded* join rather than a plain
@@ -435,25 +876,28 @@ const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
 /// which a process that outlived the check — a backgrounded daemon that inherited
 /// stdout, or one that called `setsid()` and escaped the group — never does. That
 /// would make the check's timeout fail to bound this function at all. Instead,
-/// once the shell is reaped and its group killed, the readers are given
+/// once the child is reaped and its group killed, the readers are given
 /// [`READER_JOIN_GRACE`] to finish; a reader still stuck past that is detached
 /// (its thread deliberately leaked, bounded and rare) with whatever it captured.
 #[cfg(unix)]
-fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
+fn run_process(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    ctx: &CheckContext,
+) -> (ProcessEnd, Captured) {
     use std::os::unix::process::CommandExt;
     use std::os::unix::process::ExitStatusExt;
     use wait_timeout::ChildExt;
 
-    let mut command = Command::new("sh");
     command
-        .arg("-c")
-        .arg(run)
         .current_dir(&ctx.cwd)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
 
-    // Put the shell in its own process group (pgid == the shell's pid) so a
+    // Put the child in its own process group (pgid == the child's pid) so a
     // command that spawns children — `sleep 100 | foo` — puts them in the same
     // group. We kill the *group*, so no in-group grandchild is orphaned. Set on
     // the child only; passing 0 makes the child its own leader without disturbing
@@ -474,6 +918,18 @@ fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
     // A pid is always well within i32 (kernel PID_MAX is far below i32::MAX), so
     // this cast cannot truncate; it only bridges std's u32 to libc's signed pid_t.
     let pgid = child.id() as libc::pid_t;
+
+    // Feed the prompt on a detached thread if there is one. The pipe is moved into
+    // the thread so it is closed (signalling EOF to the child) when the write
+    // finishes; a write error — the runner closed its stdin early — is not itself a
+    // check failure, so it is ignored and the runner's own exit decides the verdict.
+    if let (Some(bytes), Some(mut sink)) = (stdin, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = sink.write_all(&bytes);
+            let _ = sink.flush();
+        });
+    }
 
     // Drain stdout and stderr on their own threads into shared buffers. Draining
     // concurrently avoids the deadlock where a command that writes more than a
@@ -522,7 +978,7 @@ fn execute(run: &str, ctx: &CheckContext) -> (ProcessEnd, Captured) {
 
     // Kill the process group on EVERY terminal path — not only the timeout arms
     // above (which killed before reaping). A check that *completed* may still have
-    // leaked a background child; killing the group after the shell is reaped reaps
+    // leaked a background child; killing the group after the child is reaped reaps
     // that in-group child too — no orphan survives a completed check — and closes
     // any pipe an in-group child still holds, which is what lets the readers reach
     // EOF promptly in the common case. A second kill on the timeout paths is a
@@ -1390,7 +1846,10 @@ mod tests {
     // --- Non-cmd kinds are never silently passed (invariant #6). ---
 
     #[test]
-    fn agent_check_is_unverifiable_never_held() {
+    fn agent_check_with_no_runner_is_unverifiable_never_held() {
+        // The opt-in guarantee: a context with no runner (the default) does not
+        // execute the agent check and does not spawn anything. It is Unverifiable
+        // with a note that names the missing config, never Held.
         let check = Check {
             kind: CheckKind::Agent {
                 instruction: "look into it".to_owned(),
@@ -1399,8 +1858,14 @@ mod tests {
         };
         let outcome = run_check(&check, &CheckContext::new("."));
         assert_eq!(outcome.verdict, Verdict::Unverifiable);
-        assert!(matches!(outcome.end, ProcessEnd::NotExecuted { .. }));
-        assert!(outcome.evidence.is_some());
+        match &outcome.end {
+            ProcessEnd::NotExecuted { note } => {
+                assert!(note.contains("no agent runner"), "note: {note}");
+            }
+            other => panic!("expected NotExecuted, got {other:?}"),
+        }
+        let evidence = outcome.evidence.expect("a not-executed note is evidence");
+        assert!(evidence.contains("CLAIM_AGENT_CMD"), "evidence: {evidence}");
     }
 
     #[test]
@@ -1414,6 +1879,487 @@ mod tests {
         let outcome = run_check(&check, &CheckContext::new("."));
         assert_eq!(outcome.verdict, Verdict::Unverifiable);
         assert!(outcome.evidence.is_some());
+    }
+
+    // --- Agent checks (item 12): the honesty mapping under a MOCK runner. ---
+    //
+    // Every test here runs against a tiny shell script the test writes to a tempdir
+    // that reads stdin and emits canned stdout. No real model or paid API is ever
+    // invoked, and none can be: the runner is always a local script under our
+    // control.
+
+    /// An `agent` check with the given instruction, on the on-change trigger.
+    fn agent(instruction: &str) -> Check {
+        Check {
+            kind: CheckKind::Agent {
+                instruction: instruction.to_owned(),
+            },
+            when: Trigger::OnChange,
+        }
+    }
+
+    /// Write an executable mock runner script into `dir` and return an
+    /// [`AgentRunner::Argv`] that invokes it. The script's body is the shell after
+    /// `#!/bin/sh`, so a test controls exactly what canned output (or misbehavior)
+    /// the runner produces.
+    fn mock_runner(dir: &Path, body: &str) -> AgentRunner {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("mock-runner.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        AgentRunner::Argv(vec![path.to_string_lossy().into_owned()])
+    }
+
+    /// Run an agent check whose runner emits `body` (a shell snippet), in a fresh
+    /// temp dir with the given timeout, and return the outcome.
+    fn run_agent_with(instruction: &str, runner_body: &str, timeout: Duration) -> CheckOutcome {
+        let tmp = tempdir();
+        let runner = mock_runner(tmp.path(), runner_body);
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.timeout = timeout;
+        ctx.agent_runner = Some(runner);
+        run_check(&agent(instruction), &ctx)
+    }
+
+    #[test]
+    fn agent_held_json_maps_to_held_with_evidence_and_citations() {
+        let outcome = run_agent_with(
+            "is the fix still absent?",
+            r#"cat >/dev/null; echo '{"verdict":"held","evidence":"still pinned at 4.2","citations":["CHANGELOG.md","https://example.test/issue/1"]}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Held);
+        let evidence = outcome.evidence.expect("held carries evidence");
+        assert!(evidence.contains("still pinned at 4.2"), "{evidence}");
+        assert!(evidence.contains("CHANGELOG.md"), "{evidence}");
+        assert!(
+            evidence.contains("https://example.test/issue/1"),
+            "{evidence}"
+        );
+    }
+
+    #[test]
+    fn agent_drifted_json_maps_to_drifted() {
+        let outcome = run_agent_with(
+            "did a fix ship?",
+            r#"cat >/dev/null; echo '{"verdict":"drifted","evidence":"5.2 shipped the CJK fix"}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Drifted);
+        assert!(outcome
+            .evidence
+            .unwrap()
+            .contains("5.2 shipped the CJK fix"));
+    }
+
+    #[test]
+    fn agent_unverifiable_json_maps_to_unverifiable() {
+        let outcome = run_agent_with(
+            "is it fixed?",
+            r#"cat >/dev/null; echo '{"verdict":"unverifiable","evidence":"changelog was ambiguous"}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Unverifiable);
+        assert!(outcome.evidence.unwrap().contains("ambiguous"));
+    }
+
+    #[test]
+    fn agent_json_wrapped_in_prose_is_parsed_to_its_verdict() {
+        // A model that narrates before answering must still be read: the object is
+        // located within the surrounding prose and parsed to its verdict.
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; printf 'Let me look... I checked the changelog.\nHere is my answer:\n{"verdict":"drifted","evidence":"fixed in 5.2"}\nDone.\n'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Drifted);
+        assert!(outcome.evidence.unwrap().contains("fixed in 5.2"));
+    }
+
+    #[test]
+    fn agent_runner_nonzero_exit_is_broken_never_held() {
+        // The runner even printed a well-formed held, but it exited non-zero: the
+        // output is discarded and the verdict is Broken. A misbehaving runner cannot
+        // fake a pass by printing held while failing.
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; echo '{"verdict":"held","evidence":"trust me"}'; exit 3"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_eq!(outcome.end, ProcessEnd::Exited { code: 3 });
+    }
+
+    #[test]
+    fn agent_runner_timeout_is_broken_and_leaves_no_orphan() {
+        // A runner that hangs past the timeout is Broken, and the group-kill leaves
+        // no surviving grandchild — the same no-orphan guarantee the cmd path has.
+        let tmp = tempdir();
+        let sentinel = tmp.path().join("agent-grandchild-survived.txt");
+        // The runner backgrounds a grandchild that would write a sentinel after a
+        // sleep, then hangs itself past the timeout.
+        let body = format!(
+            "( sleep 3; echo alive > '{}' ) & cat >/dev/null; sleep 30",
+            sentinel.display()
+        );
+        let runner = mock_runner(tmp.path(), &body);
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.timeout = Duration::from_millis(300);
+        ctx.agent_runner = Some(runner);
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert!(
+            matches!(outcome.end, ProcessEnd::TimedOut { .. }),
+            "end: {:?}",
+            outcome.end
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(
+            !sentinel.exists(),
+            "the agent runner's grandchild survived the timeout; the group was not killed"
+        );
+    }
+
+    #[test]
+    fn agent_runner_spawn_failure_is_broken() {
+        // A runner pointing at a non-existent program cannot spawn: Broken, never a
+        // pass.
+        let tmp = tempdir();
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.agent_runner = Some(AgentRunner::Argv(vec![
+            "/no/such/agent-runner/anywhere".to_owned()
+        ]));
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert!(matches!(outcome.end, ProcessEnd::SpawnFailed { .. }));
+    }
+
+    #[test]
+    fn agent_empty_argv_is_broken() {
+        let tmp = tempdir();
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.agent_runner = Some(AgentRunner::Argv(vec![]));
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert!(matches!(outcome.end, ProcessEnd::SpawnFailed { .. }));
+    }
+
+    #[test]
+    fn agent_garbage_output_is_broken_never_held() {
+        // Exit 0 but non-JSON prose: the runner produced no verdict, so Broken.
+        let outcome = run_agent_with(
+            "check it",
+            "cat >/dev/null; echo 'I could not figure this out, sorry.'",
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_ne!(outcome.verdict, Verdict::Held);
+        assert!(outcome.evidence.unwrap().contains("no usable verdict"));
+    }
+
+    #[test]
+    fn agent_json_missing_verdict_field_is_broken() {
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; echo '{"evidence":"I looked but omitted the verdict"}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_ne!(outcome.verdict, Verdict::Held);
+    }
+
+    #[test]
+    fn agent_invalid_verdict_value_is_broken_never_held() {
+        // `"maybe"` is not one of the three allowed verdicts. It must not be coerced
+        // to anything, least of all Held.
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; echo '{"verdict":"maybe","evidence":"unsure"}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_ne!(outcome.verdict, Verdict::Held);
+    }
+
+    #[test]
+    fn agent_empty_output_is_broken() {
+        // Exit 0 with no output at all is not an answer.
+        let outcome = run_agent_with("check it", "cat >/dev/null; true", DEFAULT_TIMEOUT);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+    }
+
+    #[test]
+    fn agent_held_with_no_evidence_records_none() {
+        // A valid held with no evidence field records `None`, not an empty string,
+        // matching the cmd path's no-output convention.
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; echo '{"verdict":"held"}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Held);
+        assert_eq!(outcome.evidence, None);
+    }
+
+    #[test]
+    fn agent_verdict_as_nonstring_is_broken() {
+        // `"verdict": 0` — a number, not one of the strings — must not read as Held
+        // (which is exit-code 0's meaning on the cmd path; there is no such crossover
+        // here).
+        let outcome = run_agent_with(
+            "check it",
+            r#"cat >/dev/null; echo '{"verdict":0}'"#,
+            DEFAULT_TIMEOUT,
+        );
+        assert_eq!(outcome.verdict, Verdict::Broken);
+    }
+
+    #[test]
+    fn agent_held_with_evidence_within_the_cap_keeps_a_bounded_note() {
+        // A held verdict whose evidence fits within the capture cap parses cleanly
+        // and its evidence is retained. `output_cap` is generous enough to hold the
+        // whole JSON object; the resulting note is bounded by construction (it is
+        // derived from bytes already bounded by the cap). This is the ordinary
+        // held-with-a-lot-of-evidence path.
+        let tmp = tempdir();
+        let runner = mock_runner(
+            tmp.path(),
+            r#"cat >/dev/null; printf '{"verdict":"held","evidence":"'; for i in $(seq 1 100); do printf 'EVIDENCE-CHUNK-%s ' "$i"; done; printf '"}'"#,
+        );
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.output_cap = 8 * 1024;
+        ctx.agent_runner = Some(runner);
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Held);
+        let evidence = outcome.evidence.expect("evidence present");
+        assert!(evidence.contains("EVIDENCE-CHUNK-1 "), "{evidence:.80}");
+        assert!(
+            evidence.len() <= ctx.output_cap + 128,
+            "note must stay bounded, was {} bytes",
+            evidence.len()
+        );
+    }
+
+    #[test]
+    fn agent_flooding_output_past_the_cap_is_broken_never_held() {
+        // The honesty guard on a runner that floods stdout: once the captured output
+        // is truncated at the cap, the JSON object is cut off and no longer parses,
+        // so the verdict is Broken — a runner cannot bury a fake `held` under a
+        // megabyte of preamble and have it read as a pass.
+        let tmp = tempdir();
+        let runner = mock_runner(
+            tmp.path(),
+            r#"cat >/dev/null; for i in $(seq 1 5000); do printf 'PADDING-LINE-%s\n' "$i"; done; echo '{"verdict":"held","evidence":"buried"}'"#,
+        );
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.output_cap = 256;
+        ctx.agent_runner = Some(runner);
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert_ne!(outcome.verdict, Verdict::Held);
+    }
+
+    #[test]
+    fn agent_runner_receives_the_prompt_on_stdin() {
+        // The instruction and the response directive both reach the runner on stdin.
+        // The runner writes what it read to a file the test inspects, proving the
+        // prompt was fed and carried both the instruction and the fixed contract.
+        let tmp = tempdir();
+        let seen = tmp.path().join("prompt-seen.txt");
+        let runner = mock_runner(
+            tmp.path(),
+            &format!(
+                "cat > '{}'; echo '{{\"verdict\":\"held\",\"evidence\":\"ok\"}}'",
+                seen.display()
+            ),
+        );
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.agent_runner = Some(runner);
+        let outcome = run_check(&agent("INSTRUCTION-SENTINEL: is it still true?"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Held);
+
+        let prompt = std::fs::read_to_string(&seen).expect("runner should have received stdin");
+        assert!(
+            prompt.contains("INSTRUCTION-SENTINEL: is it still true?"),
+            "the instruction must reach the runner on stdin: {prompt}"
+        );
+        // The fixed contract (the response directive) must also be present, so the
+        // runner is told the exact schema.
+        assert!(
+            prompt.contains("\"verdict\""),
+            "the response directive must reach the runner: {prompt}"
+        );
+        assert!(prompt.contains("unverifiable"), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn agent_shell_runner_form_works() {
+        // The AgentRunner::Shell form runs via `sh -c` and is fed the prompt on
+        // stdin, just like the argv form.
+        let tmp = tempdir();
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.agent_runner = Some(AgentRunner::Shell(
+            r#"cat >/dev/null; echo '{"verdict":"held","evidence":"shell runner ok"}'"#.to_owned(),
+        ));
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Held);
+        assert!(outcome.evidence.unwrap().contains("shell runner ok"));
+    }
+
+    #[test]
+    fn agent_empty_shell_runner_is_broken() {
+        let tmp = tempdir();
+        let mut ctx = CheckContext::new(tmp.path());
+        ctx.agent_runner = Some(AgentRunner::Shell("   ".to_owned()));
+        let outcome = run_check(&agent("check it"), &ctx);
+        assert_eq!(outcome.verdict, Verdict::Broken);
+        assert!(matches!(outcome.end, ProcessEnd::SpawnFailed { .. }));
+    }
+
+    // --- Agent classification and parsing, unit-level (no spawn). ---
+
+    #[test]
+    fn classify_agent_maps_clean_exit_and_parsed_verdict() {
+        let held = Captured {
+            bytes: br#"{"verdict":"held","evidence":"ok"}"#.to_vec(),
+            truncated: false,
+            escapee: false,
+        };
+        let outcome = classify_agent(
+            ProcessEnd::Exited { code: 0 },
+            held,
+            DEFAULT_OUTPUT_CAP,
+            Duration::ZERO,
+        );
+        assert_eq!(outcome.verdict, Verdict::Held);
+    }
+
+    #[test]
+    fn classify_agent_never_maps_a_nonzero_exit_to_held() {
+        // Even with a perfectly-formed held on stdout, a non-zero exit is Broken.
+        for code in [1, 2, 42, 127, 137] {
+            let held = Captured {
+                bytes: br#"{"verdict":"held","evidence":"ok"}"#.to_vec(),
+                truncated: false,
+                escapee: false,
+            };
+            let outcome = classify_agent(
+                ProcessEnd::Exited { code },
+                held,
+                DEFAULT_OUTPUT_CAP,
+                Duration::ZERO,
+            );
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Broken,
+                "exit {code} with a held body must be Broken"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_agent_maps_signal_and_timeout_to_broken() {
+        for end in [
+            ProcessEnd::Signalled,
+            ProcessEnd::TimedOut {
+                after: Duration::from_secs(1),
+            },
+            ProcessEnd::SpawnFailed {
+                reason: "x".to_owned(),
+            },
+        ] {
+            let held = Captured {
+                bytes: br#"{"verdict":"held"}"#.to_vec(),
+                truncated: false,
+                escapee: false,
+            };
+            let outcome = classify_agent(end.clone(), held, DEFAULT_OUTPUT_CAP, Duration::ZERO);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Broken,
+                "end {end:?} must be Broken"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_agent_response_reads_the_three_verdicts() {
+        assert_eq!(
+            parse_agent_response(r#"{"verdict":"held"}"#)
+                .unwrap()
+                .verdict,
+            Verdict::Held
+        );
+        assert_eq!(
+            parse_agent_response(r#"{"verdict":"drifted"}"#)
+                .unwrap()
+                .verdict,
+            Verdict::Drifted
+        );
+        assert_eq!(
+            parse_agent_response(r#"{"verdict":"unverifiable"}"#)
+                .unwrap()
+                .verdict,
+            Verdict::Unverifiable
+        );
+    }
+
+    #[test]
+    fn parse_agent_response_rejects_malformed() {
+        assert!(parse_agent_response("not json at all").is_err());
+        assert!(parse_agent_response("").is_err());
+        assert!(parse_agent_response("{}").is_err());
+        assert!(parse_agent_response(r#"{"evidence":"no verdict"}"#).is_err());
+        assert!(parse_agent_response(r#"{"verdict":"maybe"}"#).is_err());
+        assert!(parse_agent_response(r#"{"verdict":42}"#).is_err());
+        assert!(parse_agent_response(r#"["verdict","held"]"#).is_err());
+    }
+
+    #[test]
+    fn parse_agent_response_finds_the_object_after_a_stray_brace() {
+        // A model that emits `{}` or a JSON snippet before the real answer must not
+        // stop the parser: it scans on until it finds an object carrying `verdict`.
+        let raw =
+            r#"warmup {} then {"note":"aside"} and finally {"verdict":"held","evidence":"found"}"#;
+        let response = parse_agent_response(raw).unwrap();
+        assert_eq!(response.verdict, Verdict::Held);
+        assert_eq!(response.evidence, "found");
+    }
+
+    #[test]
+    fn parse_agent_response_handles_braces_inside_strings() {
+        // A brace inside an evidence string must not desynchronize the object
+        // locator.
+        let raw = r#"{"verdict":"drifted","evidence":"the config had {nested} braces"}"#;
+        let response = parse_agent_response(raw).unwrap();
+        assert_eq!(response.verdict, Verdict::Drifted);
+        assert!(response.evidence.contains("{nested}"));
+    }
+
+    #[test]
+    fn agent_prompt_carries_the_instruction_and_the_contract() {
+        let prompt = build_agent_prompt("Is libfoo still pinned at 4.2?");
+        assert!(prompt.contains("Is libfoo still pinned at 4.2?"));
+        // The three verdict values must all appear so the runner is told the exact
+        // vocabulary the parser enforces.
+        assert!(prompt.contains("held"));
+        assert!(prompt.contains("drifted"));
+        assert!(prompt.contains("unverifiable"));
+        assert!(prompt.contains("verdict"));
+    }
+
+    #[test]
+    fn cap_evidence_truncates_and_marks() {
+        let big = "x".repeat(1000);
+        let capped = cap_evidence(big, 100);
+        assert!(capped.contains("evidence truncated at 100 bytes"));
+        let payload = capped.split("\n[evidence truncated").next().unwrap();
+        assert!(payload.len() <= 100);
+    }
+
+    #[test]
+    fn cap_evidence_leaves_short_notes_untouched() {
+        assert_eq!(cap_evidence("short".to_owned(), 100), "short");
     }
 
     // --- Duration and status descriptions. ---

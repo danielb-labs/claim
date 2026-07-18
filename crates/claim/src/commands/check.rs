@@ -15,9 +15,15 @@
 //!   `--report-only` is absent.
 //! - **Every non-passing outcome pushes the exit code up, never down.** A drifted
 //!   or unverifiable verdict, or an unresolved support, is exit 1; a broken check
-//!   is exit 2; the highest applicable code wins. An `agent`/`human` check returns
-//!   [`claim_core::Verdict::Unverifiable`] in v1 (core does this), which is exit 1
-//!   — it never fakes a pass.
+//!   is exit 2; the highest applicable code wins. A `human` check, and an `agent`
+//!   check with no runner configured, returns
+//!   [`claim_core::Verdict::Unverifiable`] (core does this), which is exit 1 — it
+//!   never fakes a pass.
+//! - **Agent execution is opt-in.** An `agent` check runs only when
+//!   [`CLAIM_AGENT_CMD_ENV`] is set to a runner command; the runner's structured
+//!   output maps to a verdict under the same broken-never-passes contract as `cmd`.
+//!   With the variable unset (the default) no runner is attached, so agent checks
+//!   stay `Unverifiable` and no subprocess — and no model — is ever invoked.
 //!
 //! # Exit codes
 //!
@@ -31,9 +37,9 @@
 
 use anyhow::{Context, Result};
 use claim_core::{
-    append_entry, compute_status, read_entries, resolve_supports, run_check, CheckContext,
-    CheckOutcome, ClaimId, Event, Grace, LogEntry, ProcessEnd, Status, SupportResolution,
-    Timestamp, Verdict,
+    append_entry, compute_status, read_entries, resolve_supports, run_check, AgentRunner,
+    CheckContext, CheckOutcome, ClaimId, Event, Grace, LogEntry, ProcessEnd, Status,
+    SupportResolution, Timestamp, Verdict,
 };
 use serde::Serialize;
 
@@ -41,6 +47,16 @@ use crate::cli::CheckArgs;
 use crate::output::{emit, trigger_label, verdict_label, Format};
 use crate::scheduling::is_due;
 use claim_store::{discover, git, LoadError, LoadedClaim, Store};
+
+/// The environment variable that opts a run into executing `agent` checks.
+///
+/// Its value is a shell command that receives the verdict prompt on stdin and must
+/// print the verdict JSON on stdout (see [`agent_runner_from_env`] and
+/// `docs/agent-checks.md`). Unset — the default — leaves agent checks
+/// `Unverifiable` and spawns nothing, so a plain `claim check` never invokes a
+/// model or makes an API call. Providing a real runner (and paying for it) is the
+/// operator's responsibility.
+const CLAIM_AGENT_CMD_ENV: &str = "CLAIM_AGENT_CMD";
 
 /// The exit code when every check held and every support resolved.
 const EXIT_OK: i32 = 0;
@@ -118,9 +134,13 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
         })
     };
 
+    // Agent execution is strictly opt-in: only a set CLAIM_AGENT_CMD attaches a
+    // runner. With it unset, every agent check is Unverifiable and nothing is
+    // spawned, so a default `claim check` never reaches a model.
+    let agent_runner = agent_runner_from_env()?;
     let run = RunContext {
         store: &store,
-        ctx: CheckContext::new(store.root()),
+        ctx: CheckContext::new(store.root()).with_agent_runner(agent_runner),
         known_ids: &known_ids,
         provenance,
         now,
@@ -138,6 +158,38 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
     let exit = overall_exit(&results).max(if has_faults { EXIT_BROKEN } else { EXIT_OK });
     report(format, &results, &load.errors, &load_notes, args, exit, now);
     Ok(exit)
+}
+
+/// Resolve the agent runner from [`CLAIM_AGENT_CMD_ENV`], if set.
+///
+/// The value is treated as a shell command ([`AgentRunner::Shell`]), so an operator
+/// can express a runner as a one-liner — a wrapper script, a model CLI with flags, a
+/// small pipeline — without the tool imposing an argv split. The command receives
+/// the verdict prompt on stdin and must emit the verdict JSON on stdout.
+///
+/// A whitespace-only value is rejected loudly rather than silently ignored: a run
+/// that meant to configure a runner but set it to blank must not quietly fall back
+/// to leaving every agent check unverifiable. Unset returns `Ok(None)` — the
+/// ordinary default where agent checks are unverifiable and nothing is spawned.
+///
+/// # Errors
+///
+/// Fails when the variable is set to a non-UTF-8 value or to blank whitespace.
+fn agent_runner_from_env() -> Result<Option<AgentRunner>> {
+    match std::env::var(CLAIM_AGENT_CMD_ENV) {
+        Ok(cmd) if cmd.trim().is_empty() => {
+            anyhow::bail!(
+                "{CLAIM_AGENT_CMD_ENV} is set but empty; unset it to leave agent checks \
+                 unverifiable, or set it to a runner command that reads the prompt on stdin \
+                 and prints the verdict JSON on stdout"
+            )
+        }
+        Ok(cmd) => Ok(Some(AgentRunner::Shell(cmd))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{CLAIM_AGENT_CMD_ENV} is set to a non-UTF-8 value")
+        }
+    }
 }
 
 /// The run-wide inputs every claim's check shares, resolved once.

@@ -49,22 +49,36 @@ record a claim without shelling out. Decide as its own follow-up.
 
 ## Post-v1 capabilities
 
-Deferred by design. PRODUCT.md §7 is the full list with build-signals; the two
-most consequential are named here because they change what the product *is*.
+Mostly deferred by design. PRODUCT.md §7 is the full list with build-signals; the
+two most consequential are named here because they change what the product *is*.
+(Agent-check *execution* has since landed in item 12; what remains deferred there —
+the adversarial spot-audit — is called out below.)
 
 ### Agent checks (`kind: agent`)
 
-The headline deferred capability — arguably the point of the whole product. A
-check that is a natural-language instruction an agent executes ("read libfoo's
-changelog since 5.0; is the CJK corruption fixed?"), returning a verdict plus
-cited evidence. The format already parses `kind: agent`; v1 returns `Unverifiable`
-for it (never a fake pass). Execution design is sketched: the clock lane runs an
-agent CLI (e.g. `claude -p "<instruction>" --output-format json`) in the
-customer's own CI, with their key and a budget, and a sample of `held` verdicts is
-re-checked by a second agent instructed to refute the first. This is what makes
-previously-uncheckable facts (world-facts, "a fix shipped") checkable — and it is
-the honest home for the facts witnessed-red can't stage. Build-signal: when
-proxy-only or checkless claims are a real share of a live corpus.
+The headline capability — arguably the point of the whole product. A check that is
+a natural-language instruction an agent executes ("read libfoo's changelog since
+5.0; is the CJK corruption fixed?"), returning a verdict plus cited evidence. This
+is what makes previously-uncheckable facts (world-facts, "a fix shipped")
+checkable.
+
+**Execution now exists (item 12).** `run_check` runs a `kind: agent` check through
+an operator-supplied runner and maps its structured output to a verdict, under the
+same broken-never-passes contract as `cmd`. It is strictly opt-in: the CLI reads
+the runner from `CLAIM_AGENT_CMD` (a shell command fed the prompt on stdin,
+emitting the verdict JSON on stdout); unset, agent checks stay `Unverifiable` and
+nothing is spawned — a default `claim check` never contacts a model. The tool ships
+no model client; the runner (e.g. a wrapper around a model CLI), its credentials,
+and its budget are the operator's. See `docs/agent-checks.md`.
+
+**Still deferred: the adversarial spot-audit.** A sample of `held` verdicts
+re-checked by a second agent instructed to refute the first — the guard against a
+confabulated green that no human would otherwise read (a `drifted` gets human eyes
+naturally; an unread `held` is where a wrong answer hides). The execution mechanism
+is the prerequisite and now exists; the audit loop, its sampling policy, and where
+it runs (the clock lane, the hub scheduler) are not built. Build-signal for
+deepening the whole capability: when proxy-only or checkless claims are a real share
+of a live corpus.
 
 **Verdict protocol (how an agent check communicates its findings).** A `cmd`
 check yields its verdict through the exit code (0 held, 1 drifted, anything else
@@ -80,7 +94,9 @@ for "ran, but the evidence was conflicting or insufficient to conclude" — whic
 exactly why the verdict model has four states, not two. So yes, an agent check can
 land on held-vs-drifted by what it finds, just like a `cmd`'s exit 0 vs 1 — but it
 carries its reasoning with it rather than collapsing to a bit, and it has an honest
-"I couldn't tell" it can return instead of guessing.
+"I couldn't tell" it can return instead of guessing. Implemented in item 12; the
+prompt/response schema is fixed in `crates/claim-core/src/check.rs` and documented
+in `docs/agent-checks.md`.
 
 ### Capture the expensive derivation (the memoization framing)
 
