@@ -1,10 +1,16 @@
-# Parked decisions
+# Parked decisions and deferred work
 
-Design changes we've agreed are worth making but have deliberately deferred, so
-the reasoning isn't lost. Each entry is a decision waiting to be scheduled, not a
-bug. Newest first.
+Design changes and capabilities we've agreed are worth capturing but have
+deliberately deferred, so the reasoning isn't lost. This is a record of
+decisions, not a bug list. The broad post-v1 roadmap lives in PRODUCT.md §7
+("Deliberately absent from v1") with build-signals; this file captures what came
+out of working sessions and the few capabilities worth calling out by name.
 
-## Rethink witnessed-red: demote from mandatory to optional
+## Near-term follow-ups
+
+Small changes to make soon, after the current build items land.
+
+### Rethink witnessed-red: demote from mandatory to optional
 
 **Status:** parked 2026-07-18, pending decision. Touches golden invariant #5 and
 simplifies the already-merged item 04 (`claim add`).
@@ -47,6 +53,67 @@ label, an agent-friendly `add`, and the tree-perturbation (and its data-loss ris
 gone. `claim add` simplifies to: run the check once, require it passes, write the
 claim.
 
+**Implementation note.** If we keep any at-creation witnessing for stageable
+checks, run the green→red→green dance in a throwaway `git worktree` at HEAD so it
+never touches the user's or agent's working tree — which also removes the
+clean-tree requirement. Mostly moot if witnessing becomes optional.
+
 **When to do it.** As a small follow-up that simplifies item 04, after the current
 build items land. Reconcile CLAUDE.md invariant #5 and PRODUCT.md in the same
 change.
+
+### Fold the documentation site into the repo
+
+A single self-contained HTML docs site was built during a session at
+`~/claim-docs/` (concepts, CLI reference, the diagrams, an FAQ). Move it into the
+repo as a versioned `docs/` (or `site/`) item so it ships with the tool and stays
+in sync as verbs land; wire the diagrams from `diagrams/`. Right now it lives
+outside version control and will drift.
+
+### Reconsider an MCP create/propose verb
+
+We cut `propose` from the MCP server (item 07 is `query` + `report` only), on the
+logic that an in-repo agent just writes the file or runs `claim add`. The
+agent-creation ergonomics discussion reopened it: if witnessed-red is demoted
+(above), `add` becomes simple enough that a thin MCP `create` wrapper may be worth
+it, so agents can record a claim without shelling out. Decide alongside the
+witnessed-red change.
+
+## Post-v1 capabilities
+
+Deferred by design. PRODUCT.md §7 is the full list with build-signals; the two
+most consequential are named here because they change what the product *is*.
+
+### Agent checks (`kind: agent`)
+
+The headline deferred capability — arguably the point of the whole product. A
+check that is a natural-language instruction an agent executes ("read libfoo's
+changelog since 5.0; is the CJK corruption fixed?"), returning a verdict plus
+cited evidence. The format already parses `kind: agent`; v1 returns `Unverifiable`
+for it (never a fake pass). Execution design is sketched: the clock lane runs an
+agent CLI (e.g. `claude -p "<instruction>" --output-format json`) in the
+customer's own CI, with their key and a budget, and a sample of `held` verdicts is
+re-checked by a second agent instructed to refute the first. This is what makes
+previously-uncheckable facts (world-facts, "a fix shipped") checkable — and it is
+the honest home for the facts witnessed-red can't stage. Build-signal: when
+proxy-only or checkless claims are a real share of a live corpus.
+
+### Windowed / SLO-style claims
+
+Some recorded facts are recurring predictions, not static facts — "the vendor file
+lands by 06:00 UTC", "p99 latency stays under 200ms". One late day isn't drift.
+The verdict model can't express "held if N of the last M runs passed"; either add
+windowed verdicts or exclude the class explicitly. Flagged in the original design
+critique (an SLO is not a fact).
+
+### The rest — see PRODUCT.md §7 and §8
+
+Suspect status and doubt propagation along the graph; `class` and `tags`;
+escalation beyond a PR comment plus a standing issue (nag → owning-team gate →
+block); flap damping; read-set tracing for on-change triggers and `--path`;
+forge-approval provenance (PR approvers via the forge API, over git commit
+authorship); the hub (index, search, review queue, dashboards, scheduler,
+runners); cross-repo drift routing; canonicalization of equivalent world-claims;
+company-wide connectors (email/chat/docs). Open questions still unresolved:
+automatic contradiction detection, `claim move` with id tombstones, and who
+governs the graph's edge set.
