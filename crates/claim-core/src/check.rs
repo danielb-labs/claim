@@ -45,7 +45,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::claim::{Check, CheckKind, ClaimId, SupportTarget};
+use jiff::Timestamp;
+
+use crate::claim::{Check, CheckKind, ClaimId, Skip, SupportTarget};
 use crate::verdict::Verdict;
 
 // Check execution relies on unix process semantics — a shell, process groups, and
@@ -335,6 +337,55 @@ pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
             duration: Duration::ZERO,
         },
     }
+}
+
+/// The decision a check's [`Skip`] yields for one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipDecision {
+    /// The skip does not suppress this run; run the check. The optional note records
+    /// *why* the skip did not apply — an expiry, or a condition that could not be
+    /// evaluated — for the report.
+    Run(Option<String>),
+    /// The skip suppresses this run; do not run the check and record no verdict.
+    Skip,
+}
+
+/// Decide whether a check's declared [`Skip`] suppresses this run, honestly.
+///
+/// The rules exist so a skip can never become a silent, permanent mute — the exact
+/// stale-green-light this tool refuses:
+/// - An expired `until` (now on or after it) *always* runs the check — the debt is
+///   called regardless of `unless` — and the note records the lapse.
+/// - An `unless` command that succeeds (exit 0) cancels the skip and runs the check;
+///   one that fails (exit 1) leaves the skip in force; one that cannot be evaluated
+///   (any other exit, a spawn failure, a timeout) runs the check rather than muting
+///   it, because a broken condition must never hide drift.
+/// - With neither an expiry nor an `unless`, the skip holds — an indefinite skip,
+///   which callers surface loudly rather than treat as healthy.
+///
+/// `now` is a parameter (never the wall clock) so the decision is deterministic under
+/// test. Evaluating `unless` runs a command through the same bounded runner a `cmd`
+/// check uses, so a hung condition times out to a run, not a hang.
+pub fn evaluate_skip(skip: &Skip, ctx: &CheckContext, now: Timestamp) -> SkipDecision {
+    if let Some(until) = skip.until {
+        if now >= until {
+            return SkipDecision::Run(Some(format!("skip expired {until}")));
+        }
+    }
+    if let Some(condition) = &skip.unless {
+        return match run_cmd(condition, false, ctx).verdict {
+            // exit 0: the condition holds — this environment can verify, so run.
+            Verdict::Held => SkipDecision::Run(None),
+            // exit 1: the condition does not hold — the skip stands.
+            Verdict::Drifted => SkipDecision::Skip,
+            // Anything else could not evaluate the condition; run rather than
+            // silently skip, so a broken `unless` can never mute a check.
+            _ => SkipDecision::Run(Some(format!(
+                "skip condition `{condition}` could not be evaluated; running the check"
+            ))),
+        };
+    }
+    SkipDecision::Skip
 }
 
 /// Execute a `cmd` check's `run` string and classify the result.
@@ -1557,6 +1608,7 @@ mod tests {
                 negate,
             },
             when: Trigger::OnChange,
+            skip: None,
         }
     }
 
@@ -2004,6 +2056,7 @@ mod tests {
                 instruction: "look into it".to_owned(),
             },
             when: Trigger::OnChange,
+            skip: None,
         };
         let outcome = run_check(&check, &CheckContext::new("."));
         assert_eq!(outcome.verdict, Verdict::Unverifiable);
@@ -2024,6 +2077,7 @@ mod tests {
                 prompt: Some("eyeball it".to_owned()),
             },
             when: Trigger::OnChange,
+            skip: None,
         };
         let outcome = run_check(&check, &CheckContext::new("."));
         assert_eq!(outcome.verdict, Verdict::Unverifiable);
@@ -2044,6 +2098,7 @@ mod tests {
                 instruction: instruction.to_owned(),
             },
             when: Trigger::OnChange,
+            skip: None,
         }
     }
 
@@ -2918,5 +2973,88 @@ mod tests {
         base.push(format!("claim-check-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         TempDir { path: base }
+    }
+}
+
+/// The skip-decision honesty rules: a skip must never become a silent, permanent
+/// mute, so every negative path here (broken condition, expired bound) resolves to
+/// *running* the check, never to a quiet skip.
+#[cfg(test)]
+mod skip_eval_tests {
+    use super::*;
+    use crate::claim::Skip;
+
+    fn ts(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn skip(reason: &str, unless: Option<&str>, until: Option<&str>) -> Skip {
+        Skip {
+            reason: reason.to_owned(),
+            unless: unless.map(ToOwned::to_owned),
+            until: until.map(ts),
+        }
+    }
+
+    const NOW: &str = "2026-01-01T00:00:00Z";
+
+    #[test]
+    fn an_unconditional_skip_holds() {
+        let s = skip("parked", None, None);
+        assert_eq!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Skip
+        );
+    }
+
+    #[test]
+    fn unless_exit_zero_cancels_the_skip_and_runs() {
+        // The condition holds (`true` exits 0): this environment can verify, so run.
+        let s = skip("parked", Some("true"), None);
+        assert_eq!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Run(None)
+        );
+    }
+
+    #[test]
+    fn unless_exit_one_leaves_the_skip_in_force() {
+        // The condition does not hold (`false` exits 1): the skip stands.
+        let s = skip("parked", Some("false"), None);
+        assert_eq!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Skip
+        );
+    }
+
+    #[test]
+    fn a_broken_unless_runs_the_check_never_silently_mutes() {
+        // A condition that is neither exit 0 nor 1 cannot be evaluated; the check must
+        // run rather than be silently muted — a broken mute is how drift hides.
+        let s = skip("parked", Some("exit 3"), None);
+        assert!(matches!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Run(Some(_))
+        ));
+    }
+
+    #[test]
+    fn an_expired_until_runs_regardless_of_a_still_true_unless() {
+        // `until` is in the past: the debt is called even though `false` would keep
+        // the skip in force. The expiry wins, and the run carries a lapse note.
+        let s = skip("parked", Some("false"), Some("2025-01-01T00:00:00Z"));
+        assert!(matches!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Run(Some(_))
+        ));
+    }
+
+    #[test]
+    fn an_unexpired_until_still_skips() {
+        let s = skip("parked", None, Some("2027-01-01T00:00:00Z"));
+        assert_eq!(
+            evaluate_skip(&s, &CheckContext::new("."), ts(NOW)),
+            SkipDecision::Skip
+        );
     }
 }

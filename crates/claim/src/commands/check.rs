@@ -39,9 +39,9 @@
 
 use anyhow::{Context, Result};
 use claim_core::{
-    append_entry, compute_status, read_entries, resolve_supports, run_check, CheckContext,
-    CheckOutcome, ClaimId, Event, Grace, LogEntry, ProcessEnd, Status, SupportResolution,
-    Timestamp, Verdict,
+    append_entry, compute_status, evaluate_skip, read_entries, resolve_supports, run_check,
+    CheckContext, CheckOutcome, ClaimId, Event, Grace, LogEntry, ProcessEnd, SkipDecision, Status,
+    SupportResolution, Timestamp, Verdict,
 };
 use serde::Serialize;
 
@@ -193,6 +193,25 @@ struct CheckResult {
     evidence: Option<String>,
     /// The claim's trigger for this check, so the report shows the cadence.
     when: String,
+    /// Why a declared skip did *not* apply this run, when that is worth reporting: a
+    /// lapsed `until`, or an `unless` condition that could not be evaluated (so the
+    /// check ran rather than being silently muted). `None` on an ordinary run.
+    note: Option<String>,
+}
+
+/// A check whose declared skip suppressed this run.
+///
+/// Reported so a skip is never silent, and carries no verdict: a skip is not a pass.
+#[derive(Debug, Serialize)]
+struct SkippedCheck {
+    /// The author's justification, from the claim's `skip.reason`.
+    reason: String,
+    /// The skip's expiry, if it declared one (RFC 3339). `None` for an indefinite
+    /// skip — surfaced plainly so an unbounded mute cannot hide.
+    until: Option<String>,
+    /// The claim's trigger for this check, so the report shows the cadence it would
+    /// otherwise run on.
+    when: String,
 }
 
 /// One resolved (or unresolved) `supports` target within a claim's result.
@@ -214,8 +233,15 @@ struct ClaimResult {
     id: String,
     /// The claim file's path relative to the store root.
     file: String,
-    /// Each check's verdict, in the claim's declared order.
+    /// Each check's verdict, in the claim's declared order. A check whose skip was in
+    /// force this run is *not* here — it is in [`skipped`](ClaimResult::skipped)
+    /// instead, with no verdict, so it contributes nothing to the exit code.
     checks: Vec<CheckResult>,
+    /// Checks whose declared skip suppressed this run: reported (never silent), never
+    /// a pass, and recording no verdict. A skipped check advances no freshness, so the
+    /// claim still decays toward stale — the skip only keeps the build green where it
+    /// legitimately applies.
+    skipped: Vec<SkippedCheck>,
     /// Each `supports` target's resolution.
     supports: Vec<SupportResult>,
     /// Whether this claim's verdicts were written to the log (`false` under
@@ -233,14 +259,37 @@ struct ClaimResult {
 fn check_one(run: &RunContext, loaded: &LoadedClaim) -> Result<ClaimResult> {
     let claim = &loaded.claim;
 
-    let mut checks = Vec::with_capacity(claim.checks.len());
+    let mut checks = Vec::new();
+    let mut skipped = Vec::new();
     for check in &claim.checks {
+        // A declared skip is evaluated *before* the check runs. When it holds, the
+        // check does not run and records no verdict — a skip is never a pass, so the
+        // claim keeps decaying toward stale. `Run(note)` carries why a skip did not
+        // apply (a lapsed `until`, or an `unless` that could not be evaluated), so the
+        // report can say the debt was called rather than silently running.
+        let note = match &check.skip {
+            Some(skip) => match evaluate_skip(skip, &run.ctx, run.now) {
+                SkipDecision::Skip => {
+                    skipped.push(SkippedCheck {
+                        reason: skip.reason.clone(),
+                        until: skip.until.map(|t| t.to_string()),
+                        when: trigger_label(check.when),
+                    });
+                    continue;
+                }
+                SkipDecision::Run(note) => note,
+            },
+            None => None,
+        };
+
         let outcome = run_check(check, &run.ctx);
 
         // Persist the verdict only on a persisting run. This is the ONLY place the
         // log is touched, and it is reached only when `provenance` is `Some` — which
         // it is exactly when the run is not `--report-only`. A report-only run has
-        // no provenance, so it structurally cannot write here.
+        // no provenance, so it structurally cannot write here. A skipped check never
+        // reaches this point, so a skip writes nothing (invariant #4: a write is a
+        // commit, and a skip is not a verification).
         if let Some(provenance) = &run.provenance {
             let entry = verification_entry(run.now, provenance, &outcome);
             append_entry(&run.store.log_dir(), &claim.id, &entry)
@@ -253,6 +302,7 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> Result<ClaimResult> {
             end: outcome.end.clone(),
             evidence: outcome.evidence.clone(),
             when: trigger_label(check.when),
+            note,
         });
     }
 
@@ -267,6 +317,7 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> Result<ClaimResult> {
         id: claim.id.to_string(),
         file: loaded.path.clone(),
         checks,
+        skipped,
         supports,
         persisted: run.provenance.is_some(),
         exit,
@@ -426,11 +477,22 @@ fn human(
                 check.detail,
                 check.when
             );
+            if let Some(note) = &check.note {
+                println!("      | {note}");
+            }
             if let Some(ev) = &check.evidence {
                 if let Some(line) = first_evidence_line(ev) {
                     println!("      | {line}");
                 }
             }
+        }
+        for skip in &result.skipped {
+            let bound = match &skip.until {
+                Some(until) => format!("until {until}"),
+                None => "no expiry".to_owned(),
+            };
+            println!("  {:<12} [{}] ({bound})", "skipped", skip.when);
+            println!("      | {}", skip.reason);
         }
         for support in &result.supports {
             if !support.resolved {
@@ -493,6 +555,7 @@ mod tests {
             detail: "exit 0".to_owned(),
             evidence: None,
             when: "on-change".to_owned(),
+            note: None,
         }
     }
 
@@ -503,6 +566,7 @@ mod tests {
             detail: "x".to_owned(),
             evidence: None,
             when: "on-change".to_owned(),
+            note: None,
         }
     }
 
@@ -571,6 +635,7 @@ mod tests {
             id: "c".to_owned(),
             file: "f".to_owned(),
             checks: vec![],
+            skipped: vec![],
             supports: vec![],
             persisted: true,
             exit,

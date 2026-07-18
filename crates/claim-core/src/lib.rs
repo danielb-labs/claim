@@ -33,12 +33,12 @@ pub mod log;
 pub mod verdict;
 
 pub use check::{
-    build_agent_prompt, resolve_supports, run_check, AgentRunner, CheckContext, CheckOutcome,
-    ProcessEnd, SupportResolution, DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
+    build_agent_prompt, evaluate_skip, resolve_supports, run_check, AgentRunner, CheckContext,
+    CheckOutcome, ProcessEnd, SkipDecision, SupportResolution, DEFAULT_OUTPUT_CAP, DEFAULT_TIMEOUT,
 };
 pub use claim::{
     extract_embedded_claims, has_frontmatter_fence, parse_claim_file, Check, CheckKind, Claim,
-    ClaimId, Days, Source, SupportTarget, Trigger, WikiLink,
+    ClaimId, Days, Skip, Source, SupportTarget, Trigger, WikiLink,
 };
 pub use error::{Error, Result};
 pub use log::{

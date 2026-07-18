@@ -304,6 +304,19 @@ fn draft_from_claim(claim: &Claim) -> Result<ClaimDraft> {
             ),
         ));
     };
+    // The `add`-shaped draft the renderer round-trips carries no skip, so amending a
+    // skip-bearing check would silently drop the skip — a data loss the tool must
+    // refuse loudly, like the multi-check and non-cmd cases above.
+    if check.skip.is_some() {
+        return Err(app(
+            ErrorKind::InvalidInput,
+            format!(
+                "claim '{}' has a check with a skip; `claim amend` does not preserve skips in v1 \
+                 and would drop it. Edit this claim's file by hand.",
+                claim.id
+            ),
+        ));
+    }
     Ok(ClaimDraft {
         id: claim.id.to_string(),
         max_age: claim.max_age.to_string(),

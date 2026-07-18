@@ -689,3 +689,233 @@ fn a_malformed_sibling_does_not_stop_checking_the_good_claims() {
     assert_eq!(errors.len(), 1);
     assert!(errors[0]["file"].as_str().unwrap().ends_with("bad.md"));
 }
+
+// --- Skip: a skipped check is reported, green, and records no verdict. ---
+
+/// A cmd claim whose check *would drift* (`run: false`), carrying the given skip
+/// block, so a green result can come only from the skip suppressing the run — never
+/// from the check itself passing.
+fn drifting_claim_with_skip(id: &str, skip_yaml: &str) -> String {
+    format!(
+        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"false\"\n    when: on-change\n{skip_yaml}max-age: \"30d\"\n---\nWould drift, but is skipped.\n"
+    )
+}
+
+#[test]
+fn an_unconditional_skip_is_green_and_records_no_verdict() {
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip(
+            "parked",
+            "    skip:\n      reason: no runner in this environment\n",
+        ),
+    );
+
+    // A persisting run (not --report-only): the check would drift, but the skip
+    // suppresses it, so the run is green and reports the reason.
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("skipped"))
+        .stdout(predicate::str::contains("no runner in this environment"));
+
+    // A skip is not a verification (invariant #4): nothing was written to the log.
+    assert_eq!(repo.log_count("parked"), 0, "a skip records no verdict");
+}
+
+#[test]
+fn unless_true_cancels_the_skip_and_the_check_runs() {
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip(
+            "parked",
+            "    skip:\n      reason: skip unless the runner is present\n      unless: \"true\"\n",
+        ),
+    );
+
+    // `unless` succeeds (exit 0), so the skip is cancelled and the failing check runs
+    // and drifts — proving an environment that can verify does.
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("drifted"));
+    assert_eq!(
+        repo.log_count("parked"),
+        1,
+        "a run whose skip was cancelled records its verdict"
+    );
+}
+
+#[test]
+fn unless_false_leaves_the_skip_in_force() {
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip(
+            "parked",
+            "    skip:\n      reason: parked while the condition is false\n      unless: \"false\"\n",
+        ),
+    );
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("skipped"));
+    assert_eq!(repo.log_count("parked"), 0);
+}
+
+#[test]
+fn a_skip_json_shape_is_stable_and_carries_no_verdict() {
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip("parked", "    skip:\n      reason: no runner here\n"),
+    );
+    let out = repo
+        .claim()
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+    let claim = &v["claims"][0];
+    assert!(
+        claim["checks"].as_array().unwrap().is_empty(),
+        "a skipped check produces no verdict-bearing check result"
+    );
+    let skipped = claim["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "the skip is reported in the skipped list");
+    assert_eq!(skipped[0]["reason"], "no runner here");
+    assert!(
+        skipped[0]["until"].is_null(),
+        "an indefinite skip has no expiry"
+    );
+}
+
+#[test]
+fn a_skip_does_not_mask_a_sibling_checks_drift() {
+    // The load-bearing honesty property: a skip suppresses only its own check. A
+    // second check on the same claim that drifts must still surface (exit 1, in the
+    // verdict-bearing `checks` list) — a skip that swallowed a sibling's drift would
+    // be exactly the stale-green this tool exists to prevent.
+    let repo = ready_repo();
+    repo.write_claim(
+        "mixed",
+        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n    skip:\n      reason: parked\n  - kind: cmd\n    run: \"false\"\n    when: on-change\nmax-age: 30d\n---\nOne check skipped, one drifts.\n",
+    );
+
+    let out = repo
+        .claim()
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let claim = &v["claims"][0];
+    let checks = claim["checks"].as_array().unwrap();
+    assert_eq!(
+        checks.len(),
+        1,
+        "the drifting check produced a verdict result"
+    );
+    assert_eq!(
+        checks[0]["verdict"], "drifted",
+        "the sibling drift surfaced"
+    );
+    assert_eq!(
+        claim["skipped"].as_array().unwrap().len(),
+        1,
+        "the skipped check is reported separately"
+    );
+    assert_eq!(v["exit"], 1, "the overall exit reflects the sibling drift");
+}
+
+#[test]
+fn a_broken_unless_runs_the_check_at_the_cli_never_mutes() {
+    // The CLI counterpart to the core broken-`unless` test: an `unless` that cannot
+    // be evaluated (exit 3) must run the failing check and surface the drift, never
+    // silently skip it.
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip(
+            "parked",
+            "    skip:\n      reason: parked\n      unless: \"exit 3\"\n",
+        ),
+    );
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("drifted"));
+    assert_eq!(
+        repo.log_count("parked"),
+        1,
+        "a run that was not skipped is recorded"
+    );
+}
+
+#[test]
+fn an_expired_until_runs_the_check_and_reports_the_lapse() {
+    // `until` is long past, so the debt is called: the check runs (and drifts), and
+    // the lapse is reported both in the JSON `note` and the human output.
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip(
+            "parked",
+            "    skip:\n      reason: parked\n      until: 2020-01-01\n",
+        ),
+    );
+
+    let out = repo
+        .claim_at("2026-07-18T00:00:00Z")
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let check = &v["claims"][0]["checks"][0];
+    assert_eq!(check["verdict"], "drifted");
+    assert!(
+        check["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("skip expired"),
+        "the lapse is reported in the note: {check}"
+    );
+    repo.claim_at("2026-07-18T00:00:00Z")
+        .args(["check", "--all"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("skip expired"));
+}
+
+#[test]
+fn a_skip_under_report_only_is_green_reports_and_writes_nothing() {
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip("parked", "    skip:\n      reason: parked\n"),
+    );
+    repo.claim()
+        .args(["check", "--all", "--report-only"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("skipped"));
+    assert_eq!(
+        repo.log_count("parked"),
+        0,
+        "report-only writes nothing, and neither does a skip"
+    );
+}

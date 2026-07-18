@@ -288,6 +288,42 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     check (always, in v1) or when an <code>every Nd</code> check&rsquo;s interval has elapsed since its
     last recorded run. <code>claim check</code> defaults to running only the due claims; <code>--all</code>
     runs every claim&rsquo;s checks regardless.</p>
+
+    <h3>Skip &mdash; deliberately not running a check</h3>
+    <p>Sometimes a check cannot run where <code>claim check</code> is invoked &mdash; an
+    <code>agent</code> check in a CI with no model runner, say. A check may carry a <code>skip</code>
+    block so it is <em>not</em> run there, without turning the build red. A skip is an
+    <strong>acknowledged, bounded debt, never a pass</strong>: a skipped check records no verdict and
+    advances no freshness, so the claim still decays toward <span class="chip amber">stale</span> and
+    the skip only keeps the build green where it legitimately applies. It is the single most dangerous
+    thing this tool offers &mdash; the stale green light it exists to prevent &mdash; so its fields keep
+    it honest:</p>
+<pre><code>checks:
+  - kind: agent
+    instruction: "Is negation still owned by the tool (no shell `!`)?"
+    when: on-change
+    skip:
+      reason: "no model runner in billing-free CI; verified locally"  # required
+      unless: 'test -n "$CLAIM_AGENT_CMD"'   # run (don't skip) when this exits 0
+      until: 2026-10-01                      # the skip expires; then it runs</code></pre>
+    <ul>
+      <li><code>reason</code> is <strong>required</strong> &mdash; a skip with no reason is refused at
+      parse time. There are no silent skips.</li>
+      <li><code>unless</code> (optional) is a command that <em>cancels</em> the skip and runs the check
+      when it exits <code>0</code>. A command that cannot be evaluated (any other exit, a spawn failure,
+      a timeout) runs the check rather than silently muting it &mdash; a broken condition must never hide
+      drift.</li>
+      <li><code>until</code> (optional) is a date (<code>YYYY-MM-DD</code>) or RFC 3339 instant at which
+      the skip expires; on or after it the check runs regardless of <code>unless</code>, and the lapse is
+      reported. A skip with neither <code>unless</code> nor <code>until</code> is an indefinite skip &mdash;
+      allowed, but surfaced plainly (<code>claim list</code> marks the claim <code>+skip</code>, and
+      <code>claim check</code> reports every skip) so an unbounded mute can never hide.</li>
+    </ul>
+    <p>In <code>claim check</code>&rsquo;s output a suppressed check shows as <code>skipped</code> with
+    its reason and either its expiry or <code>(no expiry)</code>; when an <code>until</code> lapses the
+    run reports <code>skip expired &hellip;</code> on the check it re-enabled. Who added a skip, and when,
+    is git&rsquo;s to say, never the file&rsquo;s. <code>claim amend</code> refuses a skip-bearing check
+    rather than drop the skip on re-render; edit such a claim&rsquo;s file directly.</p>
   </section>
 
   <section id="status">

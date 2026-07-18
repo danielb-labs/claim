@@ -286,6 +286,27 @@ fn amend_refuses_a_multi_check_claim_rather_than_dropping_a_check() {
 }
 
 #[test]
+fn amend_refuses_a_skip_bearing_check_rather_than_dropping_the_skip() {
+    // The `add`-shaped draft the renderer round-trips carries no skip, so amending a
+    // skip-bearing check would silently drop the skip — a data loss amend must refuse
+    // loudly, like the multi-check case above.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    let with_skip = "---\nid: parked\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\n    skip:\n      reason: no runner in CI\n      unless: \"true\"\nmax-age: 30d\n---\nA parked claim.\n";
+    repo.write_claim("parked", with_skip);
+
+    repo.claim()
+        .args(["amend", "parked", "--statement", "changed"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("skip"));
+    // The skip survived untouched.
+    assert!(repo
+        .read(".claims/parked.md")
+        .contains("reason: no runner in CI"));
+}
+
+#[test]
 fn amend_only_max_age_keeps_the_check_and_statement() {
     // A pure max-age bump: the check still holds (tree already matches), only the
     // window changes, and the statement is untouched.
