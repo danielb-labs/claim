@@ -21,6 +21,7 @@
 //! check.
 
 use std::num::NonZeroU32;
+use std::str::FromStr;
 
 use serde_norway::Value;
 
@@ -29,13 +30,13 @@ use crate::error::{Error, Result};
 /// A fully validated claim: a human statement, the checks that re-verify it, its
 /// freshness policy, and where it came from.
 ///
-/// Constructing a `Claim` outside this module's parsers is possible but means
-/// bypassing validation; prefer [`parse_claim_file`] and
-/// [`extract_embedded_claims`], which guarantee every invariant the rest of the
-/// system relies on (a non-empty check list, a well-formed id, a positive
-/// `max_age`). The fields are public so downstream items can read them; treat a
-/// value obtained from a parser as already-validated and a hand-built one as
-/// suspect.
+/// A `Claim` is only ever produced by this module's parsers ([`parse_claim_file`]
+/// and [`extract_embedded_claims`]), which is why it has no public constructor:
+/// there is no way to build one that skips validation, so every `Claim` a caller
+/// holds already satisfies the schema (a non-empty check list, a well-formed and
+/// non-empty statement, a positive `max_age`). The fields are public for reading;
+/// the `#[non_exhaustive]` attribute reserves the right to add fields without a
+/// breaking change, so callers must not construct or exhaustively destructure it.
 ///
 /// Identity and provenance are deliberately absent. Who authored or reviewed a
 /// claim is derived from git and the forge at read time, never stored here,
@@ -82,11 +83,13 @@ pub struct Claim {
 pub struct ClaimId(String);
 
 impl ClaimId {
-    /// Validate and wrap a raw id string.
+    /// Validate and wrap a raw id string, returning the reason on failure.
     ///
-    /// Returns the reason the id is malformed (never a full [`Error`], so callers
-    /// can prepend the field path and file), phrased for the author to fix.
-    fn parse(raw: &str) -> std::result::Result<Self, String> {
+    /// Returns a bare reason (not a full [`Error`]) so the frontmatter parser can
+    /// prepend the field path and file. The public entry point is
+    /// [`FromStr`](ClaimId::from_str), for downstream code that must validate a
+    /// bare id — a verdict-log path, a `claim add` argument — with no file to name.
+    fn validate(raw: &str) -> std::result::Result<Self, String> {
         if raw.is_empty() {
             return Err("id must not be empty".to_owned());
         }
@@ -122,6 +125,19 @@ impl ClaimId {
     }
 }
 
+impl FromStr for ClaimId {
+    type Err = Error;
+
+    /// Validate a bare id string outside any file, for callers that hold an id
+    /// without a claim file — the verdict-log path `.claims/log/<id>/` and the
+    /// `claim add` id argument. The error's reason is self-contained (it quotes
+    /// the offending id), so the `id` context in the path position is only a
+    /// label.
+    fn from_str(raw: &str) -> Result<Self> {
+        ClaimId::validate(raw).map_err(|reason| Error::parse("id", reason))
+    }
+}
+
 impl std::fmt::Display for ClaimId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -150,11 +166,12 @@ pub struct Check {
 ///
 /// v1 only *executes* [`Cmd`](CheckKind::Cmd) checks, but the parser accepts and
 /// round-trips all three so that files authored for a later version remain valid
-/// today. Modelling this as an enum makes the exhaustive `match` in later check
-/// execution a compile-time obligation: a new kind cannot be added without every
-/// consumer being forced to handle it.
+/// today. This enum is deliberately *not* `#[non_exhaustive]`: the workspace
+/// crates version together, and an exhaustive `match` here is the mechanism that
+/// forces every consumer — above all check execution — to handle a new kind the
+/// moment one is added, rather than silently skipping it. That compile error is
+/// the point.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum CheckKind {
     /// A command line the tool runs, mapping its exit code to a verdict. The tool
     /// owns that mapping and owns negation; see [`crate::verdict::Verdict`].
@@ -183,7 +200,8 @@ pub enum CheckKind {
 ///
 /// v1 recognizes exactly two triggers. Anything else is rejected rather than
 /// guessed at, because a trigger the tool misreads is a check that runs on the
-/// wrong clock.
+/// wrong clock. Like [`CheckKind`] this is intentionally not `#[non_exhaustive]`,
+/// so a future trigger form forces every scheduler consumer to handle it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// Run whenever a file the check watches changes. In v1 this means the check
@@ -200,30 +218,25 @@ impl Trigger {
     /// Parse a `when:` value: the literal `on-change`, or `every <N>d` with `N` a
     /// positive integer.
     ///
-    /// Returns the reason on failure (not a full [`Error`]) so the caller can
-    /// attach the field path and file.
+    /// Returns a bare reason on failure (not a full [`Error`], and without a field
+    /// prefix), so the caller frames it as `checks[i].when: {reason}` in its own
+    /// `field: message` style.
     fn parse(raw: &str) -> std::result::Result<Self, String> {
-        let trimmed = raw.trim();
-        if trimmed == "on-change" {
+        if raw == "on-change" {
             return Ok(Trigger::OnChange);
         }
-        if let Some(rest) = trimmed.strip_prefix("every") {
-            // Require whitespace between the keyword and the interval so that a
-            // typo like `every30d` is a clear error rather than being silently
-            // accepted.
-            let interval = rest.trim_start();
-            if interval.len() == rest.len() {
-                return Err(format!(
-                    "when '{raw}' is malformed; write 'every <N>d', for example 'every 30d'"
-                ));
-            }
+        // The interval must follow `every` separated by exactly one space, so a
+        // typo like `every30d` or padded forms like `every  30d` are clear errors
+        // rather than being silently normalized. `parse_day_count` then rejects
+        // any surrounding or embedded whitespace in the count itself.
+        if let Some(interval) = raw.strip_prefix("every ") {
             let days = parse_day_count(interval).map_err(|reason| {
-                format!("when '{raw}' is malformed: {reason}; write 'every <N>d', e.g. 'every 30d'")
+                format!("'{raw}' is malformed ({reason}); write 'every <N>d', e.g. 'every 30d'")
             })?;
             return Ok(Trigger::Every { days });
         }
         Err(format!(
-            "when '{raw}' is not a recognized trigger; use 'on-change' or 'every <N>d'"
+            "'{raw}' is not a recognized trigger; use 'on-change' or 'every <N>d'"
         ))
     }
 }
@@ -240,10 +253,25 @@ impl Trigger {
 pub struct Days(NonZeroU32);
 
 impl Days {
-    /// The number of days, guaranteed positive.
+    /// The number of days, guaranteed positive. Returned as a plain `u32` so call
+    /// sites doing arithmetic need not unwrap a second time; the positivity
+    /// guarantee is upheld at construction, not at every read.
     #[must_use]
-    pub fn get(self) -> NonZeroU32 {
-        self.0
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl FromStr for Days {
+    type Err = Error;
+
+    /// Validate a bare `<N>d` day count outside any file, for callers that hold a
+    /// duration string without a claim file. The error's reason quotes the input,
+    /// so the `max-age` context in the path position is only a label.
+    fn from_str(raw: &str) -> Result<Self> {
+        parse_day_count(raw)
+            .map(Days)
+            .map_err(|reason| Error::parse("max-age", reason))
     }
 }
 
@@ -255,21 +283,41 @@ impl std::fmt::Display for Days {
 
 /// Parse an `<N>d` day count, e.g. `120d`, into a positive count.
 ///
-/// Shared by [`Days`] parsing and the `every <N>d` trigger. Returns the reason
-/// on failure so callers can frame it with a field path.
+/// Shared by [`Days`] and the `every <N>d` trigger. The number must be a bare
+/// canonical decimal — no sign, no leading zero, no surrounding or embedded
+/// whitespace — so that `+30d`, `030d`, and ` 30d` are rejected as firmly as
+/// `12.5d` and `12days`. Returns a bare reason on failure, and gives an
+/// out-of-range count a distinct message from a non-numeric one. Callers frame
+/// the reason with a field path.
 fn parse_day_count(raw: &str) -> std::result::Result<NonZeroU32, String> {
-    let trimmed = raw.trim();
-    let digits = trimmed.strip_suffix('d').ok_or_else(|| {
-        format!("'{trimmed}' must be a day count ending in 'd', for example '120d'")
-    })?;
+    let digits = raw
+        .strip_suffix('d')
+        .ok_or_else(|| format!("'{raw}' must be a day count ending in 'd', for example '120d'"))?;
     if digits.is_empty() {
-        return Err(format!("'{trimmed}' has no number before 'd'"));
+        return Err(format!("'{raw}' has no number before 'd'"));
+    }
+    // Only a canonical `[1-9][0-9]*` (or a lone `0`, which fails the positivity
+    // check below) is a number here. Rejecting non-canonical spellings up front
+    // keeps `u32::from_str`'s lenient acceptance of signs and whitespace from
+    // leaking in.
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "'{raw}' has a non-numeric day count; write a plain number like '120d'"
+        ));
+    }
+    // A leading zero on a non-zero number is non-canonical. An all-zero count
+    // (`0d`, `000d`) is instead reported as non-positive below, which is the more
+    // useful message.
+    let significant = digits.trim_start_matches('0');
+    if digits.len() > 1 && digits.starts_with('0') && !significant.is_empty() {
+        return Err(format!(
+            "'{raw}' has a leading zero; write the day count as '{significant}d'"
+        ));
     }
     let n: u32 = digits
         .parse()
-        .map_err(|_| format!("'{trimmed}' has a non-numeric or out-of-range day count"))?;
-    NonZeroU32::new(n)
-        .ok_or_else(|| format!("'{trimmed}' must be a positive number of days, not 0"))
+        .map_err(|_| format!("'{raw}' is too large; the day count must fit in 32 bits"))?;
+    NonZeroU32::new(n).ok_or_else(|| format!("'{raw}' must be a positive number of days, not 0"))
 }
 
 /// A target a claim justifies via its `supports` edge: a decision ref like
@@ -377,42 +425,52 @@ pub fn parse_claim_file(path: &str, contents: &str) -> Result<Claim> {
 /// opener. Blocks are returned in file order. A file with no claim blocks yields
 /// an empty vector, which is not an error — most files have none.
 ///
+/// Both fences are structural, not textual: the `<!-- claim` opener is
+/// recognized only when it stands alone on its line (as the whole line, followed
+/// by a word boundary so `<!-- claims ... -->` is an ordinary comment), and the
+/// `-->` closer only when it stands alone on its line. A `-->` appearing inside a
+/// YAML value therefore does not terminate the block — otherwise an arrow in a
+/// string would silently truncate the claim and drop later checks.
+///
 /// `path` is used for error messages and each returned [`Source::Embedded`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::Parse`] naming `path` and the offending block's location
-/// when a `<!-- claim` opener is never closed, its YAML is malformed, or any
-/// field violates the schema. One bad block fails the whole extraction, because
-/// a host file that silently drops a claim it clearly meant to declare is the
-/// kind of quiet failure this tool exists to prevent.
+/// when a `<!-- claim` opener is never closed by a `-->` on its own line, its
+/// YAML is malformed, or any field violates the schema. One bad block fails the
+/// whole extraction, because a host file that silently drops a claim it clearly
+/// meant to declare is the kind of quiet failure this tool exists to prevent.
 pub fn extract_embedded_claims(path: &str, contents: &str) -> Result<Vec<Claim>> {
     let mut claims = Vec::new();
     let mut search_from = 0;
+    // The start of the line `search_from` sits on, so the backward scan for an
+    // opener's line start never rescans past content already consumed — bounding
+    // total work at O(n) even for a newline-free file dense with `<!-- claim`.
+    let mut region_line_start = 0;
     while let Some(rel) = contents[search_from..].find(EMBED_OPEN) {
         let open_at = search_from + rel;
-        // The opener must sit on its own line, per the format: text before it on
-        // the same line (other than whitespace) means this is prose that merely
-        // mentions the marker, not a claim block.
-        let line_start = contents[..open_at].rfind('\n').map_or(0, |nl| nl + 1);
-        if !contents[line_start..open_at].trim().is_empty() {
-            search_from = open_at + EMBED_OPEN.len();
+        let after_open = open_at + EMBED_OPEN.len();
+
+        // The keyword must end at a boundary; `<!-- claimant` and `<!-- claims`
+        // are ordinary comments, not claim blocks.
+        let next = contents[after_open..].chars().next();
+        let is_keyword = matches!(next, None | Some(' ' | '\t' | '\r' | '\n'))
+            || contents[after_open..].starts_with(EMBED_CLOSE);
+        // The opener must be the whole line up to here: only whitespace may
+        // precede it on its line, or it is prose that merely mentions the marker.
+        let line_start = contents[region_line_start..open_at]
+            .rfind('\n')
+            .map_or(region_line_start, |nl| region_line_start + nl + 1);
+        let opener_alone = contents[line_start..open_at].trim().is_empty();
+
+        if !is_keyword || !opener_alone {
+            search_from = after_open;
+            region_line_start = line_start;
             continue;
         }
 
-        let after_open = open_at + EMBED_OPEN.len();
-        let close_rel = contents[after_open..].find(EMBED_CLOSE).ok_or_else(|| {
-            Error::parse(
-                path,
-                format!(
-                    "unterminated '<!-- claim' block at byte {open_at}; it must be closed with \
-                     '-->'"
-                ),
-            )
-        })?;
-        let yaml = &contents[after_open..after_open + close_rel];
-        let close_end = after_open + close_rel + EMBED_CLOSE.len();
-
+        let (yaml, close_end) = embedded_yaml(path, contents, open_at, after_open)?;
         let statement = preceding_statement(&contents[..line_start]);
         let source = Source::Embedded {
             path: path.to_owned(),
@@ -420,8 +478,41 @@ pub fn extract_embedded_claims(path: &str, contents: &str) -> Result<Vec<Claim>>
         };
         claims.push(build_claim(path, yaml, &statement, source)?);
         search_from = close_end;
+        region_line_start = contents[..close_end].rfind('\n').map_or(0, |nl| nl + 1);
     }
     Ok(claims)
+}
+
+/// Locate the YAML payload of an embedded block and the byte just past its
+/// closing fence.
+///
+/// The closer is the first line after the opener that is exactly `-->` (allowing
+/// only surrounding whitespace), never a `-->` embedded in a value. Returns the
+/// YAML slice between the fences and the offset one past the closing line.
+fn embedded_yaml<'a>(
+    path: &str,
+    contents: &'a str,
+    open_at: usize,
+    after_open: usize,
+) -> Result<(&'a str, usize)> {
+    // Scan line by line from just after the opener for a line that is the closing
+    // fence alone. `split_inclusive` keeps line terminators so byte offsets stay
+    // exact across CRLF.
+    let mut offset = after_open;
+    for line in contents[after_open..].split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).trim() == EMBED_CLOSE {
+            let yaml = &contents[after_open..offset];
+            return Ok((yaml, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    Err(Error::parse(
+        path,
+        format!(
+            "unterminated '<!-- claim' block at byte {open_at}; it must be closed by a '-->' \
+             alone on its own line"
+        ),
+    ))
 }
 
 const FRONTMATTER_FENCE: &str = "---";
@@ -431,7 +522,9 @@ const EMBED_CLOSE: &str = "-->";
 /// Split a standalone file into its frontmatter YAML and markdown body.
 ///
 /// The frontmatter must open with a `---` fence on the first line and close with
-/// a `---` fence on its own line. Everything after the closing fence is the body.
+/// an *unindented* `---` line. The closing fence is matched structurally rather
+/// than by a trimmed compare, so a `---` line that is indented (and therefore
+/// part of a YAML block scalar) does not prematurely terminate the frontmatter.
 fn split_frontmatter<'a>(path: &str, contents: &'a str) -> Result<(&'a str, &'a str)> {
     // A UTF-8 BOM ahead of the fence would otherwise defeat the prefix check and
     // produce a baffling "missing frontmatter" error on a file that looks correct.
@@ -453,10 +546,14 @@ fn split_frontmatter<'a>(path: &str, contents: &'a str) -> Result<(&'a str, &'a 
             )
         })?;
 
-    // The closing fence is the first line consisting solely of `---`.
+    // The closing fence is the first unindented line equal to exactly `---`.
+    // Leading whitespace disqualifies it, because an indented `---` inside a block
+    // scalar is data, not a fence; only trailing spaces and the line terminator
+    // are tolerated.
     let mut offset = 0;
     for line in after_open.split_inclusive('\n') {
-        if line.trim_end_matches(['\r', '\n']).trim() == FRONTMATTER_FENCE {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content.trim_end() == FRONTMATTER_FENCE {
             let yaml = &after_open[..offset];
             let body = &after_open[offset + line.len()..];
             return Ok((yaml, body));
@@ -465,7 +562,7 @@ fn split_frontmatter<'a>(path: &str, contents: &'a str) -> Result<(&'a str, &'a 
     }
     Err(Error::parse(
         path,
-        "unterminated YAML frontmatter; the opening '---' fence has no matching closing '---'",
+        "unterminated YAML frontmatter; the opening '---' fence has no matching unindented '---'",
     ))
 }
 
@@ -502,6 +599,24 @@ fn preceding_statement(before: &str) -> String {
 /// The single choke point both host formats pass through, so the schema is
 /// enforced in exactly one place. Every error names the field path and file.
 fn build_claim(path: &str, yaml: &str, statement: &str, source: Source) -> Result<Claim> {
+    let statement = statement.trim();
+    if statement.is_empty() {
+        // The statement is the fact a human reads when drift routes to them; a
+        // claim without one is a nag-worthy error, not a valid claim. The two host
+        // formats fail it for the same reason but need different guidance.
+        let reason = match &source {
+            Source::File { .. } => {
+                "the claim has no statement; write the fact in the markdown body after the \
+                 closing '---' fence"
+            }
+            Source::Embedded { .. } => {
+                "the claim has no statement; put the fact on the non-blank line immediately \
+                 before the '<!-- claim' block"
+            }
+        };
+        return Err(Error::parse(path, reason));
+    }
+
     let value: Value = serde_norway::from_str(yaml)
         .map_err(|e| Error::parse(path, format!("invalid YAML: {e}")))?;
 
@@ -529,7 +644,7 @@ fn build_claim(path: &str, yaml: &str, statement: &str, source: Source) -> Resul
     reject_unknown_fields(path, map)?;
 
     let id_raw = require_str(path, map, "id")?;
-    let id = ClaimId::parse(id_raw).map_err(|reason| Error::parse(path, reason))?;
+    let id = ClaimId::validate(id_raw).map_err(|reason| Error::parse(path, reason))?;
 
     let checks = parse_checks(path, map)?;
     let max_age = parse_max_age(path, map)?;
@@ -633,7 +748,11 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
         .as_str()
         .ok_or_else(|| Error::parse(path, format!("{}: expected a string", field("kind"))))?;
 
-    let kind = match kind_raw {
+    // The fields each kind permits, always including the shared `kind` and
+    // `when`. A field outside this set is rejected, mirroring top-level
+    // `reject_unknown_fields`: a typo like `negated:` must fail loudly, never be
+    // silently ignored into a wrong-sensed check.
+    let (kind, allowed): (CheckKind, &[&str]) = match kind_raw {
         "cmd" => {
             let run = require_check_str(path, map, index, "run")?;
             let negate = match map.get("negate") {
@@ -650,16 +769,22 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
                     ));
                 }
             };
-            CheckKind::Cmd {
-                run: run.to_owned(),
-                negate,
-            }
+            (
+                CheckKind::Cmd {
+                    run: run.to_owned(),
+                    negate,
+                },
+                &["kind", "run", "negate", "when"],
+            )
         }
         "agent" => {
             let instruction = require_check_str(path, map, index, "instruction")?;
-            CheckKind::Agent {
-                instruction: instruction.to_owned(),
-            }
+            (
+                CheckKind::Agent {
+                    instruction: instruction.to_owned(),
+                },
+                &["kind", "instruction", "when"],
+            )
         }
         "human" => {
             let prompt = match map.get("prompt") {
@@ -676,7 +801,7 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
                     ));
                 }
             };
-            CheckKind::Human { prompt }
+            (CheckKind::Human { prompt }, &["kind", "prompt", "when"])
         }
         other => {
             return Err(Error::parse(
@@ -688,6 +813,8 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
             ));
         }
     };
+
+    reject_unknown_check_fields(path, map, index, kind_raw, allowed)?;
 
     let when_raw = map
         .get("when")
@@ -708,9 +835,38 @@ fn parse_check(path: &str, index: usize, value: &Value) -> Result<Check> {
             )
         })?;
     let when = Trigger::parse(when_raw)
-        .map_err(|reason| Error::parse(path, format!("checks[{index}].{reason}")))?;
+        .map_err(|reason| Error::parse(path, format!("{}: {reason}", field("when"))))?;
 
     Ok(Check { kind, when })
+}
+
+/// Reject any field on a check outside the set its kind permits.
+fn reject_unknown_check_fields(
+    path: &str,
+    map: &serde_norway::Mapping,
+    index: usize,
+    kind: &str,
+    allowed: &[&str],
+) -> Result<()> {
+    for key in map.keys() {
+        let name = key.as_str().ok_or_else(|| {
+            Error::parse(
+                path,
+                format!("checks[{index}]: has a non-string field name; keys must be strings"),
+            )
+        })?;
+        if !allowed.contains(&name) {
+            return Err(Error::parse(
+                path,
+                format!(
+                    "checks[{index}]: unknown field '{name}' on a '{kind}' check; allowed fields \
+                     are {}",
+                    allowed.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Require a string field on a check, with a field-pathed error on absence or
@@ -823,24 +979,31 @@ fn require_str<'a>(path: &str, map: &'a serde_norway::Mapping, name: &str) -> Re
 /// Harvest `[[wiki-link]]` targets from a statement body, de-duplicated and in
 /// first-seen order.
 ///
-/// Empty or whitespace-only brackets are ignored — `[[]]` is not a link. Nested
-/// or unbalanced brackets are handled by taking the shortest `[[`…`]]` span, so
-/// `[[a]] [[b]]` yields two links rather than one greedy match.
+/// A link is the shortest `[[`…`]]` span that contains no newline and no further
+/// `[`, so `[[a]] [[b]]` yields two links, `[[[x]]]` yields `x` (the innermost
+/// pair), and a `[[` that never closes on its line captures nothing. Empty or
+/// whitespace-only brackets are ignored — `[[]]` is not a link.
 fn harvest_wiki_links(statement: &str) -> Vec<WikiLink> {
     let mut links: Vec<WikiLink> = Vec::new();
     let mut i = 0;
     while let Some(open_rel) = statement[i..].find("[[") {
-        let open = i + open_rel + 2;
+        let mut open = i + open_rel + 2;
+        // Align to the innermost opener so `[[[x]]]` yields `x`, not `[x`.
+        while statement[open..].starts_with('[') {
+            open += 1;
+        }
         let Some(close_rel) = statement[open..].find("]]") else {
             break;
         };
-        let inner = statement[open..open + close_rel].trim();
-        // A nested `[[` inside the span means the true opener is later; skip past
-        // this false opener rather than capturing the outer, greedy match.
-        if inner.contains("[[") {
+        let span = &statement[open..open + close_rel];
+        // A link never spans a line break, and never contains a further `[[`
+        // (which would mean the true opener is later). In either case this is a
+        // false opener; restart the scan just inside it.
+        if span.contains('\n') || span.contains("[[") {
             i = open;
             continue;
         }
+        let inner = span.trim();
         if !inner.is_empty() {
             let link = WikiLink(inner.to_owned());
             if !links.contains(&link) {
@@ -1038,11 +1201,18 @@ See [[libfoo-cjk-repro]] for the reproduction.
             Trigger::parse("every 1d").unwrap(),
             Trigger::Every { days: nz(1) }
         );
-        // Surrounding whitespace is tolerated; YAML folding can introduce it.
-        assert_eq!(
-            Trigger::parse("  every   7d  ").unwrap(),
-            Trigger::Every { days: nz(7) }
-        );
+    }
+
+    #[test]
+    fn trigger_rejects_noncanonical_spacing() {
+        // The trigger is a fixed syntax, not free-form: padded or doubled spaces
+        // are errors, so a misread trigger cannot run a check on the wrong clock.
+        for bad in [" every 30d", "every  30d", "every 30d ", "on-change "] {
+            assert!(
+                Trigger::parse(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1257,20 +1427,20 @@ See [[libfoo-cjk-repro]] for the reproduction.
     #[test]
     fn empty_checks_list_fails() {
         let err = expect_err("---\nid: a\nchecks: []\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
         assert!(
-            parse_reason(&err).contains("empty"),
-            "{}",
-            parse_reason(&err)
+            r.starts_with("checks:") && r.contains("the list is empty"),
+            "{r}"
         );
     }
 
     #[test]
     fn checks_not_a_list_fails() {
         let err = expect_err("---\nid: a\nchecks: nope\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
         assert!(
-            parse_reason(&err).contains("checks:"),
-            "{}",
-            parse_reason(&err)
+            r.starts_with("checks:") && r.contains("expected a list"),
+            "{r}"
         );
     }
 
@@ -1468,13 +1638,11 @@ See [[libfoo-cjk-repro]] for the reproduction.
     fn one_bad_embedded_block_fails_whole_extraction() {
         // A malformed block must fail extraction, not be silently skipped: a host
         // file dropping a claim it meant to declare is the quiet failure we forbid.
-        let host = "Good.\n<!-- claim\nid: ok\nchecks:\n  - kind: cmd\n    run: a\n    when: on-change\nmax-age: 1d\n-->\n\nBad.\n<!-- claim\nid: BAD ID\nchecks:\n  - kind: cmd\n    run: a\n    when: on-change\nmax-age: 1d\n-->\n";
+        // The bad block uses a space in its id, which the id validator rejects.
+        let host = "Good.\n<!-- claim\nid: ok\nchecks:\n  - kind: cmd\n    run: a\n    when: on-change\nmax-age: 1d\n-->\n\nBad.\n<!-- claim\nid: bad id\nchecks:\n  - kind: cmd\n    run: a\n    when: on-change\nmax-age: 1d\n-->\n";
         let err = extract_embedded_claims("host.md", host).expect_err("expected error");
-        assert!(
-            parse_reason(&err).contains("BAD ID") || parse_reason(&err).contains("contains"),
-            "{}",
-            parse_reason(&err)
-        );
+        let r = parse_reason(&err);
+        assert!(r.contains("bad id") && r.contains("contains ' '"), "{r}");
     }
 
     #[test]
@@ -1498,17 +1666,65 @@ See [[libfoo-cjk-repro]] for the reproduction.
             parse_day_count(&format!("{}d", u32::MAX)).unwrap(),
             nz(u32::MAX)
         );
-        // One past u32 must be rejected, not silently truncated.
-        assert!(parse_day_count("4294967296d").is_err());
+        // One past u32 is rejected with a distinct "too large" message, not folded
+        // into the generic non-numeric error and not silently truncated.
+        let err = parse_day_count("4294967296d").unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]
-    fn embedded_claim_at_start_of_file_has_empty_statement() {
-        // No preceding prose is a valid, if unusual, shape: an empty statement.
+    fn day_count_rejects_noncanonical_numbers() {
+        // Signs, leading zeros, and surrounding or embedded whitespace are
+        // rejected as firmly as `12.5d`, so `u32::from_str`'s leniency never leaks.
+        for bad in ["+30d", "-30d", "030d", " 30d", "\t30d", "3 0d", "30 d"] {
+            assert!(parse_day_count(bad).is_err(), "expected '{bad}' rejected");
+        }
+        // The leading-zero message points at the canonical spelling.
+        assert!(parse_day_count("007d")
+            .unwrap_err()
+            .contains("leading zero"));
+        // An all-zero count is reported as non-positive, not as a leading zero.
+        assert!(parse_day_count("000d").unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn max_age_and_every_share_strict_numeric_rules() {
+        // The same non-canonical spellings are rejected in both fields.
+        for bad in ["+30", "030", "30 "] {
+            let ma = format!("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: \"{bad}d\"\n---\nS.\n");
+            assert!(
+                expect_err(&ma).to_string().contains("max-age"),
+                "max-age {bad}"
+            );
+            assert!(
+                Trigger::parse(&format!("every {bad}d")).is_err(),
+                "every {bad}d"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_claim_with_no_preceding_prose_fails() {
+        // The statement is required in both host formats; an embedded block with
+        // no prose above it is an error that points the author at the fix.
         let host = "<!-- claim\nid: x\nchecks:\n  - kind: cmd\n    run: a\n    when: on-change\nmax-age: 1d\n-->\n";
-        let claims = extract_embedded_claims("f.md", host).unwrap();
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].statement, "");
+        let err = extract_embedded_claims("f.md", host).expect_err("expected an error");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("no statement") && r.contains("before the"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn file_claim_with_no_body_fails() {
+        let text = "---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: 1d\n---\n\n   \n";
+        let err = expect_err(text);
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("no statement") && r.contains("markdown body"),
+            "{r}"
+        );
     }
 
     #[test]
@@ -1518,5 +1734,258 @@ See [[libfoo-cjk-repro]] for the reproduction.
         assert_eq!(claim.id.to_string(), "payments/libfoo-pin");
         assert_eq!(claim.wiki_links[0].to_string(), "libfoo-cjk-repro");
         assert_eq!(claim.supports[0].to_string(), "requirements.txt#libfoo");
+    }
+
+    #[test]
+    fn embedded_arrow_inside_a_value_does_not_truncate_the_block() {
+        // A `-->` inside a YAML string must not be mistaken for the closing fence:
+        // truncating here would silently drop the second check with no error, the
+        // exact "nag never a lie" break the fence-on-own-line rule prevents.
+        let host = "A fact.\n<!-- claim\nid: silent\nmax-age: 1d\nchecks:\n  - kind: agent\n    when: on-change\n    instruction: A --> B\n  - kind: cmd\n    run: second\n    when: on-change\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].checks.len(), 2);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "A --> B".to_owned()
+            }
+        );
+        assert_eq!(
+            claims[0].checks[1].kind,
+            CheckKind::Cmd {
+                run: "second".to_owned(),
+                negate: false
+            }
+        );
+    }
+
+    #[test]
+    fn embedded_closer_must_be_alone_on_its_line() {
+        // A line that starts with `-->` but has trailing content is not a closer;
+        // only a `-->` alone on its line terminates the block. Here the arrow-led
+        // line lives inside a block scalar and must be carried into the value.
+        let host = "A fact.\n<!-- claim\nid: x\nchecks:\n  - kind: agent\n    when: on-change\n    instruction: |\n      step one\n      --> keep scanning\nmax-age: 1d\n-->\n";
+        let claims = extract_embedded_claims("host.md", host).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].checks[0].kind,
+            CheckKind::Agent {
+                instruction: "step one\n--> keep scanning\n".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn indented_dashes_in_a_block_scalar_are_not_the_closing_fence() {
+        // A `---` line inside a `|` block scalar is indented data, not the fence;
+        // a trimmed compare would truncate the frontmatter here and then reject it.
+        let text = "---\nid: a\nchecks:\n  - kind: agent\n    when: every 30d\n    instruction: |\n      first line\n      ---\n      third line\nmax-age: 1d\n---\nStatement.\n";
+        let claim = parse_claim_file("f.md", text).unwrap();
+        assert_eq!(
+            claim.checks[0].kind,
+            CheckKind::Agent {
+                instruction: "first line\n---\nthird line\n".to_owned()
+            }
+        );
+        assert_eq!(claim.statement, "Statement.");
+    }
+
+    #[test]
+    fn embedded_keyword_needs_a_boundary() {
+        // `<!-- claims ...` and `<!-- claimant` are ordinary comments, not blocks,
+        // so an innocent comment is not turned into a whole-file parse error.
+        let host = "See the docs.\n<!-- claims are documented in docs/claims.md -->\nMore text.\n";
+        let claims = extract_embedded_claims("README.md", host).unwrap();
+        assert!(claims.is_empty());
+
+        let host2 = "<!-- claimant details below -->\n";
+        assert!(extract_embedded_claims("f.md", host2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn misspelled_negate_is_rejected_not_silently_ignored() {
+        // `negated:` must not parse as `negate: false` and silently flip the
+        // check's sense; an unknown field on a check is an error naming the field.
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    negated: true\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0]") && r.contains("unknown field 'negated'"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn field_belonging_to_another_kind_is_rejected() {
+        // `run` on a human check, `instruction` on a cmd check: each names the
+        // stray field and the kind it does not belong to.
+        let human_run = expect_err("---\nid: a\nchecks:\n  - kind: human\n    run: x\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&human_run);
+        assert!(
+            r.contains("unknown field 'run'") && r.contains("'human'"),
+            "{r}"
+        );
+
+        let cmd_instruction = expect_err("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    instruction: y\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&cmd_instruction);
+        assert!(
+            r.contains("unknown field 'instruction'") && r.contains("'cmd'"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn id_wrong_type_fails() {
+        let err = expect_err("---\nid: 42\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.starts_with("id:") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn non_string_top_level_key_fails() {
+        let err = expect_err("---\n42: x\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        assert!(
+            parse_reason(&err).contains("non-string field name"),
+            "{}",
+            parse_reason(&err)
+        );
+    }
+
+    #[test]
+    fn frontmatter_that_is_a_sequence_or_scalar_fails() {
+        let seq = expect_err("---\n- a\n- b\n---\nS.\n");
+        let r = parse_reason(&seq);
+        assert!(
+            r.contains("must be a YAML mapping") && r.contains("a list"),
+            "{r}"
+        );
+
+        let scalar = expect_err("---\njust a string\n---\nS.\n");
+        let r = parse_reason(&scalar);
+        assert!(
+            r.contains("must be a YAML mapping") && r.contains("a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn check_element_not_a_mapping_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - just-a-string\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.starts_with("checks[0]:") && r.contains("expected a mapping"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn kind_non_string_fails() {
+        let err = expect_err(
+            "---\nid: a\nchecks:\n  - kind: [cmd]\n    when: on-change\nmax-age: 1d\n---\nS.\n",
+        );
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0].kind") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn when_non_string_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: [on-change]\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0].when") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn human_prompt_wrong_type_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: human\n    prompt: [a, b]\n    when: on-change\nmax-age: 1d\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.contains("checks[0].prompt") && r.contains("expected a string"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn max_age_as_a_list_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: [1d]\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(r.starts_with("max-age:") && r.contains("a list"), "{r}");
+    }
+
+    #[test]
+    fn supports_not_a_list_fails() {
+        let err = expect_err("---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: 1d\nsupports: requirements.txt#libfoo\n---\nS.\n");
+        let r = parse_reason(&err);
+        assert!(
+            r.starts_with("supports:") && r.contains("expected a list"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn wiki_links_do_not_span_a_newline() {
+        // A `[[` whose `]]` is on a later line is not a link.
+        let links = harvest_wiki_links("open [[start\nend]] and a real [[link]] here");
+        assert_eq!(
+            links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+            ["link"]
+        );
+    }
+
+    #[test]
+    fn wiki_link_triple_brackets_takes_innermost() {
+        // `[[[x]]]` yields `x`, not `[x` with a stray leading bracket.
+        let links = harvest_wiki_links("nested [[[x]]] here");
+        assert_eq!(links.iter().map(|w| w.as_str()).collect::<Vec<_>>(), ["x"]);
+    }
+
+    #[test]
+    fn claim_id_from_str_validates_bare_ids() {
+        assert_eq!(
+            "payments/libfoo-pin".parse::<ClaimId>().unwrap().as_str(),
+            "payments/libfoo-pin"
+        );
+        // The public entry point rejects the same shapes the file parser does, and
+        // its error reason quotes the offending id.
+        let err = "Bad Id".parse::<ClaimId>().unwrap_err();
+        assert!(
+            parse_reason(&err).contains("Bad Id"),
+            "{}",
+            parse_reason(&err)
+        );
+        assert!("trailing/".parse::<ClaimId>().is_err());
+    }
+
+    #[test]
+    fn days_from_str_validates_bare_durations() {
+        assert_eq!("120d".parse::<Days>().unwrap(), Days(nz(120)));
+        assert!("0d".parse::<Days>().is_err());
+        assert!("120".parse::<Days>().is_err());
+        assert!("+5d".parse::<Days>().is_err());
+    }
+
+    #[test]
+    fn days_get_returns_plain_u32() {
+        let d: Days = "30d".parse().unwrap();
+        // No second unwrap needed at call sites doing arithmetic.
+        assert_eq!(d.get(), 30u32);
+        assert_eq!(d.get() * 2, 60);
+    }
+
+    #[test]
+    fn dense_openers_without_newlines_are_bounded_and_correct() {
+        // Many `<!-- claim` substrings on a single newline-free line, none of them
+        // real openers (each followed by non-boundary text), must all be skipped
+        // and yield no claims — exercising the bounded backward scan.
+        let host = "<!-- claimA <!-- claimB <!-- claimC ".repeat(50);
+        assert!(extract_embedded_claims("f.md", &host).unwrap().is_empty());
     }
 }

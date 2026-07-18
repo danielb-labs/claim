@@ -11,12 +11,6 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# YAML parser for claim frontmatter and embedded-claim blocks. Upstream
-# `serde_yaml` is archived and unmaintained, which is disqualifying for a tool
-# whose product is trust. Of the two maintained forks the methodology approves,
-# `serde_norway` was chosen over `serde_yaml_ng`: it has the more recent release
-# cadence (a live signal that dependency and security fixes keep landing) and
-# actively tracks upstream `serde` and its `unsafe-libyaml` backend. Both are
-# drop-in serde-compatible; the deciding factor is which fork is least likely to
-# rot, since a verification tool cannot depend on an unmaintained parser.
+# YAML parser for claim frontmatter and embedded blocks. Chosen over the archived
+# `serde_yaml` and the alternative fork `serde_yaml_ng`; rationale in CLAUDE.md.
 serde_norway = { workspace = true }

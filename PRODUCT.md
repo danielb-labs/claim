@@ -92,11 +92,47 @@ checks:
       drifted. Cite the changelog entry or issue in your evidence.
     when: every 30d
 max-age: 120d
-links:
-  supports: [decision:requirements.txt#libfoo]
+supports: [requirements.txt#libfoo]
 ---
 We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.
 Established by reproducing the corruption on 5.1 (repro in history).
+```
+
+The frontmatter schema, precisely: `id` is a required kebab-case slug
+(lowercase letters, digits, hyphens, `/` as a namespace separator, e.g.
+`payments/libfoo-pin`). `checks` is a required non-empty list; each check
+has a `kind` (`cmd`, `agent`, or `human`) and a `when` trigger that is
+either `on-change` or `every <N>d`. A `cmd` check has a `run` command and
+an optional `negate` (default false); an `agent` check has an
+`instruction`; a `human` check has an optional `prompt`. `max-age` is a
+required `<N>d` duration. `supports` is an optional top-level list of
+targets this claim justifies — decision refs like `requirements.txt#libfoo`
+or bare claim ids. (`supports` is a plain top-level list, not wrapped in a
+`links:` object: with one declared edge type there is nothing for a wrapper
+to disambiguate. The `[[wiki-links]]` in the body are harvested separately.)
+The markdown body is the statement and is required — a claim with no prose
+is rejected.
+
+**Embedded claims.** The same schema also travels inside another file
+(CLAUDE.md, AGENTS.md, or any text file) as an HTML comment block, so a
+context file can carry the claims that keep it honest. The block opens with
+`<!-- claim` alone on its own line, contains the identical YAML, and closes
+with `-->` alone on its own line; the statement is the non-blank text
+immediately above the opener. A single host file may hold several such
+blocks. Both fences must stand alone on their lines so that a `-->` inside a
+YAML value never truncates the block. The `id` is required here too — an
+embedded claim is a full claim, not a fragment.
+
+```markdown
+We pin libfoo at 4.2; 5.x corrupts CJK PDF export.
+<!-- claim
+id: payments/libfoo-pin
+checks:
+  - kind: cmd
+    run: "grep -q 'libfoo==4.2' requirements.txt"
+    when: on-change
+max-age: 120d
+-->
 ```
 
 Things to notice:
