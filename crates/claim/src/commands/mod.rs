@@ -6,6 +6,7 @@ pub mod amend;
 pub mod check;
 pub mod docs;
 pub mod drift;
+pub mod graph;
 pub mod init;
 pub mod list;
 pub mod log;

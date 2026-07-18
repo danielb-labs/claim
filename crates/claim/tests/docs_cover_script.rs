@@ -72,7 +72,7 @@ fn run_script(root: &Path) -> i32 {
 /// entry inside a `<section id="mcp">` block, the exact shape the real site uses.
 fn covered_index() -> String {
     let verbs = [
-        "init", "add", "check", "list", "log", "drift", "amend", "retire", "stats", "docs",
+        "init", "add", "check", "list", "log", "drift", "amend", "retire", "stats", "graph", "docs",
     ];
     let mut html = String::from("<html><body>\n");
     for verb in verbs {

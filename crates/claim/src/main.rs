@@ -80,6 +80,7 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
         Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),
         Command::Retire(args) => commands::retire::run(args, format).map(|()| 0),
         Command::Stats(args) => commands::stats::run(args, format).map(|()| 0),
+        Command::Graph(args) => commands::graph::run(args, format),
         Command::Docs(args) => commands::docs::run(args, format).map(|()| 0),
     }
 }
