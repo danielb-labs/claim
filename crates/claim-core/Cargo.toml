@@ -11,3 +11,6 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# YAML parser for claim frontmatter and embedded blocks. Chosen over the archived
+# `serde_yaml` and the alternative fork `serde_yaml_ng`; rationale in CLAUDE.md.
+serde_norway = { workspace = true }

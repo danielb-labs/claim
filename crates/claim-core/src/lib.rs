@@ -11,8 +11,13 @@
 //! including a check that could not run, resolves to something the operator will
 //! eventually be nagged about. The failure mode is a nag, never a lie.
 
+pub mod claim;
 pub mod error;
 pub mod verdict;
 
+pub use claim::{
+    extract_embedded_claims, parse_claim_file, Check, CheckKind, Claim, ClaimId, Days, Source,
+    SupportTarget, Trigger, WikiLink,
+};
 pub use error::{Error, Result};
 pub use verdict::{Status, Verdict};
