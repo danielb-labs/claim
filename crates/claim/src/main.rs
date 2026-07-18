@@ -63,13 +63,14 @@ fn main() {
 
 /// Route a parsed command to its implementation, returning the process exit code.
 ///
-/// Most verbs return `0` on success; `check` and `drift` return a richer code
-/// (see the module docs) computed from what they found. An `Err` is reported and
-/// mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and never
-/// a verb's low code.
+/// Most verbs return `0` on success; `check`, `list`, and `drift` return a richer
+/// code (see the module docs) computed from what they found. An `Err` is reported
+/// and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and
+/// never a verb's low code.
 ///
-/// Unbuilt verbs return an error here rather than doing nothing, so an unfinished
-/// command exits non-zero and never masquerades as a success.
+/// `amend`, `retire`, and `stats` are binary: `0` on success (via `.map(|()| 0)`),
+/// `2` on any error — they have no review-worthy middle code the way `check`/`drift`
+/// do.
 fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
     match command {
         Command::Init(args) => commands::init::run(args, format).map(|()| 0),
@@ -78,9 +79,9 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
         Command::List(args) => commands::list::run(args, format),
         Command::Log(args) => commands::log::run(args, format).map(|()| 0),
         Command::Drift(args) => commands::drift::run(args, format),
-        Command::Amend | Command::Retire | Command::Stats => {
-            anyhow::bail!("`claim {}` is not implemented yet", command.name())
-        }
+        Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),
+        Command::Retire(args) => commands::retire::run(args, format).map(|()| 0),
+        Command::Stats(args) => commands::stats::run(args, format).map(|()| 0),
     }
 }
 

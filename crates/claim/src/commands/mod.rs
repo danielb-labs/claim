@@ -2,8 +2,11 @@
 //! CLI grammar that feeds them lives in [`crate::cli`].
 
 pub mod add;
+pub mod amend;
 pub mod check;
 pub mod drift;
 pub mod init;
 pub mod list;
 pub mod log;
+pub mod retire;
+pub mod stats;
