@@ -515,8 +515,9 @@ quarters. Value lands the first time a CLAUDE.md sentence goes red.
   mapping its output to a verdict under the same broken-never-passes
   contract as `cmd`; unset, agent checks stay `Unverifiable` and nothing is
   spawned, so a default run never contacts a model. The runner (e.g. a
-  wrapper around `claude -p "<instruction>" --output-format json`), its key,
-  and its budget are the customer's. See `docs/agent-checks.md`. What
+  wrapper around `claude -p`, fed the prompt on stdin, like
+  `examples/claude-runner.sh`), its key, and its budget are the customer's.
+  See `docs/agent-checks.md`. What
   remains deferred here — *tiered checks* and the *adversarial spot-audit*
   of `held` verdicts — builds when checkless claims with no possible cmd
   proxy reach a double-digit share of a real corpus.

@@ -163,8 +163,34 @@ CLAIM_AGENT_CMD="$PWD/mock-agent.sh" claim check --all
 
 A real runner is a wrapper around a model CLI that reads the prompt from stdin,
 sends it to the model, and prints the model's JSON answer — for example a wrapper
-around `claude -p --output-format json` or an equivalent. That wrapper, its API
-key, and its per-check budget are the operator's responsibility.
+around `claude -p` or an equivalent. That wrapper, its API key, and its per-check
+budget are the operator's responsibility.
+
+## A reference runner, and this repo's own agent claim
+
+This repository ships one: [`examples/claude-runner.sh`](../examples/claude-runner.sh)
+is a two-line wrapper around `claude -p` that reads the prompt on stdin, lets the
+model read the tree (read-only `Read`/`Grep`/`Glob` tools only, so a check can inspect
+but never modify), and prints its verdict JSON. Point `CLAIM_AGENT_CMD` at it to run
+agent checks against a real model:
+
+```sh
+export CLAIM_AGENT_CMD="$PWD/examples/claude-runner.sh"
+claim check --all
+```
+
+The store's own agent claim, `core/negation-owned-by-the-tool`, uses it to verify
+golden invariant #2 (the tool owns negation) — a fact a `cmd` grep cannot check,
+because the only literal `sh -c "!` in the tree is the doc comment warning against it.
+Proving it needs a semantic reading of `check.rs`, which is exactly what an agent
+check is for.
+
+Because a billing-free CI has no model runner, that claim carries a `skip` with
+`unless: test -n "$CLAIM_AGENT_CMD"`: it is **skipped** (reported, never a pass)
+wherever no runner is wired, and **verified** wherever one is — locally, or in a lane
+that sets `CLAIM_AGENT_CMD`. That is the intended shape for an agent claim in a repo
+that will not call a model on every CI run: honest about not verifying, without
+failing the build.
 
 ## What is not built yet
 
