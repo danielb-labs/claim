@@ -30,3 +30,7 @@ tempfile = "3"
 # birth-order assertion compares instants (not lexical strings, which jiff's
 # trailing-zero trimming would make wrong).
 claim-core = { path = "../claim-core" }
+# Snapshot tests (CLAUDE.md) so a change to a stable rendered surface — the claim
+# file text — is a deliberate, reviewable diff. Applied only to dynamic-content-free
+# output; timestamp/temp-path-laden CLI stdout keeps structural JSON assertions.
+insta = "1"

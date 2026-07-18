@@ -47,7 +47,10 @@ fn add_writes_the_claim_file_and_birth_log() {
         .success()
         .stderr(predicate::str::contains("witnessed red"))
         .stdout(predicate::str::contains("Created claim 'libfoo-pin'"))
-        .stdout(predicate::str::contains("git add"));
+        // The handoff anchors at the store root with `git -C`, so it works from a
+        // subdirectory (M2).
+        .stdout(predicate::str::contains("git -C "))
+        .stdout(predicate::str::contains(" add "));
 
     // The claim file landed at the id-derived path and parses back.
     assert!(repo.exists(".claims/libfoo-pin.md"));
@@ -65,10 +68,16 @@ fn add_writes_the_claim_file_and_birth_log() {
     for entry in &entries {
         assert_eq!(entry["actor"], "Test User <test@example.com>");
         let commit = entry["commit"].as_str().unwrap();
-        assert!(!commit.is_empty(), "commit must be a resolved sha");
+        // A committed repo records the FULL 40-char sha (M3), config-independent —
+        // not the abbreviated form, and not the unborn sentinel.
+        assert_eq!(commit.len(), 40, "the recorded commit is the full sha");
         assert_ne!(
             commit, "0000000000000000000000000000000000000000",
             "a committed repo resolves a real sha, not the unborn sentinel"
+        );
+        assert!(
+            commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "the recorded commit is a hex sha"
         );
     }
     assert!(
@@ -115,6 +124,23 @@ fn add_json_shape_is_stable() {
     assert_eq!(v["verdict"], "held");
     assert_eq!(v["witnessed_red"], true);
     assert_eq!(v["actor"], "Test User <test@example.com>");
+    // The root is present (M2) so a subdir caller can resolve the root-relative
+    // `file`/`to_commit`. It is an absolute path to a directory that contains the
+    // written claim file (compared via canonical paths, since macOS resolves
+    // /var → /private/var and the two forms would otherwise differ).
+    let root = std::path::Path::new(v["root"].as_str().expect("root is a string"));
+    assert!(root.is_absolute(), "root is absolute: {}", root.display());
+    assert!(
+        root.join(v["file"].as_str().unwrap()).exists(),
+        "root + file resolves to the written claim"
+    );
+    assert_eq!(
+        std::fs::canonicalize(root).unwrap(),
+        std::fs::canonicalize(repo.path()).unwrap(),
+        "root is the repo root"
+    );
+    // The commit is the full sha (M3), not the abbreviated form.
+    assert_eq!(v["commit"].as_str().unwrap().len(), 40);
     let to_commit = v["to_commit"].as_array().unwrap();
     assert_eq!(to_commit.len(), 3, "the file plus two log entries");
     assert_eq!(to_commit[0], ".claims/c.md");
@@ -526,8 +552,9 @@ fn unwitnessed_records_the_claim_marked_unverified() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("WARNING"))
-        .stdout(predicate::str::contains("--unwitnessed"));
+        // The warning reaches the human on stderr (m2), never contaminating stdout.
+        .stderr(predicate::str::contains("warning:"))
+        .stderr(predicate::str::contains("unwitnessed"));
 
     // Exactly one entry (the establishing Held), and it is marked unwitnessed so a
     // later `list --unverified` can surface it.
@@ -594,6 +621,423 @@ fn json_add_without_a_witness_is_refused() {
         .stderr(predicate::str::contains("witness"));
 }
 
+// --- C1 (Critical): the default restore must never destroy the user's work. ---
+
+#[test]
+fn refuses_a_dirty_tracked_tree_and_leaves_edits_intact() {
+    // C1 regression. A repo is normally dirty when a claim is added. The default
+    // witnessed-red restore is `git checkout`, which reverts EVERY tracked file — so
+    // a pre-existing uncommitted edit to a tracked file would be silently destroyed.
+    // The add MUST refuse before perturbing, and the edit MUST survive untouched.
+    let repo = ready_repo();
+    // A tracked file with committed content, then an uncommitted edit the user cares
+    // about.
+    repo.write("notes.txt", "committed content\n");
+    repo.git(&["add", "notes.txt"]);
+    repo.git(&["commit", "-q", "-m", "add notes"]);
+    repo.write("notes.txt", "MY UNCOMMITTED EDIT\n");
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("uncommitted changes"))
+        .stderr(predicate::str::contains("stash"));
+
+    // The user's edit survived: the guard refused before any git checkout ran.
+    assert_eq!(
+        repo.read("notes.txt"),
+        "MY UNCOMMITTED EDIT\n",
+        "the pre-existing edit must not be reverted"
+    );
+    assert!(
+        !repo.exists(".claims/x.md"),
+        "nothing is written on refusal"
+    );
+}
+
+#[test]
+fn dirty_tree_json_error_kind_is_dirty_tree() {
+    // The dirty-tree refusal carries the stable machine kind, so a scripting caller
+    // can branch on it (m5) instead of matching prose.
+    let repo = ready_repo();
+    repo.write("requirements.txt", "libfoo==4.2\nDIRTY EDIT\n");
+    let output = repo
+        .claim()
+        .args([
+            "--json",
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).expect("error json on stderr");
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["kind"], "dirty-tree");
+}
+
+#[test]
+fn a_dirty_tree_is_allowed_with_an_explicit_restore_cmd() {
+    // `--restore-cmd` opts out of the git restore — the author's own inverse is
+    // trusted not to clobber unrelated work — so a dirty tree is permitted there.
+    // The unrelated edit survives because the restore only touches what the witness
+    // touched.
+    let repo = ready_repo();
+    repo.write("unrelated.txt", "committed\n");
+    repo.git(&["add", "unrelated.txt"]);
+    repo.git(&["commit", "-q", "-m", "add unrelated"]);
+    repo.write("unrelated.txt", "my dirty edit\n");
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "ok",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+            "--restore-cmd",
+            MAKE_GREEN,
+        ])
+        .assert()
+        .success();
+    assert!(repo.exists(".claims/ok.md"));
+    assert_eq!(
+        repo.read("unrelated.txt"),
+        "my dirty edit\n",
+        "the explicit restore only undoes the witness, leaving unrelated work"
+    );
+}
+
+// --- M4: the default restore must not delete untracked files (no `git clean`). ---
+
+#[test]
+fn default_restore_preserves_untracked_files() {
+    // M4 regression. This fails if the default restore ever becomes `git clean -fd`
+    // (which deletes untracked files, and the store dirs it recreates would hide the
+    // loss). A pre-existing untracked file must survive a witnessed add on the
+    // default-restore path.
+    let repo = ready_repo();
+    repo.write("scratch-untracked.txt", "keep me\n");
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "keeps-untracked",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        repo.exists("scratch-untracked.txt"),
+        "an untracked file must survive the default restore (no git clean)"
+    );
+    assert_eq!(repo.read("scratch-untracked.txt"), "keep me\n");
+}
+
+// --- M1: `--json` stdout stays a single clean JSON object even if the witness
+// prints. ---
+
+#[test]
+fn json_stdout_is_clean_even_when_the_witness_prints() {
+    // M1 regression. The witness/restore commands run via `sh -c` inheriting stdout;
+    // a witness that echoes (most real ones do) would contaminate the JSON on stdout.
+    // The ENTIRE stdout must parse as one JSON object.
+    let repo = ready_repo();
+    let output = repo
+        .claim()
+        .args([
+            "--json",
+            "add",
+            "--id",
+            "noisy",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            "echo NOISE_TO_STDOUT; echo 'libfoo==5.0' > requirements.txt",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        !text.contains("NOISE_TO_STDOUT"),
+        "witness stdout must not leak onto the tool's stdout: {text}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&text).expect("the whole stdout must parse as one JSON object");
+    assert_eq!(v["status"], "ok");
+}
+
+// --- M2: the git-add handoff works from a subdirectory. ---
+
+#[test]
+fn handoff_and_root_work_from_a_subdirectory() {
+    // M2 regression. `to_commit` is root-relative; run from a subdir, a plain
+    // `git add .claims/x.md` would fail with "did not match any files". The printed
+    // handoff anchors with `git -C <root>`, and the JSON carries `root`, so an agent
+    // in a subdir can resolve everything.
+    let repo = ready_repo();
+    std::fs::create_dir_all(repo.path().join("src/deep")).unwrap();
+
+    let output = repo
+        .claim()
+        .current_dir(repo.path().join("src/deep"))
+        .args([
+            "--json",
+            "add",
+            "--id",
+            "sub",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let root = std::path::Path::new(v["root"].as_str().unwrap());
+    // root + file (both root-relative) resolves to the real file, from anywhere.
+    assert!(root.join(v["file"].as_str().unwrap()).exists());
+    for path in v["to_commit"].as_array().unwrap() {
+        assert!(
+            root.join(path.as_str().unwrap()).exists(),
+            "each to_commit path resolves under root"
+        );
+    }
+}
+
+// --- m3: discovery stops at the git-repository boundary. ---
+
+#[test]
+fn discovery_does_not_adopt_a_store_across_the_git_boundary() {
+    // m3 regression. A `.claims/` above the repo's own `.git` belongs to a different
+    // repo (or a stray $HOME/.claims); adopting it would stamp provenance from the
+    // wrong repo. The walk stops at the git boundary, so an inner repo with no store
+    // of its own does not reach the outer store.
+    let outer = TestRepo::new(); // has a .git and (after this) a .claims above inner
+    std::fs::create_dir_all(outer.path().join(".claims/log")).unwrap();
+    let inner = outer.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    // Make `inner` its own git repository, so its `.git` is the boundary.
+    outer.git(&["-C", inner.to_str().unwrap(), "init", "-q"]);
+
+    outer
+        .claim()
+        .current_dir(&inner)
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            "true",
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            "false",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no claim store found"));
+}
+
+// --- m4: a corrupt HEAD is loud, not masked as unborn. ---
+
+#[test]
+fn corrupt_head_is_loud_not_masked_as_unborn() {
+    // m4 regression. Previously any `rev-parse HEAD` failure inside a work tree
+    // yielded the unborn sentinel, masking a corrupt HEAD. A genuinely broken HEAD
+    // must fail loudly, never silently record the all-zero sentinel.
+    let repo = ready_repo();
+    // Garbage in .git/HEAD: not a valid symref or sha.
+    std::fs::write(repo.path().join(".git/HEAD"), "this is not a ref\n").unwrap();
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            "true",
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            "false",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("HEAD").or(predicate::str::contains("git repository")));
+    assert!(!repo.exists(".claims/x.md"));
+}
+
+// --- m5: error JSON carries a stable machine `kind`. ---
+
+#[test]
+fn error_json_carries_a_stable_kind() {
+    // m5 regression. Several failure modes, each with its stable kind, so item-7
+    // agents branch on the machine value rather than English prose.
+    let repo = ready_repo();
+
+    // duplicate-id: add once, then again.
+    let dup = [
+        "--json",
+        "add",
+        "--id",
+        "d",
+        "--statement",
+        "S.",
+        "--run",
+        HOLDS,
+        "--max-age",
+        "30d",
+        "--witness-cmd",
+        MAKE_RED,
+    ];
+    repo.claim().args(dup).assert().success();
+    assert_error_kind(&repo, &dup, "duplicate-id");
+
+    // drifted-green: the fact is already false.
+    assert_error_kind(
+        &repo,
+        &[
+            "--json",
+            "add",
+            "--id",
+            "dg",
+            "--statement",
+            "S.",
+            "--run",
+            "grep -q 'nope' requirements.txt",
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ],
+        "drifted-green",
+    );
+
+    // not-witnessed: the check does not go red.
+    assert_error_kind(
+        &repo,
+        &[
+            "--json",
+            "add",
+            "--id",
+            "nw",
+            "--statement",
+            "S.",
+            "--run",
+            "true",
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ],
+        "not-witnessed",
+    );
+}
+
+/// Run a `--json add` expected to fail and assert its error object's `kind`.
+fn assert_error_kind(repo: &TestRepo, args: &[&str], expected_kind: &str) {
+    let output = repo
+        .claim()
+        .args(args)
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_slice(&output).expect("json error object on stderr");
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["kind"], expected_kind, "kind for args {args:?}");
+}
+
+// --- m1: non-TTY human-mode with no witness flags refuses clearly. ---
+
+#[test]
+fn non_tty_human_mode_without_witness_flags_refuses_clearly() {
+    // m1 regression. Without a TTY and without --witness-cmd/--unwitnessed, the
+    // interactive path is impossible; it must refuse pointing at the flags, not die
+    // with a confusing "input ended". assert_cmd provides no TTY.
+    let repo = ready_repo();
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "x",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+        ])
+        .write_stdin("") // non-TTY stdin
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not a TTY"))
+        .stderr(predicate::str::contains("--witness-cmd"))
+        .stderr(predicate::str::contains("--unwitnessed"));
+}
+
 // --- Git edge: unborn HEAD. ---
 
 #[test]
@@ -626,13 +1070,11 @@ fn add_on_an_unborn_head_uses_the_sentinel_commit() {
 
     let entries = repo.log_entries("fresh");
     for entry in &entries {
+        // The sentinel is the full 40-char null object name — non-empty (so the
+        // entry is valid) and width-consistent with a real sha.
         assert_eq!(
             entry["commit"], "0000000000000000000000000000000000000000",
-            "an unborn HEAD records the documented sentinel"
-        );
-        assert!(
-            !entry["commit"].as_str().unwrap().is_empty(),
-            "the sentinel keeps the entry's commit non-empty and valid"
+            "an unborn HEAD records the documented 40-char sentinel"
         );
     }
 }

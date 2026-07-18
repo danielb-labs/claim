@@ -50,12 +50,13 @@ use claim_core::{
 };
 use serde::Serialize;
 
+use crate::apperror::{app, ErrorKind};
 use crate::claimfile::{
     primary_cmd_check, render_and_validate, CheckDraft, CheckDraftKind, ClaimDraft,
 };
 use crate::cli::AddArgs;
 use crate::git;
-use crate::output::{emit, note, Format};
+use crate::output::{emit, note, warn, Format};
 use crate::store::{discover, Store};
 
 /// The machine form of `claim add`.
@@ -65,9 +66,14 @@ struct AddReport {
     status: &'static str,
     /// The created claim's id.
     id: String,
+    /// The store root (repository root), so an agent invoked from a subdirectory can
+    /// resolve `file` and `to_commit`, which are root-relative.
+    root: String,
     /// The path of the written claim file, relative to the store root.
     file: String,
-    /// The commit sha the birth verdict was recorded against.
+    /// The full 40-char commit sha the birth verdict was recorded against (the
+    /// unborn-HEAD sentinel when the repo has no commit yet). Full, not abbreviated,
+    /// so the recorded provenance does not vary with `core.abbrev`.
     commit: String,
     /// The actor the birth verdict was attributed to.
     actor: String,
@@ -75,8 +81,9 @@ struct AddReport {
     verdict: Verdict,
     /// Whether the check was witnessed failing. `false` only with `--unwitnessed`.
     witnessed_red: bool,
-    /// The paths the caller must `git add` and commit (invariant #4: the tool does
-    /// not commit).
+    /// The paths the caller must `git add` and commit, relative to `root` (invariant
+    /// #4: the tool does not commit). Anchor them with `root`, or use the printed
+    /// `git -C <root> add ...` line, so they resolve from any working directory.
     to_commit: Vec<String>,
 }
 
@@ -90,22 +97,26 @@ struct AddReport {
 /// `Drifted`; a git provenance failure; or an I/O failure writing the file or log.
 pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
-    let store = discover(&cwd)?;
+    let store = discover(&cwd).map_err(|e| app(ErrorKind::NoStore, e.to_string()))?;
 
     let draft = gather_draft(args, format)?;
 
-    // Validate by rendering the file and parsing it — the single validation path,
-    // reusing claim-core's schema. The parsed claim and the exact bytes come back
-    // together, so what we validate is what we write.
+    // The single validation path: render the file and parse it back, reusing
+    // claim-core's schema. The parsed claim and the exact bytes come back together,
+    // so what is validated is what is written.
     let file_path = store.claim_file_relative(&parse_id(&draft.id)?);
-    let (claim, file_text) =
-        render_and_validate(&draft, &file_path).context("the claim you described is not valid")?;
+    let (claim, file_text) = render_and_validate(&draft, &file_path).map_err(|e| {
+        app(
+            ErrorKind::InvalidInput,
+            format!("the claim you described is not valid: {e}"),
+        )
+    })?;
 
     reject_duplicate(&store, &claim)?;
 
-    // Resolve provenance up front, before the check runs or the tree is perturbed:
-    // a missing git identity or absent repository is a misconfiguration that should
-    // fail while the tree is still untouched, not after the witness dance.
+    // Provenance is resolved up front, before the check runs or the tree is
+    // perturbed: a missing git identity or absent repository should fail while the
+    // tree is still untouched, not after the witness dance.
     let provenance = Provenance {
         commit: git::resolve_commit(store.root())?,
         actor: git::resolve_actor(store.root())?,
@@ -116,12 +127,11 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
 
     let ctx = CheckContext::new(store.root());
 
-    // Step 1: the green run. The fact must be true now.
+    // The green run: the fact must be true against the current tree.
     let green = green_run(check, &ctx, format)?;
 
-    // Step 2 + 3: witness the red (unless the escape hatch is used), then restore
-    // and confirm green. Returns the log entries to record and whether red was
-    // witnessed.
+    // Witness the red (unless the escape hatch is used), then restore and confirm
+    // green, yielding the birth entries and whether the red was witnessed.
     let birth = witness(args, &store, check, &ctx, &green, format)?;
 
     write_claim_and_log(&store, &claim, &file_text, &birth, &provenance, format)
@@ -207,7 +217,10 @@ fn require_field(
     if interactive {
         return prompt();
     }
-    bail!("missing {field}; pass {flag} (no terminal is attached to prompt for it)")
+    Err(app(
+        ErrorKind::MissingInput,
+        format!("missing {field}; pass {flag} (no terminal is attached to prompt for it)"),
+    ))
 }
 
 /// Prompt on stderr and read one trimmed line from stdin.
@@ -226,7 +239,8 @@ fn prompt(message: &str) -> Result<String> {
 
 /// Parse a raw id through claim-core's validator (reused, never reimplemented).
 fn parse_id(raw: &str) -> Result<ClaimId> {
-    raw.parse::<ClaimId>().map_err(|e| anyhow::anyhow!("{e}"))
+    raw.parse::<ClaimId>()
+        .map_err(|e| app(ErrorKind::InvalidInput, e.to_string()))
 }
 
 /// Refuse a claim whose id already exists in the store: a duplicate would either
@@ -235,11 +249,14 @@ fn parse_id(raw: &str) -> Result<ClaimId> {
 fn reject_duplicate(store: &Store, claim: &Claim) -> Result<()> {
     let path = store.claim_file(&claim.id);
     if path.exists() {
-        bail!(
-            "a claim with id '{}' already exists at {}; choose a different id or edit that file",
-            claim.id,
-            path.display()
-        );
+        return Err(app(
+            ErrorKind::DuplicateId,
+            format!(
+                "a claim with id '{}' already exists at {}; choose a different id or edit that file",
+                claim.id,
+                path.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -256,21 +273,30 @@ fn green_run(check: &Check, ctx: &CheckContext, format: Format) -> Result<CheckO
 
     match outcome.verdict {
         Verdict::Held => Ok(outcome),
-        Verdict::Drifted => bail!(
-            "the check reports Drifted against the current tree ({}): the fact is already false, \
-             so there is nothing true to record. Fix the fact or the check first.",
-            outcome.status()
-        ),
-        Verdict::Broken => bail!(
-            "the check is Broken against the current tree ({}): it cannot run, so it cannot be \
-             trusted. Fix the command first.",
-            outcome.status()
-        ),
-        Verdict::Unverifiable => bail!(
-            "the check is Unverifiable ({}): claim add authors cmd checks, which never return this; \
-             this indicates an agent/human check, not supported by add in v1.",
-            outcome.status()
-        ),
+        Verdict::Drifted => Err(app(
+            ErrorKind::DriftedGreen,
+            format!(
+                "the check reports Drifted against the current tree ({}): the fact is already \
+                 false, so there is nothing true to record. Fix the fact or the check first.",
+                outcome.status()
+            ),
+        )),
+        Verdict::Broken => Err(app(
+            ErrorKind::BrokenGreen,
+            format!(
+                "the check is Broken against the current tree ({}): it cannot run, so it cannot be \
+                 trusted. Fix the command first.",
+                outcome.status()
+            ),
+        )),
+        Verdict::Unverifiable => Err(app(
+            ErrorKind::BrokenGreen,
+            format!(
+                "the check is Unverifiable ({}): claim add authors cmd checks, which never return \
+                 this; this indicates an agent/human check, not supported by add in v1.",
+                outcome.status()
+            ),
+        )),
     }
 }
 
@@ -292,6 +318,20 @@ fn witness(
         });
     }
 
+    // The default restore reverts every tracked file, so it is only safe from a
+    // clean tracked tree — a pre-existing uncommitted edit would be silently
+    // destroyed. Refuse before perturbing anything. `--restore-cmd` opts out of the
+    // git restore, so it is exempt: the author's own inverse operation is trusted
+    // not to clobber unrelated work.
+    if args.restore_cmd.is_none() && git::tracked_tree_is_dirty(store.root())? {
+        return Err(app(
+            ErrorKind::DirtyTree,
+            "the working tree has uncommitted changes to tracked files, and the default \
+             witnessed-red restore (git checkout) would discard them. Commit or stash your \
+             changes first, or pass --restore-cmd to supply your own undo. Nothing was written.",
+        ));
+    }
+
     let witnessed_drift = if let Some(cmd) = &args.witness_cmd {
         witness_scripted(args, store, check, ctx, cmd, format)?
     } else {
@@ -305,12 +345,15 @@ fn witness(
     let establishing = run_check(check, ctx);
     show_evidence(format, "confirm green", &establishing);
     if establishing.verdict != Verdict::Held {
-        bail!(
-            "after restoring the tree the check is {} ({}), not Held: the tree was not restored to \
-             a state where the fact is true. Nothing was written.",
-            verdict_label(establishing.verdict),
-            establishing.status()
-        );
+        return Err(app(
+            ErrorKind::NotRestored,
+            format!(
+                "after restoring the tree the check is {} ({}), not Held: the tree was not restored \
+                 to a state where the fact is true. Nothing was written.",
+                verdict_label(establishing.verdict),
+                establishing.status()
+            ),
+        ));
     }
 
     Ok(BirthEvidence {
@@ -331,9 +374,10 @@ fn witness(
 ///   did, works on an unborn HEAD (no commit to restore from), and is the author's
 ///   own inverse operation.
 /// - `--restore-cmd` omitted: revert *tracked* modifications with `git checkout --
-///   .`, which requires the perturbation to only edit tracked files and the repo to
-///   have a commit. Untracked files the perturbation created are left for the
-///   confirm-green run to catch (the check will not hold if they matter).
+///   .`. The caller has already refused if the tracked tree was dirty, so this
+///   reverts exactly the perturbation. Untracked files the perturbation created are
+///   left for the confirm-green run to catch (the check will not hold if they
+///   matter).
 ///
 /// The restore runs *before* the drift is judged, so even a non-`Drifted` outcome
 /// leaves the tree restored rather than perturbed.
@@ -375,12 +419,20 @@ fn restore_tree(args: &AddArgs, store: &Store) -> Result<()> {
 /// Interactive witnessed-red: ask the author to make the fact false, observe the
 /// `Drifted`, then ask them to restore. The confirm-green run (in [`witness`])
 /// verifies the restore.
+///
+/// Requires a real terminal: interaction is impossible without one. When stdin is
+/// not a TTY (a script, a pipe, CI) and no `--witness-cmd`/`--unwitnessed` was
+/// given, this refuses with the flags to use rather than hanging on a prompt or
+/// dying with a confusing "input ended" — gating on the TTY, not on `--json`, so a
+/// non-interactive *human-mode* run is handled too.
 fn witness_interactive(check: &Check, ctx: &CheckContext, format: Format) -> Result<CheckOutcome> {
-    if format.is_json() {
-        bail!(
-            "witnessing the red needs interaction, but --json implies a script. Pass --witness-cmd \
-             to supply the failing state, or --unwitnessed to record the claim unverified."
-        );
+    if !std::io::stdin().is_terminal() {
+        return Err(app(
+            ErrorKind::MissingInput,
+            "witnessing the red needs an interactive terminal, but stdin is not a TTY. Pass \
+             --witness-cmd to supply the failing state, or --unwitnessed to record the claim \
+             unverified.",
+        ));
     }
 
     prompt(
@@ -397,6 +449,8 @@ fn witness_interactive(check: &Check, ctx: &CheckContext, format: Format) -> Res
          Enter to confirm.\n> ",
     )?;
 
+    // The confirm-green run in `witness` verifies the author actually restored;
+    // nothing here trusts the prompt.
     Ok(outcome)
 }
 
@@ -409,36 +463,54 @@ fn witness_interactive(check: &Check, ctx: &CheckContext, format: Format) -> Res
 fn require_drift(outcome: &CheckOutcome) -> Result<()> {
     match outcome.verdict {
         Verdict::Drifted => Ok(()),
-        Verdict::Held => bail!(
-            "the check still reports Held after the fact was made false ({}): it does not detect \
-             this drift, so it cannot be trusted. Nothing was written. Fix the check to actually \
-             test the fact.",
-            outcome.status()
-        ),
-        Verdict::Broken => bail!(
-            "the check is Broken while witnessing the red ({}): the perturbation broke the check \
-             itself rather than making it report Drifted. Nothing was written.",
-            outcome.status()
-        ),
-        Verdict::Unverifiable => bail!(
-            "the check is Unverifiable while witnessing the red ({}). Nothing was written.",
-            outcome.status()
-        ),
+        Verdict::Held => Err(app(
+            ErrorKind::NotWitnessed,
+            format!(
+                "the check still reports Held after the fact was made false ({}): it does not \
+                 detect this drift, so it cannot be trusted. Nothing was written. Fix the check to \
+                 actually test the fact.",
+                outcome.status()
+            ),
+        )),
+        Verdict::Broken => Err(app(
+            ErrorKind::NotWitnessed,
+            format!(
+                "the check is Broken while witnessing the red ({}): the perturbation broke the \
+                 check itself rather than making it report Drifted. Nothing was written.",
+                outcome.status()
+            ),
+        )),
+        Verdict::Unverifiable => Err(app(
+            ErrorKind::NotWitnessed,
+            format!(
+                "the check is Unverifiable while witnessing the red ({}). Nothing was written.",
+                outcome.status()
+            ),
+        )),
     }
 }
 
-/// Run the perturbation command through the shell, in the store root. A non-zero
-/// exit is a failure — the command is meant to mutate the tree and succeed, and a
-/// silent failure would leave the "red" unwitnessed.
+/// Run the perturbation (or restore) command through the shell, in the store root.
+///
+/// The child's stdout is redirected to *our stderr*: a witness or restore command
+/// that prints (most real ones do) must not leak onto stdout, or it would
+/// contaminate the single JSON object a `--json` consumer parses. Its stderr is
+/// inherited as-is. A non-zero exit is a failure — the command is meant to mutate
+/// the tree and succeed, and a silent failure would leave the "red" unwitnessed.
 fn run_perturbation(root: &std::path::Path, cmd: &str) -> Result<()> {
+    use std::process::Stdio;
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(root)
+        // Send the child's stdout to our stderr so it never mixes into the JSON on
+        // stdout; stderr passes through inherited.
+        .stdout(Stdio::from(std::io::stderr()))
+        .stderr(Stdio::inherit())
         .status()
-        .context("failed to spawn the --witness-cmd")?;
+        .context("failed to spawn the command")?;
     if !status.success() {
-        bail!("the --witness-cmd exited non-zero ({status})");
+        bail!("the command exited non-zero ({status})");
     }
     Ok(())
 }
@@ -503,9 +575,20 @@ fn write_claim_and_log(
     let mut to_commit = vec![file_rel.clone()];
     to_commit.extend(written_log.iter().map(|p| relative_to(store.root(), p)));
 
+    // The unwitnessed warning must reach a human in both modes and never touch the
+    // JSON on stdout, so it goes to stderr unconditionally.
+    if !birth.witnessed_red {
+        warn(
+            "recorded --unwitnessed: the check was never seen failing, so this claim is not yet \
+             trusted. `claim list --unverified` will surface it.",
+        );
+    }
+
+    let root = store.root().display().to_string();
     let report = AddReport {
         status: "ok",
         id: claim.id.to_string(),
+        root: root.clone(),
         file: file_rel,
         commit: commit.to_owned(),
         actor: actor.to_owned(),
@@ -518,16 +601,24 @@ fn write_claim_and_log(
         println!("Created claim '{}' at {}", report.id, report.file);
         if report.witnessed_red {
             println!("The check was witnessed failing, then confirmed passing (born verified).");
-        } else {
-            println!(
-                "WARNING: recorded --unwitnessed. The check was never seen failing; \
-                 `claim list --unverified` will surface it."
-            );
         }
-        println!("Recorded the birth verdict at commit {}.", report.commit);
+        // Abbreviate for the human line only; the recorded value stays the full sha.
+        println!(
+            "Recorded the birth verdict at commit {}.",
+            git::short_commit(&report.commit)
+        );
         println!("\nNothing is committed yet. Review, then commit:");
-        println!("  git add {}", report.to_commit.join(" "));
-        println!("  git commit -m \"Add claim {}\"", report.id);
+        // Anchor the paths at the store root with `git -C`, so the printed command
+        // works from any subdirectory the user ran `claim add` in.
+        println!(
+            "  git -C {} add {}",
+            report.root,
+            report.to_commit.join(" ")
+        );
+        println!(
+            "  git -C {} commit -m \"Add claim {}\"",
+            report.root, report.id
+        );
     })
 }
 

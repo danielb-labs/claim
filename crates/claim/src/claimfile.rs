@@ -170,3 +170,47 @@ pub fn primary_cmd_check(claim: &Claim) -> Option<&Check> {
         .first()
         .filter(|c| matches!(c.kind, CheckKind::Cmd { .. }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full_draft() -> ClaimDraft {
+        ClaimDraft {
+            id: "payments/libfoo-pin".to_owned(),
+            max_age: "120d".to_owned(),
+            checks: vec![CheckDraft {
+                kind: CheckDraftKind::Cmd {
+                    run: "grep -q 'libfoo==4.2' requirements.txt".to_owned(),
+                    negate: true,
+                },
+                when: "every 30d".to_owned(),
+            }],
+            supports: vec![
+                "requirements.txt#libfoo".to_owned(),
+                "other-claim".to_owned(),
+            ],
+            statement: "We pin libfoo at 4.2.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn rendered_claim_file_is_stable() {
+        // A snapshot of the rendered file (CLAUDE.md's insta obligation), on a
+        // deliberately dynamic-content-free surface: no timestamps, no temp paths,
+        // so the snapshot is stable and any format change is a reviewable diff. The
+        // `#`-bearing supports target and the quoted command exercise the YAML
+        // quoting rules.
+        insta::assert_snapshot!(render(&full_draft()));
+    }
+
+    #[test]
+    fn rendered_claim_round_trips_through_the_parser() {
+        // The bytes we write must parse back — the single validation path.
+        let draft = full_draft();
+        let (claim, text) =
+            render_and_validate(&draft, ".claims/payments/libfoo-pin.md").expect("valid claim");
+        assert_eq!(claim.id.as_str(), "payments/libfoo-pin");
+        assert_eq!(text, render(&draft));
+    }
+}

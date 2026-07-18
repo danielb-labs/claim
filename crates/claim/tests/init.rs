@@ -63,7 +63,8 @@ fn init_json_shape_is_stable() {
 #[test]
 fn init_json_emits_only_json_on_stdout() {
     // A --json run must put nothing but the JSON object on stdout, so a pipe to a
-    // parser is clean.
+    // parser is clean. Full-parse the whole stdout (not just a `{` prefix), which
+    // fails if any stray line precedes or follows the object.
     let repo = TestRepo::new();
     let output = repo
         .claim()
@@ -73,10 +74,33 @@ fn init_json_emits_only_json_on_stdout() {
         .get_output()
         .stdout
         .clone();
-    let text = String::from_utf8(output).unwrap();
-    let trimmed = text.trim_start();
-    assert!(
-        trimmed.starts_with('{'),
-        "stdout must be exactly one JSON object, got: {text}"
-    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&output).expect("the whole stdout must parse as one JSON object");
+    assert_eq!(v["status"], "ok");
+}
+
+#[test]
+fn init_outside_a_git_repo_warns() {
+    // A store outside any git repo is usable but degenerate (`claim add` needs a
+    // commit to attribute). init still succeeds, but warns on stderr — never on
+    // stdout, so `--json` stays clean.
+    let dir = TestRepo::no_git();
+    dir.claim()
+        .arg("init")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not inside a git repository"));
+
+    // The warning does not leak into the JSON object on stdout.
+    let output = dir
+        .claim()
+        .args(["--json", "init"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_slice(&output).expect("json stdout stays clean despite the warning");
+    assert_eq!(v["status"], "ok");
 }

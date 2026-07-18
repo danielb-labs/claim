@@ -23,7 +23,13 @@
 //!   is no sha to report, so [`resolve_commit`] returns the sentinel
 //!   [`UNBORN_HEAD_SENTINEL`]: git's own all-zero object name, which reads as "no
 //!   commit yet" to anyone who knows git and keeps the log entry's `commit`
-//!   non-empty so it is still a valid, appendable entry.
+//!   non-empty so it is still a valid, appendable entry. Only a *genuinely* unborn
+//!   HEAD gets the sentinel; a corrupt HEAD stays a loud error rather than being
+//!   masked as "no commit yet".
+//!
+//! Recorded shas are always the full 40-char form, never `--short`: the abbreviated
+//! width is `core.abbrev`-dependent, and the trust substrate must not vary with a
+//! user's config. Abbreviation is display-only ([`short_commit`]).
 
 use std::path::Path;
 use std::process::Command;
@@ -43,8 +49,15 @@ use anyhow::{bail, Context, Result};
 /// carry this.
 pub const UNBORN_HEAD_SENTINEL: &str = "0000000000000000000000000000000000000000";
 
-/// Resolve the short sha of the repository's current `HEAD`, for a verdict entry's
+/// Resolve the *full* sha of the repository's current `HEAD`, for a verdict entry's
 /// `commit`.
+///
+/// The full 40-char sha, not `--short`: the abbreviated form respects the user's
+/// `core.abbrev` config, so recording it would make the trust substrate (the
+/// verdict log) vary in width and content with local configuration, and be
+/// inconsistent with the 40-char unborn sentinel. The full sha is
+/// configuration-independent; callers abbreviate only for human display
+/// ([`short_commit`]).
 ///
 /// `dir` is any path inside the repository (the store root); git discovers the
 /// repository from it. On an unborn HEAD this returns [`UNBORN_HEAD_SENTINEL`]
@@ -53,29 +66,48 @@ pub const UNBORN_HEAD_SENTINEL: &str = "0000000000000000000000000000000000000000
 ///
 /// # Errors
 ///
-/// Fails when `dir` is not inside a git repository, or when the `git` binary
-/// cannot be run, with a message naming the fix. Those are real misconfigurations
-/// for a git-native tool, not states to silently continue past.
+/// Fails when `dir` is not inside a git repository, when `HEAD` is present but
+/// corrupt (distinct from unborn), or when the `git` binary cannot be run, with a
+/// message naming the fix. Those are real misconfigurations for a git-native tool,
+/// not states to silently continue past.
 pub fn resolve_commit(dir: &Path) -> Result<String> {
-    // `rev-parse --short HEAD` is the sha; it fails on an unborn HEAD, which we
-    // distinguish from "not a repo" so only the former gets the sentinel.
-    let head = run_git(dir, &["rev-parse", "--short", "HEAD"])?;
+    let head = run_git(dir, &["rev-parse", "HEAD"])?;
     if let Some(sha) = head.success_stdout() {
         return Ok(sha);
     }
 
-    // HEAD did not resolve. Either there is no repository, or the repository has
-    // no commits yet. `rev-parse --is-inside-work-tree` tells the two apart.
-    let inside = run_git(dir, &["rev-parse", "--is-inside-work-tree"])?;
-    match inside.success_stdout().as_deref() {
-        Some("true") => Ok(UNBORN_HEAD_SENTINEL.to_owned()),
-        _ => bail!(
-            "not inside a git repository (git could not resolve HEAD in {}); \
-             a claim store lives in a git repo — run `git init` or `claim` from \
-             inside your repository",
-            dir.display()
-        ),
+    // HEAD did not resolve. Classify precisely: an *unborn* HEAD is a symbolic ref
+    // to a branch that has no commit yet, which `symbolic-ref -q HEAD` still
+    // resolves to (the ref name), while a corrupt HEAD or a bare "not a repo" does
+    // not. Only the genuine unborn case gets the sentinel; every other failure
+    // stays loud, so a corrupt HEAD is never masked as "no commit yet".
+    let symref = run_git(dir, &["symbolic-ref", "-q", "HEAD"])?;
+    if symref.ok && !symref.stdout.is_empty() {
+        // A symbolic HEAD exists but rev-parse found no commit: an unborn branch.
+        // Confirm we are inside a work tree so a detached-but-unborn oddity or a
+        // stray symref outside a repo cannot slip through.
+        let inside = run_git(dir, &["rev-parse", "--is-inside-work-tree"])?;
+        if inside.success_stdout().as_deref() == Some("true") {
+            return Ok(UNBORN_HEAD_SENTINEL.to_owned());
+        }
     }
+
+    bail!(
+        "could not resolve HEAD in {} (not a git repository, or HEAD is corrupt); \
+         a claim store lives in a git repo — run `git init` or `claim` from inside \
+         your repository. If HEAD is corrupt, repair it before recording a verdict.",
+        dir.display()
+    )
+}
+
+/// Abbreviate a commit sha for human display, without touching the recorded value.
+///
+/// The log and JSON keep the full sha ([`resolve_commit`]); only the human-readable
+/// print shortens it. The unborn sentinel abbreviates to a recognizable `0000000`
+/// rather than a misleading truncation.
+#[must_use]
+pub fn short_commit(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 /// Resolve the author identity for a verdict entry's `actor`, as `Name <email>`.
@@ -98,21 +130,52 @@ pub fn resolve_actor(dir: &Path) -> Result<String> {
     Ok(format!("{name} <{email}>"))
 }
 
-/// Revert *tracked* working-tree modifications to their state at `HEAD`, with
-/// `git checkout -- .`.
+/// Whether the *tracked* working tree has uncommitted changes — unstaged edits or
+/// staged-but-uncommitted ones.
 ///
-/// The default restore for the scripted witnessed-red flow when no `--restore-cmd`
-/// is supplied. Deliberately narrow: it touches only tracked files, so it can never
-/// delete the untracked `.claims/` store or any other untracked file — unlike a
-/// `git clean`, which this intentionally does not run. A perturbation that created
-/// *untracked* files is not undone here; the confirm-green run that follows catches
-/// an incomplete restore, so nothing is written against a still-perturbed tree.
+/// The default witnessed-red restore reverts every tracked file to the index, so it
+/// is only safe when the tracked tree starts clean; a pre-existing edit would be
+/// silently destroyed. `claim add` calls this before perturbing on the default path
+/// and refuses if it reports `true`. Untracked files are intentionally not counted
+/// (`-uno`): the restore never touches them, so their presence is not a hazard.
+///
+/// Combines `git diff --quiet` (working tree vs index) and `git diff --cached
+/// --quiet` (index vs HEAD); either being non-zero means dirty. On an unborn HEAD
+/// the `--cached` diff has no HEAD to compare against and reports the staged files
+/// as changes, which correctly reads as dirty — the default git restore cannot help
+/// there anyway.
 ///
 /// # Errors
 ///
-/// Fails if the checkout fails (no commit to restore from — an unborn HEAD — or
-/// `git` missing), so a botched restore is loud. On an unborn HEAD the author must
-/// supply `--restore-cmd` instead, since there is no committed state to revert to.
+/// Fails only if git cannot be run at all (not installed); a non-zero *diff* exit is
+/// the "dirty" signal, not an error.
+pub fn tracked_tree_is_dirty(dir: &Path) -> Result<bool> {
+    // `diff --quiet` exits 1 when there is a difference, 0 when clean. Distinguish
+    // that from a real spawn failure via GitOutput::ok being about the *exit*, not
+    // the spawn (run_git already turns a spawn failure into an Err).
+    let unstaged = run_git(dir, &["diff", "--quiet"])?;
+    let staged = run_git(dir, &["diff", "--cached", "--quiet"])?;
+    Ok(!unstaged.ok || !staged.ok)
+}
+
+/// Revert *tracked* working-tree modifications to their staged (index) state, with
+/// `git checkout -- .`.
+///
+/// The default restore for the scripted witnessed-red flow when no `--restore-cmd`
+/// is supplied, used only after [`tracked_tree_is_dirty`] confirmed the tracked tree
+/// was clean before the perturbation — so it reverts exactly the perturbation and
+/// nothing of the author's. Deliberately narrow: it touches only tracked files and
+/// restores them from the *index* (not `HEAD`), so it can never delete the untracked
+/// `.claims/` store or any other untracked file — unlike a `git clean`, which this
+/// intentionally does not run. A perturbation that created *untracked* files is not
+/// undone here; the confirm-green run that follows catches an incomplete restore, so
+/// nothing is written against a still-perturbed tree.
+///
+/// # Errors
+///
+/// Fails if the checkout fails (an unborn HEAD with an empty index has nothing to
+/// restore, or `git` missing), so a botched restore is loud. On an unborn HEAD the
+/// author must supply `--restore-cmd` instead.
 pub fn revert_tracked_changes(dir: &Path) -> Result<()> {
     run_git(dir, &["checkout", "--", "."])?
         .into_result()
@@ -120,6 +183,21 @@ pub fn revert_tracked_changes(dir: &Path) -> Result<()> {
             "failed to revert tracked changes while restoring the tree; on a repo with no \
              commit yet, pass --restore-cmd to undo the perturbation",
         )
+}
+
+/// Whether `dir` is inside a git working tree.
+///
+/// A best-effort predicate for the `init` warning: a store outside a repo is usable
+/// but cannot attribute verdicts. Returns `false` on any failure (git missing, not a
+/// repo), because the only caller wants "is this safely a repo?" and treats every
+/// non-yes as "warn".
+#[must_use]
+pub fn is_inside_work_tree(dir: &Path) -> bool {
+    run_git(dir, &["rev-parse", "--is-inside-work-tree"])
+        .ok()
+        .and_then(|o| o.success_stdout())
+        .as_deref()
+        == Some("true")
 }
 
 /// Read one git config value, trimmed. `None` maps to a clear "set it" error.

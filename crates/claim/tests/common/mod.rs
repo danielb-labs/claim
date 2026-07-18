@@ -43,6 +43,14 @@ impl TestRepo {
         repo
     }
 
+    /// A temp directory that is *not* a git repository, for the "store outside a
+    /// repo" warning. Named `TestRepo` for reuse of its helpers even though there is
+    /// no repo here.
+    pub fn no_git() -> Self {
+        let dir = TempDir::new().expect("make temp dir");
+        TestRepo { dir }
+    }
+
     fn init_bare_repo() -> Self {
         let dir = TempDir::new().expect("make temp dir");
         let repo = TestRepo { dir };

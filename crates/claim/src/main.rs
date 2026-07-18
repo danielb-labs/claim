@@ -13,6 +13,7 @@
 //! with those verbs; the two verbs built here are binary — they worked or they did
 //! not.
 
+mod apperror;
 mod claimfile;
 mod cli;
 mod commands;
@@ -22,6 +23,7 @@ mod store;
 
 use clap::Parser;
 
+use apperror::kind_of;
 use cli::{Cli, Command};
 use output::Format;
 
@@ -64,13 +66,16 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<()> {
 ///
 /// The whole cause chain is rendered, not just the outermost context, so the
 /// specific fix a lower layer named (a parser's "max-age: ... write '120d'") is not
-/// swallowed by a broad wrapper ("the claim you described is not valid").
+/// swallowed by a broad wrapper ("the claim you described is not valid"). The JSON
+/// form also carries a stable `kind` discriminator ([`kind_of`]) so a scripting
+/// consumer branches on the machine value, not the English prose.
 fn report_error(err: &anyhow::Error, format: Format) {
     let message = full_chain(err);
     match format {
         Format::Json => {
             let body = serde_json::json!({
                 "status": "error",
+                "kind": kind_of(err).as_str(),
                 "error": message,
             });
             // A serialization failure on this tiny object is impossible in practice;

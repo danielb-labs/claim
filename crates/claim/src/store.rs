@@ -126,17 +126,26 @@ impl Store {
 }
 
 /// Find the store by walking up from `start` to the nearest ancestor that contains
-/// a `.claims/` directory.
+/// a `.claims/` directory, stopping at the git-repository boundary.
 ///
 /// The nearest match wins, so a nested repository's own store shadows an outer
 /// one — the same containment rule git uses for `.git/`. Runs from any directory
 /// inside a repository, which is why a verb never assumes it was invoked at the
 /// root.
 ///
+/// The walk stops at the first ancestor that *is* a git repository (contains a
+/// `.git`): a `.claims/` found strictly above that boundary belongs to a different
+/// repository (or a stray `$HOME/.claims`), and adopting it would stamp provenance
+/// from the wrong repo onto claims in this one. A `.claims/` at the repo root or
+/// below is inside the boundary and accepted. When `start` is not inside any git
+/// repository, no boundary is hit and the walk proceeds to the filesystem root — a
+/// bare `.claims/` with no repo is still a usable store for the CLI, and `add` will
+/// separately refuse for lack of a commit to attribute.
+///
 /// # Errors
 ///
-/// Fails when no ancestor contains a `.claims/`, with a message pointing at
-/// `claim init` — the store has to be scaffolded before a claim can be added to
+/// Fails when no `.claims/` is found within the boundary, with a message pointing
+/// at `claim init` — the store has to be scaffolded before a claim can be added to
 /// it.
 pub fn discover(start: &Path) -> Result<Store> {
     for dir in start.ancestors() {
@@ -146,9 +155,16 @@ pub fn discover(start: &Path) -> Result<Store> {
                 root: dir.to_path_buf(),
             });
         }
+        // The git boundary: a `.claims/` above this belongs to another repo, so do
+        // not adopt it. Checked *after* this level's `.claims/` so a store at the
+        // repo root (alongside `.git`) is still found.
+        if dir.join(".git").exists() {
+            break;
+        }
     }
     bail!(
-        "no claim store found in {} or any parent directory; run `claim init` to create one",
+        "no claim store found in {} or any parent directory up to the git repository root; \
+         run `claim init` to create one",
         start.display()
     )
 }

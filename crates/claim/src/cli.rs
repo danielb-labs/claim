@@ -32,8 +32,7 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     /// Emit machine-readable JSON instead of human-readable text.
     ///
-    /// Global so it can precede or follow the verb (`claim --json add …` or
-    /// `claim add … --json`), and so every command shares one output contract.
+    /// May precede or follow the verb (`claim --json add …` or `claim add … --json`).
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -109,7 +108,7 @@ pub struct InitArgs {
 #[derive(Debug, clap::Args)]
 pub struct AddArgs {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
-    /// (e.g. `payments/libfoo-pin`). Validated by `claim-core`.
+    /// (e.g. `payments/libfoo-pin`).
     #[arg(long)]
     pub id: Option<String>,
 
@@ -133,7 +132,7 @@ pub struct AddArgs {
     pub negate: bool,
 
     /// The dead-man's switch: how long a passing check keeps the claim fresh, as
-    /// `<N>d` (e.g. `120d`). Validated by `claim-core`.
+    /// `<N>d` (e.g. `120d`).
     #[arg(long, value_name = "DAYS")]
     pub max_age: Option<String>,
 

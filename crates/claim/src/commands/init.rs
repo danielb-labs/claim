@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cli::InitArgs;
-use crate::output::{emit, Format};
+use crate::git;
+use crate::output::{emit, warn, Format};
 use crate::store::Store;
 
 /// The machine form of `claim init`, stable across runs.
@@ -45,6 +46,17 @@ pub fn run(args: &InitArgs, format: Format) -> Result<()> {
     };
 
     let (store, created) = Store::init(&root)?;
+
+    // A store outside a git repository is technically usable but degenerate: `claim
+    // add` cannot attribute a verdict without a commit and identity, so warn rather
+    // than let the user discover it later. Not fatal — `git init` may simply come
+    // next.
+    if !git::is_inside_work_tree(store.root()) {
+        warn(
+            "this store is not inside a git repository; `claim add` needs one to attribute \
+             verdicts. Run `git init` here before adding claims.",
+        );
+    }
 
     let report = InitReport {
         status: "ok",
