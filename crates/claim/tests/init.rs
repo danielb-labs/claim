@@ -6,12 +6,17 @@ use common::TestRepo;
 use predicates::prelude::*;
 
 #[test]
-fn init_creates_the_store_directories() {
+fn init_creates_only_the_claims_dir() {
+    // The CLI is a stateless verifier: it writes no verdict log, so `init` scaffolds
+    // only `.claims/` and never a `.claims/log/` tree.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
 
     assert!(repo.exists(".claims"), ".claims/ must be created");
-    assert!(repo.exists(".claims/log"), ".claims/log/ must be created");
+    assert!(
+        !repo.exists(".claims/log"),
+        "no verdict log tree is created; the CLI stores no verdicts"
+    );
 }
 
 #[test]

@@ -11,7 +11,6 @@ checks:
       a non-0/1 exit, a spawn failure) into a false pass: Broken must stay Broken
       regardless of `negate`. Return held if the invariant holds; drifted if any code
       path violates it.
-    when: on-change
     skip:
       reason: >-
         Needs a model runner (CLAIM_AGENT_CMD); billing-free CI has none, so this
@@ -20,7 +19,8 @@ checks:
       unless: 'test -n "$CLAIM_AGENT_CMD"'
 supports:
   - CLAUDE.md#The tool owns negation
-max-age: 180d
+hub:
+  max-age: 180d
 ---
 Golden invariant #2 holds: negation is computed inside the tool, over Held/Drifted
 only, never by a shell's interpretation of `!` — so a missing binary or a deleted path

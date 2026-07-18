@@ -14,10 +14,10 @@
 # *debug* binary's own `--help`, so it tracks the shipped CLI surface exactly. The
 # gate keeps that binary current: `scripts/check.sh` has a "dogfood claims" step that
 # builds `claim` (also a side effect of `cargo test`) and then runs
-# `./target/debug/claim check --all --report-only`, which is what executes this check.
-# So on the gate the binary is always fresh; a missing one is Broken (exit 2), never a
-# false pass. The MCP tool list comes from the server source (each `#[tool]` handler),
-# the single source of truth for what the server registers.
+# `./target/debug/claim check`, which is what executes this check. So on the gate the
+# binary is always fresh; a missing one is Broken (exit 2), never a false pass. The MCP
+# tool list comes from the server source (each `#[tool]` handler), the single source of
+# truth for what the server registers.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"

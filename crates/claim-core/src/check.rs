@@ -72,11 +72,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The default cap on retained check output, 8 KiB.
 ///
-/// Output is evidence for the verdict log, not a transcript: a few kilobytes is
-/// enough to show the grep line that matched or the error that broke the check,
-/// while a hard cap keeps a runaway command (a megabyte of build spam) from
-/// bloating the log or memory. Retention stops at the cap and the evidence is
-/// marked truncated; see [`CheckOutcome::evidence`].
+/// Output is evidence reported with the verdict, not a transcript: a few
+/// kilobytes is enough to show the grep line that matched or the error that broke
+/// the check, while a hard cap keeps a runaway command (a megabyte of build spam)
+/// from bloating the report or memory. Retention stops at the cap and the evidence
+/// is marked truncated; see [`CheckOutcome::evidence`].
 pub const DEFAULT_OUTPUT_CAP: usize = 8 * 1024;
 
 /// How a check is executed: where it runs, how long it may take, and how much of
@@ -179,11 +179,11 @@ impl CheckContext {
 /// `Held`; every other variant is unconditionally [`Verdict::Broken`].
 ///
 /// Exposed on [`CheckOutcome::end`] rather than only as a prose string because
-/// item 4 serializes outcomes into the committed verdict log: a structured value
-/// lets that history be filtered by machine ("show every timeout") and does not
-/// bake a run's configured timeout into the record the way a `"timed out after
-/// 60s"` string would. The [`Display`](std::fmt::Display) impl renders the human
-/// one-liner. `#[non_exhaustive]` because a future execution lane may add ends.
+/// the `--json` report serializes it: a structured value lets a consumer (a hub, a
+/// CI lane) filter by machine ("show every timeout") and does not bake a run's
+/// configured timeout into the record the way a `"timed out after 60s"` string
+/// would. The [`Display`](std::fmt::Display) impl renders the human one-liner.
+/// `#[non_exhaustive]` because a future execution lane may add ends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 #[non_exhaustive]
@@ -246,13 +246,13 @@ impl std::fmt::Display for ProcessEnd {
     }
 }
 
-/// The result of running one check: its verdict and the evidence a caller records.
+/// The result of running one check: its verdict and the evidence a caller reports.
 ///
-/// This is the hand-off to the verdict log (`crate::log::append_entry`), and
-/// deliberately nothing more: producing it is core's job, recording it (with a
-/// commit sha, an actor, and a timestamp) is a later item's. The fields are the
+/// This is the hand-off a caller reports (in `--json` or a human summary) and
+/// deliberately nothing more: producing it is core's job. The fields are the
 /// facts that cannot be recovered afterward — what the tool concluded, how long
-/// it took, what the process actually did.
+/// it took, what the process actually did. The CLI reports these and stores
+/// nothing; persisting a verdict stream is the hub's job, not core's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CheckOutcome {
@@ -260,15 +260,15 @@ pub struct CheckOutcome {
     /// answer to "did this check pass"; only [`Verdict::Held`] does.
     pub verdict: Verdict,
     /// How the process ended, structured — the machine-readable truth the verdict
-    /// was derived from. Recorded so a `Broken` verdict in the log says *why* it
-    /// broke and can be filtered by kind. [`status`](CheckOutcome::status) renders
-    /// its human one-liner.
+    /// was derived from. Reported so a `Broken` verdict says *why* it broke and can
+    /// be filtered by kind. [`status`](CheckOutcome::status) renders its human
+    /// one-liner.
     pub end: ProcessEnd,
     /// Combined stdout+stderr, truncated to the context's `output_cap`. `None`
     /// when the process produced no output or never started. When truncated, the
     /// retained bytes end with a marker line naming the cap, so a reader is never
-    /// misled into thinking they have the whole output. This is the evidence for
-    /// the log entry.
+    /// misled into thinking they have the whole output. This is the evidence
+    /// reported with the verdict.
     pub evidence: Option<String>,
     /// Wall-clock time from spawn to conclusion. Useful for spotting a check
     /// creeping toward its timeout before it actually breaks.
@@ -610,10 +610,10 @@ struct AgentResponse {
 }
 
 impl AgentResponse {
-    /// The evidence note recorded in the verdict log: the runner's stated evidence
+    /// The evidence note reported with the verdict: the runner's stated evidence
     /// followed by its citations, one per line. Kept human-readable because the
-    /// evidence is the point of an agent check — a person reading the log sees the
-    /// reasoning and the sources, not a bare verdict.
+    /// evidence is the point of an agent check — a person reading the report sees
+    /// the reasoning and the sources, not a bare verdict.
     fn evidence_note(&self) -> String {
         let mut note = self.evidence.clone();
         if !self.citations.is_empty() {
@@ -911,7 +911,7 @@ pub fn build_agent_prompt(instruction: &str) -> String {
 /// Truncate an evidence note to `cap` bytes on a char boundary, marking truncation.
 ///
 /// Mirrors the cmd path's cap ([`evidence_from`]) so an agent's evidence cannot
-/// bloat the verdict log any more than a command's output can. Truncation is at a
+/// bloat the report any more than a command's output can. Truncation is at a
 /// char boundary so the retained text is always valid UTF-8.
 fn cap_evidence(note: String, cap: usize) -> String {
     if note.len() <= cap {
@@ -974,7 +974,7 @@ fn apply_negation(verdict: Verdict, negate: bool) -> Verdict {
 /// `output` already carries whether it was truncated at the cap and whether a
 /// reader was detached because a process outlived the check and held its output
 /// pipe open (the escapee case; see [`execute`]). Empty output yields `None` so
-/// the log entry's `evidence` is absent rather than an empty string — unless a
+/// the outcome's `evidence` is absent rather than an empty string — unless a
 /// reader was detached, in which case the note is worth recording even with no
 /// bytes. Non-UTF-8 bytes are replaced rather than dropped, so binary noise in a
 /// command's output cannot lose the readable parts around it.
@@ -1597,17 +1597,14 @@ fn anchor_occurs(haystack: &str, anchor: &str) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::claim::Trigger;
 
-    /// A `cmd` check with the given `run` and `negate`, on the on-change trigger
-    /// (the trigger is irrelevant to execution; `run_check` never reads it).
+    /// A `cmd` check with the given `run` and `negate`.
     fn cmd(run: &str, negate: bool) -> Check {
         Check {
             kind: CheckKind::Cmd {
                 run: run.to_owned(),
                 negate,
             },
-            when: Trigger::OnChange,
             skip: None,
         }
     }
@@ -2055,7 +2052,6 @@ mod tests {
             kind: CheckKind::Agent {
                 instruction: "look into it".to_owned(),
             },
-            when: Trigger::OnChange,
             skip: None,
         };
         let outcome = run_check(&check, &CheckContext::new("."));
@@ -2076,7 +2072,6 @@ mod tests {
             kind: CheckKind::Human {
                 prompt: Some("eyeball it".to_owned()),
             },
-            when: Trigger::OnChange,
             skip: None,
         };
         let outcome = run_check(&check, &CheckContext::new("."));
@@ -2091,13 +2086,12 @@ mod tests {
     // invoked, and none can be: the runner is always a local script under our
     // control.
 
-    /// An `agent` check with the given instruction, on the on-change trigger.
+    /// An `agent` check with the given instruction.
     fn agent(instruction: &str) -> Check {
         Check {
             kind: CheckKind::Agent {
                 instruction: instruction.to_owned(),
             },
-            when: Trigger::OnChange,
             skip: None,
         }
     }
@@ -2716,9 +2710,8 @@ mod tests {
             .map(|t| format!("  - \"{t}\""))
             .collect::<Vec<_>>()
             .join("\n");
-        let src = format!(
-            "---\nid: c\nchecks:\n  - kind: cmd\n    run: x\n    when: on-change\nmax-age: 1d\nsupports:\n{list}\n---\nS.\n"
-        );
+        let src =
+            format!("---\nid: c\nchecks:\n  - kind: cmd\n    run: x\nsupports:\n{list}\n---\nS.\n");
         crate::claim::parse_claim_file("f.md", &src)
             .unwrap()
             .supports

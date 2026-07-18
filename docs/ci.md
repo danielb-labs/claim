@@ -1,22 +1,23 @@
-# CI integration: the two lanes
+# CI & the hub
 
 New here? Start with the [overview](index.html) for the core concepts (claims,
-checks, verdicts, status); this page is the CI detail behind its "CI: the two
-lanes" section.
+checks, verdicts, the CLI/hub boundary); this page is the CI detail behind its "CI
+& the hub" section.
 
-`claim` verifies recorded facts in two places, on two clocks. Both end at the same
-verdict log; they differ in what triggers them and what they are allowed to do.
+The CLI is a **stateless runtime verifier**: `claim check --json` runs every claim's
+checks and reports what held, drifted, or broke *right now*. It stores nothing — no
+verdict log, no schedule, no due-dates. The verdict stream, the schedule, and the
+standing nag live in a per-environment **hub** that ingests the CLI's reported output.
 
-- **The on-change lane** runs on every pull request. It answers "does this diff break
-  a fact someone wrote down?" and, when it does, comments on the PR — advisory, never
-  blocking.
-- **The clock lane** runs on a schedule. It answers "what has gone stale or drifted
-  while nobody was looking?" and maintains one standing issue that is the product's
-  entire v1 nag mechanism.
+The CLI stays **hub-agnostic**: it verifies and emits `--json`, and never connects to
+anything. Wrapping that output — authenticating and POSTing it to a hub, or rendering
+it into a PR comment or issue body — lives in the hub's own CI glue (a GitHub Action
+the hub ships), not in the core binary. So the same binary points at a QA hub or a
+prod hub with zero change, and never grows a hub URL, token, or protocol.
 
-This page explains both, the exit-code contract they rely on, and the boundaries that
-keep them honest. The reusable workflows live in `.github/workflows/claim-on-change.yml`
-and `.github/workflows/claim-clock.yml`; a drop-in consumer copy is in
+This page explains the exit-code contract the CI glue keys off, the renderer that
+turns `claim check --json` into the markdown a human sees, and how those pieces fit a
+GitHub workflow. The example workflow and a drop-in consumer copy are in
 `examples/consumer/`.
 
 ## The exit-code contract
@@ -28,83 +29,70 @@ mapping — the highest applicable code wins, so a mixed store reports its worst
 |------|---------|
 | `0`  | Every check held and every `supports` target resolved. |
 | `1`  | At least one drifted or unverifiable verdict, or an unresolved support — review needed. |
-| `2`  | At least one broken check, an unloadable/duplicate-id claim file, an unreadable verdict log, or a tool error. |
+| `2`  | At least one broken check, an unloadable/duplicate-id claim file, or a tool error. |
 
 The rule that matters most: **a broken check is exit 2, never a pass** (golden
 invariant #1). A check that could not run tells us nothing, so it is the loudest
-condition, not the quietest. Neither lane fails your build on any of these codes — see
-"advisory, never a block" below — but the renderer uses them to group findings and to
-decide clean-vs-dirty.
+condition, not the quietest. Drift never fails the build — see "advisory, never a
+block" below — but the renderer uses these codes to group findings and to decide
+clean-vs-dirty.
 
-## The on-change lane — report-only and advisory
+## Running the CLI in CI
 
-**Trigger:** `pull_request`.
-**Command:** `claim check --all --report-only --json`.
-**Permissions:** `contents: read`, `pull-requests: write`. No write to the repo.
+**Trigger:** `pull_request` for a per-change run, `schedule` (cron) plus
+`workflow_dispatch` for the recurring run.
+**Command:** `claim check --json`.
+**Permissions:** `contents: read`, plus `pull-requests: write` (to comment) or
+`issues: write` (to maintain the standing issue). No write to the repo's default
+branch is needed — nothing is committed.
 
 Two properties are load-bearing:
 
-- **`--report-only` writes nothing and needs no git identity.** A fork PR's CI has no
-  write token; this mode still runs every check and still reports, it just persists no
-  verdict (docs/design/PRODUCT.md section 3: fork-PR runs report only; trusted runs persist). The
-  comment step is additionally gated off for fork PRs, so a contribution from a fork
-  gets its checks and an advisory job summary without the workflow ever handling a
-  write token.
-- **It never fails the build.** The check step ends with `|| true`; the finding is
-  routed as a comment, not a gate. Drift is information delivered at the moment of
-  maximal context — the person changing the world learns what their change broke and
-  who owns the decision — not a wall in front of the merge. Escalation beyond the
-  comment is deferred (see "The v1 escalation boundary").
+- **`claim check` writes nothing and needs no git identity.** The CLI never persists a
+  verdict — a verdict is telemetry, not committed source (golden invariant #4). A fork
+  PR's CI has no write token and needs none; it still runs every check and reports.
+  There is no `--report-only`, because the CLI is only ever report-only: it has no
+  other mode.
+- **It never fails the build.** The check step is run so the finding is *routed*, not
+  used as a gate. Drift is information delivered at the moment of maximal context — the
+  person changing the world learns what their change broke and who owns the decision —
+  not a wall in front of the merge. Escalation beyond the notification is deferred (see
+  "The v1 escalation boundary").
 
-The comment is **one** grouped comment, updated in place. Findings are grouped by
-severity — broken checks first (loudest), then drifted claims, then unresolved
-supports — and each names the claim's statement, the decisions it supports, and the
-CODEOWNERS owner of its file.
+There is no separate on-change lane and clock lane ending at a committed log. Whether a
+subset runs on a PR and the rest on a clock is orchestration the CI step and the hub's
+scheduler decide; the CLI just verifies whatever it is pointed at. The cadence *hint*
+for a claim lives under its `hub:` subfield (`recheck`), which the CLI validates but
+never acts on — the hub's schedule is the hub's.
 
-## The clock lane — persist and nag
+## From `--json` to the hub
 
-**Trigger:** `schedule` (cron), plus `workflow_dispatch` for a manual run.
-**Command:** `claim check --due --json` (persisting) — or `--due --report-only` when
-`persist: false`.
-**Permissions:** `contents: write`, `issues: write`.
+The one CLI→hub path is in the pipeline domain: on push-to-production or on a PR, the
+hub's GitHub Action runs `claim check --json` and pushes the authenticated, attested
+evidence to the hub — stamped with the commit, the environment, and the CI identity.
+Trust for a verdict comes from *provenance of production* (the authenticated pipeline
+that produced it), the way a green CI check is trusted without being committed to the
+repo. That authentication and attestation live in the hub's action, out of CLI scope.
 
-This lane runs on the trusted default branch with the repo's own token, so it *is* the
-persisting context. It records each due claim's verdict and **commits the new log files
-back** — because a write to the truth is a commit (golden invariant #4), there is no
-side channel that records a verdict. Committing the verdicts also advances each claim's
-freshness clock, so an `every Nd` claim is not perpetually due.
-
-If you would rather not have CI commit to your default branch, set `persist: false`.
-The lane then runs report-only: it still nags via the issue, but records nothing, so
-`every Nd` claims stay due every run. This is a deliberate, documented trade — the nag
-still works; only the clock reset is skipped.
-
-The lane maintains **one** standing issue titled `claim: due & drifted`:
-
-- **Created** when there is a queue (drift, overdue, broken, unresolved, or an
-  unloadable file) and no such issue is open.
-- **Updated** in place, every run, to the current queue.
-- **Closed** when the store is clean. It never opens an issue to say "all clear".
-
-This single issue is the entire v1 nag mechanism: the bell that turns computed
-staleness into something a human hears.
+For a human-facing surface without a full hub, the same `--json` feeds the renderer
+below, which posts a PR comment or maintains one standing issue.
 
 ## Idempotency — one comment, one issue
 
-Both lanes are strictly idempotent, so a hundred pushes or a hundred nights leave one
-surface, not a hundred.
+The rendered surfaces are strictly idempotent, so a hundred pushes or a hundred nights
+leave one comment and one issue, not a hundred.
 
 - Every rendered body opens with a hidden HTML marker: `<!-- claim-bot:on-change -->`
-  for the comment, `<!-- claim-bot:clock -->` for the issue. The two markers are
-  distinct so a repo running both lanes never edits one lane's surface from the other.
+  for the PR comment, `<!-- claim-bot:clock -->` for the standing issue. The two markers
+  are distinct so a repo rendering both never edits one surface from the other.
 - The comment step lists the PR's comments and edits the one whose body contains the
   comment marker, creating a new comment only when none exists.
 - The issue step lists open issues carrying the `claim` label and edits the one whose
   body contains the issue marker, creating one only when there is a queue and none is
-  open.
+  open, and **closing** it when the store is clean.
 
-The `concurrency` block on each workflow additionally serializes runs against the same
-PR (on-change) or store (clock), so two runs can never race to double-post.
+A `concurrency` block on the workflow additionally serializes runs against the same PR
+or store, so two runs can never race to double-post.
 
 ## The renderer — where the logic is, and how it is tested
 
@@ -114,15 +102,51 @@ clean-vs-dirty decision — is not in the workflow YAML. It lives in `ci/render.
 (Node, no dependencies) and is unit-tested in `ci/render.test.mjs` against real
 `claim check` JSON fixtures in `ci/fixtures/`: `clean.json`, `one-drift.json` (a drift
 with a support), `mixed.json` (a broken check, a drift, and an unresolved support in
-one store, grouped by severity), `load-error.json` (an unloadable claim file in
-`errors[]`), and `note-fault.json` (a held check whose verdict log could not be read —
-a `notes[]` fault, which must not render as clean). The workflow only runs `claim`,
-calls the renderer, and hands its output to the GitHub API — so the part a reviewer
-might get wrong is the part covered by tests.
+one store, grouped by severity), and `load-error.json` (an unloadable claim file in
+`errors[]`, which keeps the store dirty even though every check that ran held). The
+workflow only runs `claim`, calls the renderer, and hands its output to the GitHub API
+— so the part a reviewer might get wrong is the part covered by tests.
 
 The tests run in the repo's own gate (`scripts/check.sh`), so a change to the CLI's
 JSON shape or the renderer breaks the build rather than silently mis-rendering in
 production.
+
+### The `claim check --json` shape
+
+The renderer consumes exactly this shape:
+
+```json
+{
+  "status": "ok",
+  "exit": 1,
+  "checked": 1,
+  "claims": [
+    {
+      "id": "payments/libfoo-pin",
+      "file": ".claims/payments/libfoo-pin.md",
+      "checks": [
+        { "verdict": "drifted", "end": { "kind": "exited", "code": 1 },
+          "detail": "exit 1", "evidence": null, "note": null }
+      ],
+      "skipped": [],
+      "supports": [
+        { "target": "requirements.txt#libfoo", "resolved": true, "reason": null }
+      ],
+      "exit": 1
+    }
+  ],
+  "errors": []
+}
+```
+
+Each claim carries its `id`, `file`, the per-check `checks[]` (each a `verdict`, its
+process `end`, a `detail`, `evidence`, and a `note`), any `skipped` checks, the
+`supports[]` with their resolution, and the claim's own worst `exit`. Top-level
+`errors[]` holds unloadable or duplicate-id claim files. There is no `selection`,
+`report_only`, `now`, or top-level `notes`, and no per-check `when` — the CLI no longer
+selects, persists, timestamps a run against a stored log, or carries a trigger.
+
+### CODEOWNERS and statements
 
 The CODEOWNERS lookup implements GitHub's rule that the **last matching pattern wins**,
 over the subset a claims store needs: a catch-all `*`, directory patterns (a bare
@@ -141,20 +165,20 @@ guessing. The authoritative parser stays in `claim-core`.
 
 The escalation ladder in v1 has exactly two rungs, and neither blocks a merge:
 
-1. **The on-change PR comment** — advisory, at the moment of maximal context.
-2. **The clock-lane standing issue** — the durable nag that outlives any single PR.
+1. **The PR comment** — advisory, at the moment of maximal context.
+2. **The standing issue** — the durable nag that outlives any single PR.
 
 There is deliberately **no gate and no block** in v1 (docs/design/PRODUCT.md section 5). A drifted
 fact routes to the people who own the decision; it does not stop the person who
 happened to trigger it. The upper rungs — a nag that escalates with time-unhandled,
-then the owning team's own merge gate, then a hard block — are policy per claim class,
-and they are built only when pilot metrics show drift actually being ignored. Until
-then, making a wrong answer *loud* (a broken check is exit 2; an unowned claim is a
-dead-letter; a clean store closes the issue) is the whole job.
+then the owning team's own merge gate, then a hard block — are policy the hub applies
+per claim class, and they are built only when pilot metrics show drift actually being
+ignored. Until then, making a wrong answer *loud* (a broken check is exit 2; an unowned
+claim is a dead-letter; a clean store closes the issue) is the whole job.
 
-## Adopting the lanes
+## Adopting the workflow
 
-Copy `examples/consumer/.github/workflows/claims-on-change.yml` and
-`claims-clock.yml` into your repo, and point `claim-repo` / `claim-ref` at the claim
-tool repository and a pinned ref. Add a `.github/CODEOWNERS` (see the example) so
-findings route to owners. That is the whole integration.
+Copy the workflow from `examples/consumer/`, and point `claim-repo` / `claim-ref` at
+the claim tool repository and a pinned ref. Add a `.github/CODEOWNERS` (see the example)
+so findings route to owners. That is the whole integration; the hub-side authentication
+and ledger, if you run a hub, are configured in the hub's own action.

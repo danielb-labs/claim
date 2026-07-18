@@ -35,20 +35,21 @@ the tool ships no model client and reaches no network on its own.
 
 ```sh
 # Default: agent checks are Unverifiable, no runner is spawned.
-claim check --all
+claim check
 
 # Opt in: point CLAIM_AGENT_CMD at your runner.
-CLAIM_AGENT_CMD='my-agent-runner --model some-model' claim check --all
+CLAIM_AGENT_CMD='my-agent-runner --model some-model' claim check
 ```
 
 ### Cost scales with how many agent checks run
 
-The runner is invoked once per agent check that runs — so `check --all` runs it for
+The runner is invoked once per agent check that runs — so `claim check` runs it for
 **every** agent check in the store, multiplying the per-check model cost on a large
-corpus. The default selection, `check --due`, runs only the checks whose cadence has
-elapsed, which for agent checks (typically `when: every Nd`) is the far smaller set
-that is actually due. Prefer `--due` for scheduled runs and reserve `--all` for
-deliberate full sweeps; the per-check spend is the operator's.
+corpus. The CLI is stateless and runs everything it is pointed at; it does not select a
+subset. Which claims run when — a cheap subset on a PR, the rest on a clock — is
+orchestration a CI step and the hub's scheduler decide (the cadence *hint* lives under a
+claim's `hub:` subfield). Reserve a full agent-check sweep for a deliberate run; the
+per-check spend is the operator's.
 
 ## The `CLAIM_AGENT_CMD` contract
 
@@ -90,11 +91,11 @@ The runner must print a single JSON object:
   - `"unverifiable"` — the evidence was insufficient or conflicting to decide. This
     is the honest "I couldn't tell"; it counts against freshness (exit 1) but is not
     a tooling failure. Prefer it to guessing.
-- **`evidence`** (optional): a short prose justification. Recorded in the verdict
-  log — the evidence is the point of an agent check, so a human reading the log sees
-  the reasoning.
+- **`evidence`** (optional): a short prose justification. Reported alongside the
+  verdict in `claim check --json` — the evidence is the point of an agent check, so a
+  human (or the hub) reading the report sees the reasoning.
 - **`citations`** (optional): an array of source strings (files, URLs, issue refs).
-  Appended to the evidence in the log.
+  Appended to the evidence in the report.
 
 The object may be wrapped in surrounding prose — a model that narrates before
 answering is fine. The tool scans **every** balanced `{…}` span on stdout for one
@@ -158,7 +159,7 @@ EOF
 
 ```sh
 chmod +x mock-agent.sh
-CLAIM_AGENT_CMD="$PWD/mock-agent.sh" claim check --all
+CLAIM_AGENT_CMD="$PWD/mock-agent.sh" claim check
 ```
 
 A real runner is a wrapper around a model CLI that reads the prompt from stdin,
@@ -176,7 +177,7 @@ agent checks against a real model:
 
 ```sh
 export CLAIM_AGENT_CMD="$PWD/examples/claude-runner.sh"
-claim check --all
+claim check
 ```
 
 The store's own agent claim, `core/negation-owned-by-the-tool`, uses it to verify
@@ -187,8 +188,8 @@ check is for.
 
 Because a billing-free CI has no model runner, that claim carries a `skip` with
 `unless: test -n "$CLAIM_AGENT_CMD"`: it is **skipped** (reported, never a pass)
-wherever no runner is wired, and **verified** wherever one is — locally, or in a lane
-that sets `CLAIM_AGENT_CMD`. That is the intended shape for an agent claim in a repo
+wherever no runner is wired, and **verified** wherever one is — locally, or in a CI
+run that sets `CLAIM_AGENT_CMD`. That is the intended shape for an agent claim in a repo
 that will not call a model on every CI run: honest about not verifying, without
 failing the build.
 

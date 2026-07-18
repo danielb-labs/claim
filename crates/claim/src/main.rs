@@ -1,8 +1,10 @@
 //! The `claim` command-line tool.
 //!
-//! A thin shell over `claim-core`: parsing, check execution, and the verdict log
-//! all live in the core crate; this binary wires them to a CLI. The entry point
-//! stays a small dispatcher — argument grammar in [`cli`], each verb's logic in
+//! A thin shell over `claim-core`: parsing and check execution live in the core
+//! crate; this binary wires them to a CLI. The tool is a stateless runtime verifier
+//! — it reads claim files, runs their checks, and reports the current verdict; it
+//! stores nothing (see `docs/design/CLI-HUB-BOUNDARY.md`). The entry point stays a
+//! small dispatcher — argument grammar in [`cli`], each verb's logic in
 //! [`commands`], shared concerns (store discovery, git provenance, output) in their
 //! own modules — so a later build item slots a verb in without touching the shape.
 //!
@@ -17,8 +19,8 @@
 //!   `1` when at least one check drifted or was unverifiable, or a support did not
 //!   resolve; `2` when a check was broken, a claim file could not be loaded, or a
 //!   tool error occurred. Highest code wins over a mixed store.
-//! - **`claim drift`** — `0` when no claim has drifted, `1` when any has, `2` when
-//!   a claim file could not be loaded.
+//! - **`claim drift`** — `0` when no claim's check drifted, `1` when any did, `2`
+//!   when a check was broken or a claim file could not be loaded.
 //! - **`claim list`** — `0` normally, `2` when a claim file could not be loaded
 //!   (the well-formed claims are still listed — a broken file nags, it does not
 //!   silence the store).
@@ -31,10 +33,8 @@
 mod apperror;
 mod claimfile;
 mod cli;
-mod clock;
 mod commands;
 mod output;
-mod scheduling;
 
 use clap::Parser;
 
@@ -66,20 +66,18 @@ fn main() {
 /// and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and
 /// never a verb's low code.
 ///
-/// `amend`, `retire`, `stats`, and `docs` are binary: `0` on success (via
-/// `.map(|()| 0)`), `2` on any error — they have no review-worthy middle code the
-/// way `check`/`drift` do.
+/// `amend`, `retire`, and `docs` are binary: `0` on success (via `.map(|()| 0)`),
+/// `2` on any error — they have no review-worthy middle code the way `check`/`drift`
+/// do.
 fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
     match command {
         Command::Init(args) => commands::init::run(args, format).map(|()| 0),
         Command::Add(args) => commands::add::run(args, format).map(|()| 0),
         Command::Check(args) => commands::check::run(args, format),
         Command::List(args) => commands::list::run(args, format),
-        Command::Log(args) => commands::log::run(args, format).map(|()| 0),
         Command::Drift(args) => commands::drift::run(args, format),
         Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),
         Command::Retire(args) => commands::retire::run(args, format).map(|()| 0),
-        Command::Stats(args) => commands::stats::run(args, format).map(|()| 0),
         Command::Docs(args) => commands::docs::run(args, format).map(|()| 0),
     }
 }

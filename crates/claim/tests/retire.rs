@@ -1,8 +1,11 @@
 //! Integration tests for `claim retire <id> --note`: closing a claim on purpose.
 //!
+//! Retirement removes the claim's definition file from the working tree (a `git rm`
+//! the user commits). There is no stored retirement event — the changelog is git
+//! history — so the load-bearing property is that the file is *gone* afterward and
+//! the output names exactly what to `git rm` and commit, with the note as the reason.
 //! Every test drives the built binary against a throwaway git repo (see
-//! [`common::TestRepo`]). Retirement writes a log entry but runs no check, so no
-//! clock pinning is needed unless status is asserted.
+//! [`common::TestRepo`]).
 
 mod common;
 
@@ -11,13 +14,11 @@ use predicates::prelude::*;
 
 /// A cmd claim whose check body is inert (`retire` never runs it).
 fn claim_file(id: &str) -> String {
-    format!(
-        "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nStatement for {id}.\n"
-    )
+    format!("---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nStatement for {id}.\n")
 }
 
 #[test]
-fn retire_appends_a_retire_adjudication_with_the_note() {
+fn retire_removes_the_claim_file_and_names_what_to_commit() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim("pin", &claim_file("pin"));
@@ -27,72 +28,33 @@ fn retire_appends_a_retire_adjudication_with_the_note() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Retired claim 'pin'"))
-        // The human output tells the user what to commit (invariant #4).
+        .stdout(predicate::str::contains("libfoo 5.0 shipped; re-reviewed"))
+        // The removal is a working-tree delete the user commits as a `git rm`
+        // (invariant #4).
+        .stdout(predicate::str::contains("Removed"))
         .stdout(predicate::str::contains("git -C"))
-        .stdout(predicate::str::contains(".claims/log/pin/"));
+        .stdout(predicate::str::contains("rm .claims/pin.md"));
 
-    // Exactly one entry, an adjudication carrying the note.
-    let entries = repo.log_entries("pin");
-    assert_eq!(entries.len(), 1);
-    let event = &entries[0]["event"];
-    assert_eq!(event["type"], "adjudication");
-    assert_eq!(event["action"]["action"], "retire");
-    assert_eq!(event["action"]["note"], "libfoo 5.0 shipped; re-reviewed");
-    // Provenance is git-derived, not typed in.
-    assert_eq!(entries[0]["actor"], "Test User <test@example.com>");
-    assert_eq!(entries[0]["commit"].as_str().unwrap().len(), 40);
+    // The claim ceases to exist: its file is gone from the working tree.
+    assert!(
+        !repo.exists(".claims/pin.md"),
+        "the retired claim file is removed from the working tree"
+    );
 }
 
 #[test]
-fn retired_claim_reads_as_retired_via_list_and_log() {
+fn retire_is_allowed_on_any_claim_regardless_of_its_check() {
+    // Retirement runs no check, so it closes any claim on purpose. The file is gone
+    // afterward whatever the fact's state was.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim("pin", &claim_file("pin"));
-    // A prior passing verdict, to prove retirement is terminal over a later Held.
-    repo.write_verdict("pin", "2026-07-10T00:00:00Z", "held");
-
-    repo.claim()
-        .args(["retire", "pin", "--note", "closed"])
-        .assert()
-        .success();
-
-    // The computed status is Retired (derived from the log, never stored).
-    repo.claim()
-        .args(["list"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("retired"));
-
-    // `log` shows the whole history ending in the retirement — history preserved.
-    let out = repo
-        .claim()
-        .args(["--json", "log", "pin"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    let entries = v["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2, "the prior held plus the retirement");
-    assert_eq!(entries[0]["verdict"], "held");
-    assert_eq!(entries[1]["event"], "adjudication");
-    assert_eq!(entries[1]["verdict"], "retire");
-}
-
-#[test]
-fn retire_is_allowed_on_any_claim_not_only_drifted() {
-    // A perfectly verified claim can still be retired (the world changed).
-    let repo = TestRepo::new();
-    repo.claim().arg("init").assert().success();
-    repo.write_claim("pin", &claim_file("pin"));
-    repo.write_verdict("pin", "2026-07-17T00:00:00Z", "held");
 
     repo.claim()
         .args(["retire", "pin", "--note", "superseded"])
         .assert()
         .success();
-    assert_eq!(repo.log_count("pin"), 2);
+    assert!(!repo.exists(".claims/pin.md"));
 }
 
 #[test]
@@ -101,18 +63,21 @@ fn retire_requires_a_note() {
     repo.claim().arg("init").assert().success();
     repo.write_claim("pin", &claim_file("pin"));
 
-    // clap rejects the missing required --note as a usage error (exit 2), and
-    // nothing is written.
+    // clap rejects the missing required --note as a usage error (exit 2), and the
+    // claim file is left in place.
     repo.claim()
         .args(["retire", "pin"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("--note"));
-    assert_eq!(repo.log_count("pin"), 0);
+    assert!(
+        repo.exists(".claims/pin.md"),
+        "nothing removed on a usage error"
+    );
 }
 
 #[test]
-fn retire_of_an_unknown_id_errors_and_writes_nothing() {
+fn retire_of_an_unknown_id_errors_and_removes_nothing() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim("pin", &claim_file("pin"));
@@ -124,8 +89,8 @@ fn retire_of_an_unknown_id_errors_and_writes_nothing() {
         .stderr(predicate::str::contains(
             "no claim with id 'does-not-exist'",
         ));
-    // No stray log directory for the phantom id.
-    assert!(!repo.exists(".claims/log/does-not-exist"));
+    // The real claim is untouched by a phantom retire.
+    assert!(repo.exists(".claims/pin.md"));
 }
 
 #[test]
@@ -146,27 +111,28 @@ fn retire_json_shape_carries_the_essentials() {
     assert_eq!(v["status"], "ok");
     assert_eq!(v["id"], "pin");
     assert_eq!(v["note"], "closed for good");
-    assert_eq!(v["commit"].as_str().unwrap().len(), 40);
-    assert_eq!(v["actor"], "Test User <test@example.com>");
+    // `file` is the removed claim file, relative to `root`. There is no stored event,
+    // so no commit/actor/log fields.
+    assert_eq!(v["file"], ".claims/pin.md");
+    assert!(
+        v.get("commit").is_none(),
+        "retire records no verdict commit"
+    );
+    assert!(v.get("actor").is_none(), "retire records no actor");
     // `root` is load-bearing: an agent invoked from a subdirectory resolves the
-    // root-relative `to_commit` paths against it (m6).
+    // root-relative `file` against it.
     assert!(
         !v["root"].as_str().unwrap().is_empty(),
         "root is present and non-empty"
     );
-    let to_commit = v["to_commit"].as_array().unwrap();
-    assert_eq!(to_commit.len(), 1);
-    assert!(to_commit[0]
-        .as_str()
-        .unwrap()
-        .starts_with(".claims/log/pin/"));
+    assert!(!repo.exists(".claims/pin.md"), "the file was removed");
 }
 
 #[test]
-fn retire_rejects_a_blank_note_before_writing_anything() {
-    // m1: clap requires --note present but accepts an empty/whitespace value; a
+fn retire_rejects_a_blank_note_before_removing_anything() {
+    // clap requires --note present but accepts an empty/whitespace value; a
     // reasonless retirement defeats the invariant the note enforces, so it is
-    // rejected loudly and nothing is written.
+    // rejected loudly and the file is left in place.
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim("pin", &claim_file("pin"));
@@ -176,7 +142,10 @@ fn retire_rejects_a_blank_note_before_writing_anything() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("the retirement note is empty"));
-    assert_eq!(repo.log_count("pin"), 0, "nothing written on a blank note");
+    assert!(
+        repo.exists(".claims/pin.md"),
+        "nothing removed on a blank note"
+    );
 
     // The JSON error carries the machine kind.
     let out = repo
@@ -189,7 +158,7 @@ fn retire_rejects_a_blank_note_before_writing_anything() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["kind"], "invalid-input");
-    assert_eq!(repo.log_count("pin"), 0);
+    assert!(repo.exists(".claims/pin.md"));
 }
 
 #[test]

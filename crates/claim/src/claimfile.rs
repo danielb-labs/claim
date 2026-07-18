@@ -23,8 +23,9 @@ use claim_store::{render_claim, CheckRender, ClaimRender, RenderError};
 pub struct ClaimDraft {
     /// The validated id, as a string for rendering.
     pub id: String,
-    /// The freshness window, e.g. `120d`.
-    pub max_age: String,
+    /// The optional hub freshness-window hint, e.g. `120d`, rendered under `hub:`.
+    /// `None` renders no `hub:` block — the CLI never acts on this hint.
+    pub max_age: Option<String>,
     /// The checks, in order.
     pub checks: Vec<CheckDraft>,
     /// The `supports` targets, in order.
@@ -37,8 +38,6 @@ pub struct ClaimDraft {
 pub struct CheckDraft {
     /// The check's kind and payload. v1 `claim add` only authors `cmd` checks.
     pub kind: CheckDraftKind,
-    /// The trigger string, e.g. `on-change` or `every 30d`.
-    pub when: String,
 }
 
 /// The kind of a drafted check. Only `cmd` is authored by `claim add` in v1; the
@@ -61,8 +60,8 @@ pub enum CheckDraftKind {
 /// distinct in the type.
 #[derive(Debug)]
 pub enum DraftError {
-    /// A frontmatter scalar (`id`/`max-age`/`when`) carried a newline or control
-    /// character — refused by the renderer before any text was produced.
+    /// A frontmatter scalar (`id` or the `hub:` `max-age` hint) carried a newline or
+    /// control character — refused by the renderer before any text was produced.
     Render(RenderError),
     /// The rendered text did not satisfy the claim schema.
     Parse(claim_core::Error),
@@ -82,10 +81,10 @@ impl std::fmt::Display for DraftError {
 ///
 /// The returned text is exactly what will be written to disk, and the returned
 /// `Claim` is proof it parses — the same file, validated. The renderer refuses a
-/// newline or control character in `id`/`max-age`/`when` (so a crafted value cannot
-/// inject a phantom field past this round-trip), and any remaining schema violation
-/// (a bad id, an empty statement, a malformed trigger) surfaces from the parser
-/// naming the field, before anything is written.
+/// newline or control character in `id` or the `hub:` `max-age` hint (so a crafted
+/// value cannot inject a phantom field past this round-trip), and any remaining
+/// schema violation (a bad id, an empty statement, a bad hub hint) surfaces from the
+/// parser naming the field, before anything is written.
 ///
 /// # Errors
 ///
@@ -106,19 +105,16 @@ impl ClaimDraft {
         let check = match self.checks.first() {
             Some(CheckDraft {
                 kind: CheckDraftKind::Cmd { run, negate },
-                ..
             }) => CheckRender::Cmd {
                 run,
                 negate: *negate,
             },
             None => unreachable!("claim add always gathers exactly one check"),
         };
-        let when = self.checks.first().map_or("on-change", |c| c.when.as_str());
         ClaimRender {
             id: &self.id,
-            max_age: &self.max_age,
+            max_age: self.max_age.as_deref(),
             check,
-            when,
             supports: &self.supports,
             statement: &self.statement,
         }
@@ -146,13 +142,12 @@ mod tests {
     fn full_draft() -> ClaimDraft {
         ClaimDraft {
             id: "payments/libfoo-pin".to_owned(),
-            max_age: "120d".to_owned(),
+            max_age: Some("120d".to_owned()),
             checks: vec![CheckDraft {
                 kind: CheckDraftKind::Cmd {
                     run: "grep -q 'libfoo==4.2' requirements.txt".to_owned(),
                     negate: true,
                 },
-                when: "every 30d".to_owned(),
             }],
             supports: vec![
                 "requirements.txt#libfoo".to_owned(),

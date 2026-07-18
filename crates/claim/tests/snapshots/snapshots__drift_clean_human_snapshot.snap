@@ -1,0 +1,5 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"drift\"], 0)"
+---
+No drifted claims. The store is clean.

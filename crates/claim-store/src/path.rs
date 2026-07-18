@@ -63,7 +63,7 @@ mod tests {
             .map(|t| format!("  - {t}\n"))
             .collect::<String>();
         let text = format!(
-            "---\nid: a\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\nsupports:\n{list}---\nS.\n"
+            "---\nid: a\nchecks:\n  - kind: cmd\n    run: \"true\"\nsupports:\n{list}---\nS.\n"
         );
         parse_claim_file("a.md", &text).unwrap().supports
     }

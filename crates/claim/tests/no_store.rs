@@ -30,17 +30,12 @@ fn assert_no_store_kind(args: &[&str]) {
 
 #[test]
 fn check_reports_no_store_kind() {
-    assert_no_store_kind(&["check", "--all"]);
+    assert_no_store_kind(&["check"]);
 }
 
 #[test]
 fn list_reports_no_store_kind() {
     assert_no_store_kind(&["list"]);
-}
-
-#[test]
-fn log_reports_no_store_kind() {
-    assert_no_store_kind(&["log", "some-id"]);
 }
 
 #[test]

@@ -1,11 +1,12 @@
 //! Integration tests for `claim add`, run against a real temp git store.
 //!
-//! The default path runs the check once and writes on `Held`, touching nothing else
-//! in the tree. The optional `--witness-cmd` path is exercised through its scripted
-//! form, which perturbs an *isolated* throwaway worktree, never the caller's tree —
-//! the property asserted most sharply below (a dirty working-tree file survives a
-//! witnessed add untouched), because that is the data-loss regression this design
-//! makes impossible.
+//! `add` runs the check once and writes the claim file on `Held`, touching nothing
+//! else in the tree and writing no verdict log — the CLI is a stateless verifier, so
+//! the whole of a successful add is the one file to commit. The optional
+//! `--witness-cmd` path is exercised through its scripted form, which perturbs an
+//! *isolated* throwaway worktree, never the caller's tree — the property asserted
+//! most sharply below (a dirty working-tree file survives a witnessed add untouched),
+//! because that is the data-loss regression this design makes impossible.
 
 mod common;
 
@@ -27,7 +28,7 @@ fn ready_repo() -> TestRepo {
 // --- Happy path: the default is a single passing check, no tree perturbation. ---
 
 #[test]
-fn add_writes_the_claim_file_and_establishing_log() {
+fn add_writes_the_claim_file_and_no_verdict_log() {
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -44,6 +45,9 @@ fn add_writes_the_claim_file_and_establishing_log() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Created claim 'libfoo-pin'"))
+        .stdout(predicate::str::contains(
+            "The check held against the current tree at commit",
+        ))
         // The handoff anchors at the store root with `git -C`, so it works from a
         // subdirectory (M2).
         .stdout(predicate::str::contains("git -C "))
@@ -52,35 +56,16 @@ fn add_writes_the_claim_file_and_establishing_log() {
     // The claim file landed at the id-derived path and parses back. The single-scalar
     // frontmatter fields are rendered quoted (the injection-hardening: a newline in a
     // scalar is refused, and the value is quoted so it cannot confuse the scanner).
+    // `--max-age` is written under the optional `hub:` subfield.
     assert!(repo.exists(".claims/libfoo-pin.md"));
     let file = repo.read(".claims/libfoo-pin.md");
     assert!(file.contains("id: \"libfoo-pin\""));
     assert!(file.contains("max-age: \"120d\""));
+    assert!(file.contains("hub:"), "max-age lives under hub:");
     assert!(file.contains("We pin libfoo at 4.2."));
 
-    // Exactly one birth entry: the establishing Held. The default path witnesses no
-    // red, so there is no separate drift entry.
-    let entries = repo.log_entries("libfoo-pin");
-    assert_eq!(
-        entries.len(),
-        1,
-        "the default add writes one establishing entry"
-    );
-    assert_eq!(entries[0]["event"]["verdict"], "held");
-    let entry = &entries[0];
-    assert_eq!(entry["actor"], "Test User <test@example.com>");
-    let commit = entry["commit"].as_str().unwrap();
-    // A committed repo records the FULL 40-char sha (M3), config-independent — not
-    // the abbreviated form, and not the unborn sentinel.
-    assert_eq!(commit.len(), 40, "the recorded commit is the full sha");
-    assert_ne!(
-        commit, "0000000000000000000000000000000000000000",
-        "a committed repo resolves a real sha, not the unborn sentinel"
-    );
-    assert!(
-        commit.chars().all(|c| c.is_ascii_hexdigit()),
-        "the recorded commit is a hex sha"
-    );
+    // The CLI stores nothing: no verdict log tree is ever created.
+    assert!(!repo.exists(".claims/log"), "add writes no verdict log");
 
     // The working tree is untouched by the default path: the pin is exactly as
     // committed, and no worktree litter was left behind.
@@ -88,29 +73,32 @@ fn add_writes_the_claim_file_and_establishing_log() {
 }
 
 #[test]
-fn add_is_born_verified_with_a_single_hold() {
-    // The birth Held is the latest conclusive verdict, so the claim reads as fresh
-    // (verified), not drifted or stale. With no witnessed red there is only the one
-    // entry, and it is the pass.
+fn add_without_max_age_omits_the_hub_block() {
+    // `--max-age` is optional (a hub hint). Omitted, the claim carries no `hub:` block
+    // at all, and the add still succeeds against a holding check.
     let repo = ready_repo();
     repo.claim()
         .args([
             "add",
             "--id",
-            "v",
+            "no-window",
             "--statement",
             "S.",
             "--run",
             HOLDS,
-            "--max-age",
-            "30d",
         ])
         .assert()
         .success();
 
-    let entries = repo.log_entries("v");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["event"]["verdict"], "held");
+    let file = repo.read(".claims/no-window.md");
+    assert!(
+        !file.contains("hub:"),
+        "no hub block without --max-age: {file}"
+    );
+    assert!(
+        !file.contains("max-age"),
+        "no max-age without the flag: {file}"
+    );
 }
 
 #[test]
@@ -162,12 +150,9 @@ fn add_json_shape_is_stable() {
     );
     // The commit is the full sha (M3), not the abbreviated form.
     assert_eq!(v["commit"].as_str().unwrap().len(), 40);
+    // Only the claim file is written — no verdict — so `to_commit` is the file alone.
     let to_commit = v["to_commit"].as_array().unwrap();
-    assert_eq!(
-        to_commit.len(),
-        2,
-        "the file plus one establishing log entry"
-    );
+    assert_eq!(to_commit.len(), 1, "only the claim file to commit, no log");
     assert_eq!(to_commit[0], ".claims/c.md");
 }
 
@@ -225,10 +210,10 @@ fn namespaced_id_nests_the_file() {
 }
 
 #[test]
-fn negate_when_and_supports_render_and_round_trip() {
-    // The whole authoring surface: a negate check on a cadence trigger with two
-    // supports (a decision ref with a `#`, and a bare claim id). The negate sense is
-    // exercised honestly — the check exits 1 (Held under negate) on the true tree.
+fn negate_and_supports_render_and_round_trip() {
+    // The whole authoring surface: a negate check with two supports (a decision ref
+    // with a `#`, and a bare claim id). The negate sense is exercised honestly — the
+    // check exits 1 (Held under negate) on the true tree.
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -240,8 +225,6 @@ fn negate_when_and_supports_render_and_round_trip() {
             "--run",
             "grep -q 'libfoo==5.0' requirements.txt",
             "--negate",
-            "--when",
-            "every 30d",
             "--max-age",
             "90d",
             "--supports",
@@ -254,10 +237,6 @@ fn negate_when_and_supports_render_and_round_trip() {
 
     let file = repo.read(".claims/payments/pin.md");
     assert!(file.contains("negate: true"), "negate is rendered: {file}");
-    assert!(
-        file.contains("when: \"every 30d\""),
-        "trigger is rendered quoted: {file}"
-    );
     // A decision ref with a `#` is quoted so YAML does not read it as a comment.
     assert!(
         file.contains("- \"requirements.txt#libfoo\""),
@@ -267,12 +246,12 @@ fn negate_when_and_supports_render_and_round_trip() {
         file.contains("- other-claim"),
         "a bare id is rendered: {file}"
     );
-
-    // The rendered file is valid and the establishing Held was recorded under the
-    // inverted sense.
-    let entries = repo.log_entries("payments/pin");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["event"]["verdict"], "held");
+    assert!(
+        file.contains("max-age: \"90d\""),
+        "max-age under hub: {file}"
+    );
+    // No verdict log is written.
+    assert!(!repo.exists(".claims/log"), "no verdict log");
 }
 
 // --- Rejections. ---
@@ -303,13 +282,13 @@ fn rejects_duplicate_id() {
 fn rejects_an_id_already_declared_in_a_differently_named_file() {
     // C1: the canonical-path check misses a claim declaring the same id from a
     // differently named file. `add` must scan every claim's id, not just the path,
-    // because two files sharing an id share one verdict log.
+    // because two files sharing an id are an ambiguous store.
     let repo = ready_repo();
     // A file named `alias.md` that declares id `dup` (its canonical path would be
     // `dup.md`, so the path check would not catch it).
     repo.write_claim(
         "alias",
-        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nExisting claim under an alias filename.\n",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nExisting claim under an alias filename.\n",
     );
 
     repo.claim()
@@ -517,20 +496,6 @@ fn rejects_a_missing_required_field_by_default() {
         .stderr(predicate::str::contains("--interactive"));
 }
 
-#[test]
-fn rejects_a_missing_max_age_by_default_clearly() {
-    // `--max-age` reads as optional in the args but is required: the default headless
-    // caller (an agent or CI, the common case) that omits it must get a clear error
-    // naming the flag, not a silent default and not a prompt.
-    let repo = ready_repo();
-    repo.claim()
-        .args(["add", "--id", "x", "--statement", "S.", "--run", HOLDS])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("missing max-age"))
-        .stderr(predicate::str::contains("--max-age"));
-}
-
 // --- Supports: an unresolvable target warns at author time but does not fail. ---
 
 #[test]
@@ -660,9 +625,10 @@ fn supports_warning_in_json_mode_goes_to_stderr_and_leaves_stdout_clean() {
 // --- Optional witnessed-red: extra confidence, in an isolated worktree. ---
 
 #[test]
-fn witness_cmd_records_the_observed_red_as_evidence() {
+fn witness_cmd_narrates_the_observed_red_and_writes_only_the_file() {
     // `--witness-cmd` makes the fact false in a throwaway worktree; the check goes
-    // Drifted there, and that observation is recorded on the establishing entry.
+    // Drifted there, and that observation is narrated for the author's confidence. No
+    // verdict is written — the whole of the add is still the one claim file.
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -685,20 +651,10 @@ fn witness_cmd_records_the_observed_red_as_evidence() {
             "witnessed failing in an isolated worktree",
         ));
 
-    // Still one entry (the establishing Held), now carrying the witnessed-red note.
-    let entries = repo.log_entries("real");
-    assert_eq!(
-        entries.len(),
-        1,
-        "witnessing adds evidence to the establishing entry, not a second entry"
-    );
-    assert_eq!(entries[0]["event"]["verdict"], "held");
+    assert!(repo.exists(".claims/real.md"));
     assert!(
-        entries[0]["event"]["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("witnessed-red"),
-        "the establishing entry records the witnessed-red evidence"
+        !repo.exists(".claims/log"),
+        "witnessing writes no verdict log"
     );
 }
 
@@ -729,8 +685,9 @@ fn witness_cmd_json_marks_witnessed_red_true() {
     let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(v["witnessed_red"], true);
     assert_eq!(v["status"], "ok");
-    // Only the file and one log entry are ever written; the witness added no entry.
-    assert_eq!(v["to_commit"].as_array().unwrap().len(), 2);
+    // Only the claim file is ever written; the witness added no entry and no log.
+    assert_eq!(v["to_commit"].as_array().unwrap().len(), 1);
+    assert_eq!(v["to_commit"][0], ".claims/w.md");
 }
 
 #[test]
@@ -819,13 +776,6 @@ fn refuses_when_the_witnessed_check_does_not_go_red() {
     assert!(
         !repo.exists(".claims/decoration.md"),
         "a check that never goes red under --witness-cmd must not be recorded"
-    );
-    assert!(
-        repo.path()
-            .join(".claims/log/decoration")
-            .read_dir()
-            .is_err(),
-        "no log entries on a refused witness"
     );
 }
 
@@ -1032,7 +982,7 @@ fn discovery_does_not_adopt_a_store_across_the_git_boundary() {
     // wrong repo. The walk stops at the git boundary, so an inner repo with no store
     // of its own does not reach the outer store.
     let outer = TestRepo::new(); // has a .git and (after this) a .claims above inner
-    std::fs::create_dir_all(outer.path().join(".claims/log")).unwrap();
+    std::fs::create_dir_all(outer.path().join(".claims")).unwrap();
     let inner = outer.path().join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     // Make `inner` its own git repository, so its `.git` is the boundary.
@@ -1212,17 +1162,16 @@ fn interactive_prompts_for_missing_fields_and_reads_stdin() {
 
 #[test]
 fn interactive_reads_missing_fields_in_order_from_stdin() {
-    // With no flags and `-i`, add prompts id, statement, run, max-age in that order,
-    // one stdin line each. Distinguishable values prove the mapping: a swapped order
-    // would feed a non-command into `--run` (refused) or land the statement in the
-    // wrong field, so a clean success with each value in its slot is the ordering
-    // proof — a silent line-to-field mismatch would be a data-integrity bug.
+    // With no flags and `-i`, add prompts id, statement, run in that order, one stdin
+    // line each (`--max-age` is optional and never prompted for). Distinguishable
+    // values prove the mapping: a swapped order would feed a non-command into `--run`
+    // (refused) or land the statement in the wrong field, so a clean success with each
+    // value in its slot is the ordering proof — a silent line-to-field mismatch would
+    // be a data-integrity bug.
     let repo = ready_repo();
     repo.claim()
         .args(["add", "-i"])
-        .write_stdin(format!(
-            "ordered-id\nThe ordered statement.\n{HOLDS}\n45d\n"
-        ))
+        .write_stdin(format!("ordered-id\nThe ordered statement.\n{HOLDS}\n"))
         .assert()
         .success();
 
@@ -1235,9 +1184,10 @@ fn interactive_reads_missing_fields_in_order_from_stdin() {
         file.contains("The ordered statement."),
         "statement from stdin line 2: {file}"
     );
+    // No max-age was supplied, so the claim carries no hub block.
     assert!(
-        file.contains("max-age: \"45d\""),
-        "max-age from stdin line 4: {file}"
+        !file.contains("hub:"),
+        "no hub block without --max-age: {file}"
     );
 }
 
@@ -1260,14 +1210,15 @@ fn interactive_with_eof_stdin_errors_clearly_instead_of_hanging() {
 
 #[test]
 fn add_on_an_unborn_head_uses_the_sentinel_commit() {
-    // A brand-new repo with no commit yet. HEAD does not resolve, so the birth
-    // verdict records the documented all-zero sentinel — and, critically, a
-    // non-empty commit, so the entry is valid (claim-core rejects an empty commit).
-    // The default path needs no worktree and no commit, so it works on an unborn HEAD.
+    // A brand-new repo with no commit yet. HEAD does not resolve, so the reported
+    // provenance commit is the documented all-zero sentinel. The default path needs no
+    // worktree and no commit, so it works on an unborn HEAD.
     let repo = TestRepo::unborn();
     repo.claim().arg("init").assert().success();
-    repo.claim()
+    let out = repo
+        .claim()
         .args([
+            "--json",
             "add",
             "--id",
             "fresh",
@@ -1279,16 +1230,18 @@ fn add_on_an_unborn_head_uses_the_sentinel_commit() {
             "30d",
         ])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
 
-    let entries = repo.log_entries("fresh");
-    assert_eq!(entries.len(), 1);
-    // The sentinel is the full 40-char null object name — non-empty (so the entry is
-    // valid) and width-consistent with a real sha.
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // The sentinel is the full 40-char null object name.
     assert_eq!(
-        entries[0]["commit"], "0000000000000000000000000000000000000000",
-        "an unborn HEAD records the documented 40-char sentinel"
+        v["commit"], "0000000000000000000000000000000000000000",
+        "an unborn HEAD reports the documented 40-char sentinel"
     );
+    assert!(repo.exists(".claims/fresh.md"));
 }
 
 #[test]

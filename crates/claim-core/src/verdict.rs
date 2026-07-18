@@ -1,10 +1,14 @@
-//! The outcome of checking a claim, and a claim's status derived from its
-//! history.
+//! The outcome of checking a claim: the verdict a check reports right now.
 //!
-//! These two enums encode the honesty contract of the whole system, so they
-//! live in the foundation rather than in any one feature. The rules stated in
-//! the doc comments are binding: later work implements them, it does not revisit
-//! them.
+//! This enum encodes the honesty contract of the whole system, so it lives in
+//! the foundation rather than in any one feature. The rules stated in the doc
+//! comments are binding: later work implements them, it does not revisit them.
+//!
+//! A verdict is a *check result* — what a check said the instant it ran — never
+//! a claim's *status* over time. The CLI reports verdicts and does not persist
+//! them; any longer-lived notion of freshness, staleness, or due-ness belongs to
+//! the hub that ingests the reported stream, not to this stateless verifier. See
+//! `docs/design/CLI-HUB-BOUNDARY.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,37 +56,14 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Whether this verdict lets a claim be considered fresh. Only [`Held`](Verdict::Held)
-    /// does. Everything else — including `Unverifiable` and `Broken` — leaves the
-    /// claim to age toward `stale` and, eventually, a human.
+    /// Whether this verdict is a pass — the check confirmed the fact holds right
+    /// now. Only [`Held`](Verdict::Held) is; everything else — including
+    /// `Unverifiable` and `Broken` — is a signal to a reader, and to the hub, that
+    /// the fact needs attention.
     #[must_use]
-    pub fn keeps_fresh(self) -> bool {
+    pub fn is_held(self) -> bool {
         matches!(self, Verdict::Held)
     }
-}
-
-/// A claim's status. Never written to the claim file: always computed from the
-/// verdict history and the claim's `max_age` at the moment it is read, the same
-/// way a certificate's validity is read from its dates rather than a stored
-/// flag.
-///
-/// A claim exists once its file is merged into a store, and not before; there is
-/// no draft state inside the system, because an unmerged claim is a pull
-/// request. A merged claim with no passing verdict on record is simply `Stale`
-/// and due immediately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Status {
-    /// The latest check passed and the claim is within `max_age`.
-    Verified,
-    /// The claim's own check reports its fact is no longer true.
-    Drifted,
-    /// Overdue: never verified, past `max_age`, or its checks have been broken or
-    /// unverifiable past the configured grace window.
-    Stale,
-    /// Closed on purpose: the world changed and the decision was re-reviewed, or
-    /// the fact became a real test and the closing note says where.
-    Retired,
 }
 
 #[cfg(test)]
@@ -90,11 +71,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_held_keeps_a_claim_fresh() {
-        assert!(Verdict::Held.keeps_fresh());
-        assert!(!Verdict::Drifted.keeps_fresh());
-        assert!(!Verdict::Unverifiable.keeps_fresh());
-        assert!(!Verdict::Broken.keeps_fresh());
+    fn only_held_is_a_pass() {
+        assert!(Verdict::Held.is_held());
+        assert!(!Verdict::Drifted.is_held());
+        assert!(!Verdict::Unverifiable.is_held());
+        assert!(!Verdict::Broken.is_held());
     }
 
     #[test]
@@ -102,14 +83,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Verdict::Unverifiable).unwrap(),
             "\"unverifiable\""
-        );
-    }
-
-    #[test]
-    fn status_serializes_as_kebab_case() {
-        assert_eq!(
-            serde_json::to_string(&Status::Verified).unwrap(),
-            "\"verified\""
         );
     }
 }

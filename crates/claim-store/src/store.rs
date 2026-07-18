@@ -1,16 +1,18 @@
 //! Locating and scaffolding a claim store on disk.
 //!
-//! A store is a `.claims/` directory holding claim files (`.claims/**/*.md`) and
-//! the verdict log (`.claims/log/<id>/`). This module owns the questions every
-//! consumer — the CLI's read/verify verbs and the MCP server — shares, so they
-//! are answered in exactly one place and the two binaries cannot drift apart:
+//! A store is a `.claims/` directory holding claim files (`.claims/**/*.md`).
+//! There is no committed verdict log: a verdict is telemetry the hub stores, not
+//! source (see `docs/design/CLI-HUB-BOUNDARY.md`), so the store holds only the
+//! claims themselves. This module owns the questions every consumer — the CLI's
+//! read/verify verbs and the MCP server — shares, so they are answered in exactly
+//! one place and the two binaries cannot drift apart:
 //!
 //! - **Where is the store?** [`discover`] walks up from a starting directory to
 //!   the nearest ancestor containing a `.claims/`, the same way git finds `.git/`.
 //!   Every consumer calls this so it works from anywhere inside a repository, not
 //!   only its root.
-//! - **How is one created?** [`Store::init`] scaffolds `.claims/` and
-//!   `.claims/log/` in a chosen directory, idempotently.
+//! - **How is one created?** [`Store::init`] scaffolds `.claims/` in a chosen
+//!   directory, idempotently.
 //! - **What claims does it hold?** [`Store::load_all`] walks `.claims/**/*.md`,
 //!   parses each file that opens with a frontmatter fence (a plain `README.md` is
 //!   a document, not a claim, and is skipped), and returns the whole corpus, so
@@ -31,9 +33,6 @@ use crate::error::StoreError;
 
 /// The store directory name, relative to the store root.
 pub const CLAIMS_DIR: &str = ".claims";
-
-/// The verdict-log subdirectory, relative to the store root.
-pub const LOG_DIR: &str = "log";
 
 /// A located claim store: the root directory that contains its `.claims/`.
 ///
@@ -60,17 +59,9 @@ impl Store {
         self.root.join(CLAIMS_DIR)
     }
 
-    /// The verdict-log root, `.claims/log/`, passed to [`claim_core::append_entry`]
-    /// and [`claim_core::read_entries`].
-    #[must_use]
-    pub fn log_dir(&self) -> PathBuf {
-        self.claims_dir().join(LOG_DIR)
-    }
-
     /// The on-disk path of a claim's definition file: `.claims/<id>.md`.
     ///
-    /// A namespaced id nests, matching how the verdict log nests a namespaced id
-    /// into directories: `payments/libfoo-pin` becomes
+    /// A namespaced id nests into directories: `payments/libfoo-pin` becomes
     /// `.claims/payments/libfoo-pin.md`. This is safe because a [`claim_core::ClaimId`]
     /// is already validated to contain only `[a-z0-9-/]` with clean, non-empty
     /// segments — no `.`/`..` and nothing that could escape the store.
@@ -100,24 +91,22 @@ impl Store {
         path.display().to_string()
     }
 
-    /// Parse every claim in the store: `.claims/**/*.md`, excluding the verdict
-    /// log.
+    /// Parse every claim in the store: `.claims/**/*.md`.
     ///
     /// The one place every consumer agrees on what "the store's claims" are, so
-    /// the CLI's `check`, `list`, `log`, and `drift` and the MCP server's `query`
-    /// cannot disagree about which files count. Returns them sorted by id for a
-    /// stable, deterministic order (a directory listing is order-unspecified across
+    /// the CLI's `check`, `list`, and `drift` and the MCP server's `query` cannot
+    /// disagree about which files count. Returns them sorted by id for a stable,
+    /// deterministic order (a directory listing is order-unspecified across
     /// platforms), so a JSON array or a human table reads the same on every run.
     ///
-    /// Three things under `.claims/` are deliberately skipped: `log/`, which holds
-    /// verdict-log JSON (`read_entries` owns those); any file that is not a `.md`;
-    /// and any `.md` that does not open with a `---` frontmatter fence — a plain
-    /// document (a `README.md`) is not a claim and must not break the store. A `.md`
-    /// that *does* open with a fence is parsed with [`claim_core::parse_claim_file`]
-    /// and named — in a parse error — the way it appears on disk relative to the
-    /// store root, so a fenced-but-malformed claim stays a loud error rather than
-    /// being silently dropped. See `collect_claim_files` for the exact rule and
-    /// its trade-off.
+    /// Two things under `.claims/` are deliberately skipped: any file that is not a
+    /// `.md`; and any `.md` that does not open with a `---` frontmatter fence — a
+    /// plain document (a `README.md`) is not a claim and must not break the store. A
+    /// `.md` that *does* open with a fence is parsed with
+    /// [`claim_core::parse_claim_file`] and named — in a parse error — the way it
+    /// appears on disk relative to the store root, so a fenced-but-malformed claim
+    /// stays a loud error rather than being silently dropped. See
+    /// `collect_claim_files` for the exact rule and its trade-off.
     ///
     /// Embedded claims (`<!-- claim ... -->` blocks in host files like CLAUDE.md)
     /// are *not* collected here: v1 authoring writes standalone `.claims/*.md`
@@ -141,9 +130,8 @@ impl Store {
     /// [`LoadError`], not an `Err`.
     pub fn load_all(&self) -> Result<StoreLoad, StoreError> {
         let claims_dir = self.claims_dir();
-        let log_dir = self.log_dir();
         let mut files = Vec::new();
-        collect_claim_files(&claims_dir, &log_dir, &mut files)?;
+        collect_claim_files(&claims_dir, &mut files)?;
 
         let mut claims: Vec<LoadedClaim> = Vec::with_capacity(files.len());
         let mut errors: Vec<LoadError> = Vec::new();
@@ -170,7 +158,7 @@ impl Store {
         Ok(StoreLoad { claims, errors })
     }
 
-    /// Scaffold a store under `root`, creating `.claims/` and `.claims/log/`.
+    /// Scaffold a store under `root`, creating `.claims/`.
     ///
     /// Idempotent: running it against a directory that already has a store is a
     /// no-op that succeeds, so `claim init` can be re-run safely (for example after
@@ -179,7 +167,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails if the directories cannot be created, or if `.claims` exists but is a
+    /// Fails if the directory cannot be created, or if `.claims` exists but is a
     /// file rather than a directory — a loud error, because silently treating a
     /// stray `.claims` file as a store would hide the real problem.
     pub fn init(root: impl Into<PathBuf>) -> Result<(Self, bool), StoreError> {
@@ -191,8 +179,7 @@ impl Store {
         }
 
         let existed = claims.is_dir();
-        let log = claims.join(LOG_DIR);
-        std::fs::create_dir_all(&log).map_err(|source| StoreError::Io {
+        std::fs::create_dir_all(&claims).map_err(|source| StoreError::Io {
             context: format!("failed to create the store at {}", claims.display()),
             source,
         })?;
@@ -301,12 +288,11 @@ fn load_one(path: &Path, rel: &str) -> std::result::Result<Claim, String> {
 /// Detect two or more claims sharing one id and turn every such conflict into a
 /// [`LoadError`] on each file, removing the ambiguous claims from `claims`.
 ///
-/// A shared id is a false-green waiting to happen: both files' verdicts land under
-/// `.claims/log/<id>/` and interleave, so `compute_status` reads a mixed history —
-/// a genuinely drifted fact can read `verified` and vanish from the drift queue.
-/// The tool must not pick a winner (which claim's history is "the" history is
-/// unknowable), so both are dropped and both are reported, naming each other. This
-/// runs on the id-sorted list, so equal ids are adjacent.
+/// A shared id is a false-green waiting to happen: two files claiming to be one
+/// fact conflate what a hub records against that id, so a genuinely drifted fact
+/// can be masked by its namesake. The tool must not pick a winner (which file's
+/// fact is "the" fact is unknowable), so both are dropped and both are reported,
+/// naming each other. This runs on the id-sorted list, so equal ids are adjacent.
 fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadError>) {
     let mut kept: Vec<LoadedClaim> = Vec::with_capacity(claims.len());
     let mut i = 0;
@@ -334,8 +320,8 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
                     file: c.path.clone(),
                     message: format!(
                         "duplicate claim id '{}': also declared in {}. Two files sharing an id \
-                         share one verdict log, so their histories interleave and a drifted fact \
-                         can read as verified. Give each claim a unique id.",
+                         conflate the fact recorded against it, so a drifted fact can be masked \
+                         by its namesake. Give each claim a unique id.",
                         id,
                         others.join(", ")
                     ),
@@ -347,9 +333,8 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
     *claims = kept;
 }
 
-/// Recursively collect standalone claim files under `dir`, skipping the verdict
-/// log directory, any non-`.md` file, and any `.md` file that does not *intend*
-/// to be a claim.
+/// Recursively collect standalone claim files under `dir`, skipping any non-`.md`
+/// file and any `.md` file that does not *intend* to be a claim.
 ///
 /// A `.claims/**/*.md` file counts as a claim only when its content — after an
 /// optional UTF-8 BOM — opens with a `---` frontmatter fence
@@ -362,25 +347,18 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
 /// The trade-off is deliberate and narrow: a file that *meant* to be a claim but
 /// whose author forgot the opening `---` fence is silently skipped rather than
 /// flagged. That is acceptable — a claim file without frontmatter is not a valid
-/// claim file (it has no id, no check, no `max-age`), and the alternative (one
-/// stray README taking the whole store's nag offline) is the false-silence this
-/// tool exists to prevent, at store scale. A file that *does* open with the fence
-/// but has malformed YAML stays a loud [`load_one`] error: it declared its intent
-/// to be a claim, so a real-but-broken claim is never dropped (invariant #6).
+/// claim file (it has no id, no check), and the alternative (one stray README
+/// taking the whole store's nag offline) is the false-silence this tool exists to
+/// prevent, at store scale. A file that *does* open with the fence but has
+/// malformed YAML stays a loud [`load_one`] error: it declared its intent to be a
+/// claim, so a real-but-broken claim is never dropped (invariant #6).
 ///
 /// A `.md` that cannot be read to inspect its first line is *kept*, not skipped,
 /// so [`load_one`] surfaces the read failure loudly rather than this walk deciding
 /// an unreadable file is a plain doc.
 ///
-/// Pushes absolute paths into `out`; the caller parses them. The `log_dir` guard
-/// is by path equality (not name), so a claim legitimately named `log.md` at the
-/// store root is still collected — only the actual `.claims/log/` tree is
-/// excluded.
-fn collect_claim_files(
-    dir: &Path,
-    log_dir: &Path,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), StoreError> {
+/// Pushes absolute paths into `out`; the caller parses them.
+fn collect_claim_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), StoreError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // A store whose `.claims/` was removed out from under us is not a claim
@@ -407,12 +385,7 @@ fn collect_claim_files(
         })?;
 
         if file_type.is_dir() {
-            // The verdict log is not a claim corpus; its JSON entries are owned by
-            // `read_entries`, not this walk.
-            if path == log_dir {
-                continue;
-            }
-            collect_claim_files(&path, log_dir, out)?;
+            collect_claim_files(&path, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("md")
             && intends_to_be_a_claim(&path)
         {
@@ -458,9 +431,7 @@ mod tests {
 
     /// A claim file body for id `id`, minimal and valid.
     fn claim_text(id: &str) -> String {
-        format!(
-            "---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nS.\n"
-        )
+        format!("---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nS.\n")
     }
 
     /// A store scaffolded in a fresh temp dir, ready for `write` + `load_all`.
@@ -567,7 +538,7 @@ mod tests {
     #[test]
     fn load_all_rejects_a_duplicate_id_across_two_files_naming_both() {
         // C1: two files declaring the same id are both dropped and both reported,
-        // each naming the other, because their verdict logs would interleave.
+        // each naming the other, because a shared id conflates the recorded fact.
         let (_dir, store) = store();
         write(&store, ".claims/one.md", &claim_text("shared"));
         write(&store, ".claims/two.md", &claim_text("shared"));
@@ -604,16 +575,14 @@ mod tests {
     }
 
     #[test]
-    fn load_all_skips_the_verdict_log_tree() {
-        let (_dir, store) = store();
-        write(&store, ".claims/a.md", &claim_text("a"));
-        // A stray .md inside the log dir must not be parsed as a claim.
-        write(&store, ".claims/log/a/note.md", "not a claim\n");
-        let load = store.load_all().unwrap();
-        assert_eq!(load.claims.len(), 1);
+    fn init_creates_only_the_claims_dir_no_log_tree() {
+        // v2 has no committed verdict log, so init scaffolds `.claims/` and nothing
+        // under it — a verdict is telemetry the hub stores, not source.
+        let (dir, _store) = store();
+        assert!(dir.path().join(".claims").is_dir());
         assert!(
-            load.errors.is_empty(),
-            "the log tree is excluded, not parsed"
+            !dir.path().join(".claims/log").exists(),
+            "no verdict-log tree is scaffolded"
         );
     }
 

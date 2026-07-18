@@ -1,30 +1,29 @@
-//! `claim retire <id> --note`: close a claim on purpose.
+//! `claim retire <id> --note`: close a claim on purpose by removing its file.
 //!
 //! Retirement is a deliberate lifecycle decision — the world changed and the
 //! decision the claim rested on was re-reviewed, or the fact became a real test and
-//! the note says where it now lives. It appends a single [`Adjudication::Retire`]
-//! entry to the claim's verdict log; [`claim_core::compute_status`] already treats
-//! the latest past-or-present adjudication as terminal, so the claim's *computed*
-//! status becomes [`claim_core::Status::Retired`] with no field ever written into
-//! the file (invariant #3, status is derived).
+//! the note says where it now lives. It removes the claim's definition file from the
+//! working tree (a `git rm`, once the user commits): the claim ceases to exist, and
+//! there is nothing left to check. There is no stored retirement event — a verdict
+//! and its lifecycle are telemetry a hub tracks, not source (see
+//! `docs/design/CLI-HUB-BOUNDARY.md`) — and the changelog *is* git history: `git log
+//! .claims/` shows exactly when a claim was added and when it was retired, and the
+//! reason rides in the removal commit's message.
 //!
-//! The claim file itself stays on disk untouched: history is preserved, and `claim
-//! log <id>` still shows the whole story ending in the retirement. Retiring runs no
-//! check — a retired claim is closed regardless of whether its fact still holds —
-//! so it is allowed on any claim, drifted or not, and needs no witnessed state.
+//! Retiring runs no check — a retired claim is closed regardless of whether its fact
+//! still holds — so it is allowed on any claim, drifted or not.
 //!
-//! Like every write in this tool (invariant #4), `retire` writes the log entry to
-//! the working tree and stops; the user commits. The output names exactly what to
-//! `git add`.
+//! Like every write in this tool (invariant #4), `retire` changes the working tree
+//! and stops; the user commits. The output names exactly what to `git rm`/commit,
+//! with the note as the commit message so the changelog records *why*.
 
 use anyhow::{Context, Result};
-use claim_core::{append_entry, Adjudication, Event, LogEntry};
 use serde::Serialize;
 
 use crate::apperror::{app, ErrorKind};
 use crate::cli::RetireArgs;
 use crate::output::{emit, relative_to, Format};
-use claim_store::{discover, git, Store};
+use claim_store::{discover, Store};
 
 /// The machine form of `claim retire`.
 #[derive(Debug, Serialize)]
@@ -34,19 +33,14 @@ struct RetireReport {
     /// The retired claim's id.
     id: String,
     /// The store root (repository root), so an agent invoked from a subdirectory can
-    /// resolve `to_commit`, which is root-relative.
+    /// resolve `file` and the commit command, which are root-relative.
     root: String,
-    /// The full 40-char commit sha the retirement was recorded against (the
-    /// unborn-HEAD sentinel when the repo has no commit yet). Full, not abbreviated,
-    /// so the recorded provenance does not vary with `core.abbrev`.
-    commit: String,
-    /// The actor the retirement was attributed to.
-    actor: String,
-    /// The closing note, echoed back.
+    /// The removed claim file, relative to `root`. The caller stages the removal and
+    /// commits it (invariant #4: the tool does not commit).
+    file: String,
+    /// The closing note, echoed back — it becomes the commit message so the
+    /// changelog (`git log .claims/`) records why.
     note: String,
-    /// The single log file the caller must `git add` and commit, relative to `root`
-    /// (invariant #4: the tool does not commit).
-    to_commit: Vec<String>,
 }
 
 /// Run `claim retire`.
@@ -57,9 +51,7 @@ struct RetireReport {
 /// `--note` (a reasonless retirement is the silent closure the note exists to
 /// prevent — clap requires the flag present but not that it carries text); an
 /// unknown id ([`ErrorKind::InvalidInput`], never a silent success — retiring a typo
-/// must not look like closing a real claim); a git provenance failure (no
-/// repository, or no configured identity); or an I/O failure appending the log
-/// entry.
+/// must not look like closing a real claim); or an I/O failure removing the file.
 pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
@@ -77,37 +69,19 @@ pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
 
     let claim = resolve_claim(&store, &args.id)?;
 
-    // Provenance is git-derived (invariant #3), resolved before the write so a
-    // missing repository or identity fails loudly rather than producing an
-    // unattributable entry (`append_entry` rejects an empty commit/actor).
-    let commit = git::resolve_commit(store.root())?;
-    let actor = git::resolve_actor(store.root())?;
+    // Remove the definition file from the working tree. The claim ceases to exist;
+    // there is no verdict or event to write. The user's commit is the tracked
+    // removal (a `git rm`), and its message carries the note.
+    let claim_file = store.claim_file(&claim.id);
+    std::fs::remove_file(&claim_file)
+        .with_context(|| format!("failed to remove the claim file {}", claim_file.display()))?;
 
-    // Stamp the entry through the clock seam (as `check` does), so the recorded
-    // instant is governed by the same `now` a read verb uses — deterministic under
-    // test, wall clock in a shipped binary.
-    let entry = LogEntry {
-        at: crate::clock::now()?,
-        commit: commit.clone(),
-        actor: actor.clone(),
-        event: Event::Adjudication {
-            action: Adjudication::Retire {
-                note: note.to_owned(),
-            },
-        },
-    };
-    let path = append_entry(&store.log_dir(), &claim.id, &entry)
-        .context("failed to record the retirement in the verdict log")?;
-
-    let to_commit = vec![relative_to(store.root(), &path)];
     let report = RetireReport {
         status: "ok",
         id: claim.id.to_string(),
         root: store.root().display().to_string(),
-        commit,
-        actor,
+        file: relative_to(store.root(), &claim_file),
         note: note.to_owned(),
-        to_commit,
     };
 
     emit(format, &report, || human(&report))
@@ -116,8 +90,7 @@ pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
 /// Resolve the requested id to a claim that actually exists in the store.
 ///
 /// An unknown id is a loud error naming the id, never a silent no-op: retiring a
-/// claim that does not exist would either do nothing (and look like success) or
-/// write a stray log directory for a phantom claim. As in `claim log`, a file that
+/// claim that does not exist would do nothing and look like success. A file that
 /// *is* the requested id but failed to parse reports *that* file's error rather than
 /// "not found", so a typo and a broken file are distinguishable.
 fn resolve_claim(store: &Store, id: &str) -> Result<claim_core::Claim> {
@@ -144,8 +117,8 @@ fn resolve_claim(store: &Store, id: &str) -> Result<claim_core::Claim> {
 }
 
 /// Whether a load-errored file's path could be the file for `id`: its `.md` stem,
-/// relative to `.claims/`, equals the id. Mirrors `claim log`'s best-effort match so
-/// an unparseable file named after the requested id reports *that* file's error.
+/// relative to `.claims/`, equals the id. So an unparseable file named after the
+/// requested id reports *that* file's error rather than "not found".
 fn file_stem_matches_id(file: &str, id: &str) -> bool {
     file.strip_prefix(".claims/")
         .and_then(|rest| rest.strip_suffix(".md"))
@@ -157,21 +130,28 @@ fn human(report: &RetireReport) {
     println!("Retired claim '{}'.", report.id);
     println!("  note: {}", report.note);
     println!(
-        "Its status is now `retired` (computed from this log entry); the claim file and its \
-         history are kept."
-    );
-    println!(
-        "Recorded the retirement at commit {}.",
-        git::short_commit(&report.commit)
+        "Removed {} from the working tree; the changelog is git history (`git log .claims/`).",
+        report.file
     );
     println!("\nNothing is committed yet. Review, then commit:");
+    println!("  git -C {} rm {}", report.root, report.file);
     println!(
-        "  git -C {} add {}",
-        report.root,
-        report.to_commit.join(" ")
+        "  git -C {} commit -m \"Retire claim {}: {}\"",
+        report.root, report.id, report.note
     );
-    println!(
-        "  git -C {} commit -m \"Retire claim {}\"",
-        report.root, report.id
-    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_stem_matches_id_maps_a_claim_path_to_its_id() {
+        assert!(file_stem_matches_id(
+            ".claims/payments/pin.md",
+            "payments/pin"
+        ));
+        assert!(!file_stem_matches_id(".claims/payments/pin.md", "other"));
+        assert!(!file_stem_matches_id("elsewhere/pin.md", "pin"));
+    }
 }

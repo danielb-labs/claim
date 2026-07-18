@@ -1,8 +1,5 @@
 {
   "status": "ok",
-  "selection": "all",
-  "report_only": true,
-  "now": "2026-07-18T06:33:02.912671Z",
   "exit": 2,
   "checked": 1,
   "claims": [
@@ -15,11 +12,11 @@
           "end": { "kind": "exited", "code": 0 },
           "detail": "exit 0",
           "evidence": null,
-          "when": "on-change"
+          "note": null
         }
       ],
+      "skipped": [],
       "supports": [],
-      "persisted": false,
       "exit": 0
     }
   ],
@@ -28,6 +25,5 @@
       "file": ".claims/broken-malformed.md",
       "message": ".claims/broken-malformed.md: missing required field 'checks'; a claim needs at least one check"
     }
-  ],
-  "notes": []
+  ]
 }

@@ -43,12 +43,13 @@ fi
 # them. In particular the docs-coverage claim drifts when a CLI verb or MCP tool ships
 # without a mention in docs/index.html, so this step is what makes that backstop
 # actually fire on every branch and in CI, not only when someone runs `claim check`
-# by hand. `--report-only` reports and sets the exit code without persisting a verdict,
-# so the gate never dirties the tree. A freshly built debug binary means the coverage
-# check reads the current CLI surface, not a stale artifact. A drifted or broken claim
-# fails the gate (non-zero exit under `set -e`).
+# by hand. `claim check` reports and sets the exit code but stores nothing (a verdict
+# is telemetry a hub ingests, not source), so the gate never dirties the tree. A
+# freshly built debug binary means the coverage check reads the current CLI surface,
+# not a stale artifact. A drifted or broken claim fails the gate (non-zero exit under
+# `set -e`).
 echo "==> dogfood claims (this repo's own claims must hold)"
 cargo build -p claim -q
-./target/debug/claim check --all --report-only
+./target/debug/claim check
 
 echo "OK"

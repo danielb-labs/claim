@@ -8,6 +8,4 @@ pub mod docs;
 pub mod drift;
 pub mod init;
 pub mod list;
-pub mod log;
 pub mod retire;
-pub mod stats;

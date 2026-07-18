@@ -11,10 +11,14 @@ about *how the code gets built*.
 
 `claim` binds plain-language facts to executable checks, so an engineering org's
 recorded knowledge — and its coding agents' context files — cannot silently rot.
-A claim is a statement plus a way to re-verify it plus a schedule. When a fact
-stops being true, the system notices and routes it to whoever owns the decision
-that rested on it. The whole product is trust, so the code that produces verdicts
-has to be trustworthy itself.
+A claim is a statement plus a way to re-verify it, committed to git; the CLI is a
+stateless runtime verifier that runs the checks and reports whether each fact holds
+right now. When a fact stops being true, the system notices and routes it to whoever
+owns the decision that rested on it. The verdict stream, the schedule, and the
+staleness ledger live in a per-environment **hub** that ingests the CLI's reported
+output — not in git and not in the CLI (see `docs/design/CLI-HUB-BOUNDARY.md`). The
+whole product is trust, so the code that produces verdicts has to be trustworthy
+itself.
 
 ## The golden invariants
 
@@ -32,23 +36,36 @@ discussion.
    inside the tool. Never shell out to `sh -c "! ..."`: a missing binary or a
    deleted path would invert into a false pass. Never let a check's success
    depend on a shell's interpretation of `!`.
-3. **Status and provenance are derived, never stored.** A claim's status is
-   computed from its verdict log and `max_age` at read time. Who authored or
-   reviewed a claim comes from git and the forge (commit author, PR approvals),
-   not from fields in the file. Anything a claim file asserts about itself can be
-   forged; anything git records cannot.
-4. **A write to the truth is a commit.** The tool appends verdicts as files that
-   get committed. There is no side channel, no database, no API that writes
-   claims. If a feature seems to need one, it's the wrong feature for v1.
-5. **A passing check verifies the fact.** `claim add` writes the establishing
-   verdict when its check reports `Held` against reality; `Drifted` (already
-   false) and `Broken` (can't run) are refused. A check is never penalized or
-   marked "unverified" for a red that can't be staged — world-facts and agent
-   checks have no red to fabricate, and a pass against reality is the whole of
+3. **Provenance is derived, never stored.** Who authored or reviewed a claim comes
+   from git and the forge (commit author, PR approvals), not from fields in the
+   file. Anything a claim file asserts about itself can be forged; anything git
+   records cannot. A claim's *status* — freshness, staleness, due-ness — is not the
+   CLI's to hold at all: it is derived by the hub from the verdict stream it stores
+   (see `docs/design/CLI-HUB-BOUNDARY.md`), the same read-time derivation, one layer
+   out.
+4. **The truth is the claim, and a verdict is telemetry.** The truth — the claim —
+   is a commit: a statement, its check, its `supports`, authored and reviewed in git.
+   A verdict is a reported observation, **never committed**. The CLI runs checks and
+   reports `held`/`drifted`/`broken` now (human or `--json`); it stores nothing. The
+   trusted authority for verdicts is the pipeline that produced them and the hub that
+   stores them, the way a green CI check is trusted without being committed to the
+   repo. There is no `.claims/log/`, no side channel, no database, no API that writes
+   verdicts. If a feature seems to need the tool to persist a verdict, it belongs in
+   the hub, not the CLI.
+5. **A passing check verifies the fact — as a birth gate, not a stored receipt.**
+   `claim add` refuses a claim whose check does not report `Held` against reality;
+   `Drifted` (already false) and `Broken` (can't run) are refused. But it writes **no
+   establishing verdict** — a false claim is caught by the next check, so the receipt
+   is unnecessary and committing it would put telemetry in git. A check is never
+   penalized or marked "unverified" for a red that can't be staged — world-facts and
+   agent checks have no red to fabricate, and a pass against reality is the whole of
    verification.
 6. **The failure mode is a nag, never a lie.** Every path — a broken check, an
-   unverifiable streak, a check that was never written, a deleted decision — must
-   degrade toward a human being asked to look, never toward a stale green light.
+   unverifiable answer, a check that was never written, a deleted decision — must
+   degrade toward a human being asked to look, never toward a stale green light. The
+   CLI reports current truth loudly; the *nag* over time (a fact gone unchecked,
+   overdue for its cadence) issues from the hub, which knows the schedule and the
+   history the stateless CLI does not.
 
 When in doubt, prefer the choice that makes a wrong answer *loud*.
 
@@ -65,14 +82,15 @@ to build instead of shipping.
 
 Layout is a Cargo workspace:
 
-- `crates/claim-core` — the domain: parsing, verdict history, status, check
+- `crates/claim-core` — the domain: parsing, the verdict enum, and check
   execution. No terminal, network, or process concerns leak in except where a
   check genuinely runs a subprocess. This is where correctness lives and where
-  test coverage is densest.
+  test coverage is densest. There is no verdict-log or status code here: a verdict
+  is a check result the CLI reports, never a stored history.
 - `crates/claim-store` — the shared infrastructure over core: store discovery,
-  loading a store's claims, and git provenance (commit author, HEAD sha). Both
-  front doors depend on it so they read one store and attribute verdicts
-  identically.
+  loading a store's claims, git provenance (commit author, HEAD sha), and the
+  authoring gate. Both front doors depend on it so they read one store and
+  attribute authored claims identically.
 - `crates/claim` — the `claim` CLI, a thin shell over core and store.
 - `crates/claim-mcp` — the MCP server, a thin shell over core and store.
 
@@ -85,10 +103,11 @@ first item to need it picks one and records the choice in this file. **Chosen:
 `serde_norway`** (item 01), for its more recent release cadence over
 `serde_yaml_ng` — a live signal that dependency and security fixes keep landing,
 which is what a trust tool needs from its parser; rationale in
-`crates/claim-core/Cargo.toml`. For instant and duration arithmetic (the verdict
-log's timestamps and status computation), **`jiff`** (item 02): correctness-first,
-with unambiguous UTC instants, lossless RFC 3339 round-trips, and checked duration
-arithmetic that surfaces overflow instead of wrapping — chosen over `time`/`chrono`;
+`crates/claim-core/Cargo.toml`. For instant and duration arithmetic (a verdict's
+report timestamp, a skip's `until` expiry, and the `hub:` day-count hints the parser
+validates), **`jiff`** (item 02): correctness-first, with unambiguous UTC instants,
+lossless RFC 3339 round-trips, and checked duration arithmetic that surfaces overflow
+instead of wrapping — chosen over `time`/`chrono`;
 rationale in `crates/claim-core/Cargo.toml`. For check execution (item 03),
 **`wait-timeout`** to bound a check's run so a hung command times out to `Broken`
 instead of hanging the tool, and **`libc`** for the one syscall std does not expose,
@@ -105,7 +124,8 @@ async runtime rmcp serves on; and **`schemars`**, which rmcp uses to derive each
 tool's input schema from its request type — rationale in
 `crates/claim-mcp/Cargo.toml`. (The store and git-provenance logic the CLI and the
 server both need lives in the shared **`claim-store`** workspace crate, extracted in
-item 07 so the two front doors read one store and attribute verdicts identically.)
+item 07 so the two front doors read one store and attribute authored claims
+identically.)
 Adding any other dependency requires a one-line justification in the crate's
 `Cargo.toml` and a note in the review — every dependency is attack surface and
 maintenance.
@@ -149,10 +169,11 @@ Coverage is not a percentage target; it's a set of obligations:
 
 - **Every golden invariant has a test that would fail if the invariant broke** —
   especially the negative paths: a check that exits 137 is `Broken` not `Held`; a
-  `negate` claim with a missing binary is `Broken` not a pass; a claim with no
-  verdicts is `Stale` not `Verified`.
+  `negate` claim with a missing binary is `Broken` not a pass; `claim add` refuses a
+  `Drifted`/`Broken` establish and writes nothing; `claim check` reports without
+  persisting any verdict.
 - **Every public function in `claim-core`** has unit tests for its ordinary case
-  and its edge cases (empty, malformed, boundary dates, concurrent-append).
+  and its edge cases (empty, malformed, boundary values).
 - **Every CLI command** has an integration test (`assert_cmd`) asserting exit
   code, human output, and `--json` shape, run against a real temp store.
 - **Output has snapshot tests** (`insta`) so format changes are deliberate and

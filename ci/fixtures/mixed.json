@@ -1,8 +1,5 @@
 {
   "status": "ok",
-  "selection": "all",
-  "report_only": true,
-  "now": "2026-07-18T06:32:51.556860Z",
   "exit": 2,
   "checked": 3,
   "claims": [
@@ -15,9 +12,10 @@
           "end": { "kind": "exited", "code": 0 },
           "detail": "exit 0",
           "evidence": null,
-          "when": "every 30d"
+          "note": null
         }
       ],
+      "skipped": [],
       "supports": [
         {
           "target": "docs/decisions/node20.md",
@@ -25,7 +23,6 @@
           "reason": "'docs/decisions/node20.md' resolves to neither an existing file nor a claim id in the store; the decision or claim it supports may have been deleted"
         }
       ],
-      "persisted": false,
       "exit": 1
     },
     {
@@ -37,11 +34,11 @@
           "end": { "kind": "exited", "code": 2 },
           "detail": "exit 2",
           "evidence": "grep: config.txt: No such file or directory\n",
-          "when": "on-change"
+          "note": null
         }
       ],
+      "skipped": [],
       "supports": [],
-      "persisted": false,
       "exit": 2
     },
     {
@@ -53,9 +50,10 @@
           "end": { "kind": "exited", "code": 1 },
           "detail": "exit 1",
           "evidence": null,
-          "when": "on-change"
+          "note": null
         }
       ],
+      "skipped": [],
       "supports": [
         {
           "target": "requirements.txt#libfoo",
@@ -63,10 +61,8 @@
           "reason": null
         }
       ],
-      "persisted": false,
       "exit": 1
     }
   ],
-  "errors": [],
-  "notes": []
+  "errors": []
 }

@@ -15,7 +15,7 @@
 use std::io::Write;
 
 use anyhow::Result;
-use claim_core::{Status, Trigger, Verdict};
+use claim_core::Verdict;
 use serde::Serialize;
 
 /// Which form a command should print in.
@@ -95,9 +95,10 @@ pub fn warn(message: &str) {
 
 /// The lowercase human label for a verdict, shared by every verb that prints one.
 ///
-/// Kept in one place so `check`, `list`, and `log` cannot disagree on the wording
-/// a script or a human reads. The strings match the JSON `--json` forms (serde's
-/// kebab-case rename), so the human and machine vocabularies are the same words.
+/// Kept in one place so `check` and the authoring verbs cannot disagree on the
+/// wording a script or a human reads. The strings match the JSON `--json` forms
+/// (serde's kebab-case rename), so the human and machine vocabularies are the same
+/// words.
 #[must_use]
 pub fn verdict_label(v: Verdict) -> &'static str {
     match v {
@@ -105,32 +106,6 @@ pub fn verdict_label(v: Verdict) -> &'static str {
         Verdict::Drifted => "drifted",
         Verdict::Unverifiable => "unverifiable",
         Verdict::Broken => "broken",
-    }
-}
-
-/// The lowercase human label for a computed status, shared across verbs.
-///
-/// As with [`verdict_label`], one definition so the inventory table, the drift
-/// queue, and a claim's history all name a status identically, and identically to
-/// its `--json` form.
-#[must_use]
-pub fn status_label(s: Status) -> &'static str {
-    match s {
-        Status::Verified => "verified",
-        Status::Drifted => "drifted",
-        Status::Stale => "stale",
-        Status::Retired => "retired",
-    }
-}
-
-/// The canonical string form of a trigger — `on-change` or `every <N>d` — shared
-/// so `check` and `log` render a claim's cadence identically. Round-trips the
-/// `when:` value a claim file declares.
-#[must_use]
-pub fn trigger_label(when: Trigger) -> String {
-    match when {
-        Trigger::OnChange => "on-change".to_owned(),
-        Trigger::Every { days } => format!("every {days}d"),
     }
 }
 
