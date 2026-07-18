@@ -1,0 +1,11 @@
+---
+source: crates/claim/tests/graph.rs
+expression: "String::from_utf8(out).unwrap()"
+---
+a
+  ├─ DECISION.md#x
+  └─ b [claim]
+b
+  └─ DECISION.md#y
+
+1 claim(s) support nothing: c

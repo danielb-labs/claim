@@ -24,6 +24,9 @@
 //! - **`claim list`** — `0` normally, `2` when a claim file could not be loaded
 //!   (the well-formed claims are still listed — a broken file nags, it does not
 //!   silence the store).
+//! - **`claim graph`** — `0` normally, `2` when a claim file could not be loaded
+//!   (the graph is still rendered from the well-formed claims; a broken file is
+//!   surfaced, not silenced).
 //!
 //! Every other verb is binary: `0` on success, `2` on error. A command signals a
 //! non-error exit code by returning it from [`dispatch`]; an `Err` is always
@@ -61,10 +64,10 @@ fn main() {
 
 /// Route a parsed command to its implementation, returning the process exit code.
 ///
-/// Most verbs return `0` on success; `check`, `list`, and `drift` return a richer
-/// code (see the module docs) computed from what they found. An `Err` is reported
-/// and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and
-/// never a verb's low code.
+/// Most verbs return `0` on success; `check`, `list`, `drift`, and `graph` return a
+/// richer code (see the module docs) computed from what they found. An `Err` is
+/// reported and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2`
+/// and never a verb's low code.
 ///
 /// `amend`, `retire`, and `docs` are binary: `0` on success (via `.map(|()| 0)`),
 /// `2` on any error — they have no review-worthy middle code the way `check`/`drift`
@@ -76,6 +79,7 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
         Command::Check(args) => commands::check::run(args, format),
         Command::List(args) => commands::list::run(args, format),
         Command::Drift(args) => commands::drift::run(args, format),
+        Command::Graph(args) => commands::graph::run(args, format),
         Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),
         Command::Retire(args) => commands::retire::run(args, format).map(|()| 0),
         Command::Docs(args) => commands::docs::run(args, format).map(|()| 0),

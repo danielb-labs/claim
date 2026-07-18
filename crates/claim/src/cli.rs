@@ -64,6 +64,10 @@ pub enum Command {
     /// Close a claim on purpose with a note: remove its file (a git rm).
     Retire(RetireArgs),
 
+    /// Render the `supports` graph: each claim and the decisions or claims it backs
+    /// (`--backers` flips it to each target and the claims backing it).
+    Graph(GraphArgs),
+
     /// Open the product documentation bundled into this binary.
     Docs(DocsArgs),
 }
@@ -227,6 +231,23 @@ EXIT CODES:
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DRIFT_EXIT_HELP)]
 pub struct DriftArgs {}
+
+/// Arguments to `claim graph`: render the store's `supports` graph.
+///
+/// It reads the whole store from the current directory and prints the edges. The
+/// default ASCII view groups by claim — each claim, then the targets it supports, a
+/// target that is itself a claim tagged `[claim]`; `--backers` flips to the inverse
+/// (each target, then the claims backing it). `--json` emits a direction-agnostic
+/// node/edge list unaffected by `--backers`. Richer views — filtering, transitive
+/// support, real visualization — belong to the hub, not here.
+#[derive(Debug, clap::Args)]
+pub struct GraphArgs {
+    /// Group by target instead of by claim: show each decision or claim and the claims
+    /// that back it ("who backs this?"), the inverse of the default grouped-by-claim
+    /// view. Ignored under `--json`, whose node/edge list is direction-agnostic.
+    #[arg(long)]
+    pub backers: bool,
+}
 
 /// Arguments to `claim retire <id>`: close a claim on purpose by removing its file.
 ///

@@ -578,6 +578,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
         <tr><td><code>claim drift</code></td><td>Run checks and list the drifted claims with what each supports <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim amend</code></td><td>Resolve drift by fixing a claim&rsquo;s statement and check; require it holds again <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim retire</code></td><td>Close a claim on purpose with a note; remove its file (a git rm) <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim graph</code></td><td>Render the <code>supports</code> graph &mdash; each claim and the decisions or claims it backs (<code>--backers</code> flips it) <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim docs</code></td><td>Open the documentation bundled into this binary (version-locked to the tool you ran) <span class="chip done">shipped</span></td></tr>
       </tbody>
     </table>
@@ -629,6 +630,20 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     file (a <code>git rm</code>); the required note records why (the decision was re-reviewed, or the fact
     became a real test and this says where). The changelog is git history &mdash;
     <code>git log .claims/</code> shows every claim ever retired &mdash; so it writes no tombstone.</p>
+
+    <h3>claim graph</h3>
+    <p>Renders the store&rsquo;s <code>supports</code> graph: nodes are the claims and the decision refs
+    (or other claims) they back, edges are <code>claim &rarr; target</code>. The default ASCII view groups
+    by claim &mdash; the direction <code>supports</code> reads &mdash; heading each claim with the targets
+    it backs. A target that is itself a claim is tagged <code>[claim]</code>, so a claim resting on another
+    verified claim is visible at a glance; a decision ref or file is left plain. A claim that supports
+    nothing heads no group and is listed in a footer (<code>N claim(s) support nothing: &hellip;</code>), so
+    it is never silently dropped. Pass <code>--backers</code> to flip the grouping the other way &mdash;
+    each decision or claim, then the claims backing it &mdash; for the &ldquo;who backs this?&rdquo;
+    question. <code>--json</code> emits a direction-agnostic <code>{nodes, edges}</code> list an agent can
+    traverse, unaffected by <code>--backers</code>. Every view is deterministic (sorted), so the output
+    diffs cleanly. It is deliberately light: filtering, transitive support, and real visualization belong to
+    the hub, not the standalone CLI.</p>
 
     <h3>claim docs</h3>
     <p>Locates this documentation site &mdash; the very page you are reading &mdash; from a copy
