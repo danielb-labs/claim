@@ -185,9 +185,9 @@ docs and design files that describe it in the same commit.
 A branch that changes user-facing behavior — a verb, a flag, an exit code, an MCP
 tool, an output shape — MUST update, add, or remove the docs it affects **in the
 same branch**, as part of the definition of done: the `docs/index.html` site, the
-topic docs under `docs/`, and the `--help`/`--long-help` text. This is checked in
-review (see step 4 of "How we work"): an unaccompanied behavior change is not
-mergeable, however correct the code is.
+topic docs under `docs/`, and the `--help` text. This is checked in review (see step
+4 of "How we work"): an unaccompanied behavior change is not mergeable, however
+correct the code is.
 
 Docs are **never** a separate batch item. Batching documentation into its own later
 item is exactly what let item 14's MCP `create` tool ship while the site still said

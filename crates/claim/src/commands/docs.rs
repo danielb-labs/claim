@@ -138,10 +138,11 @@ pub fn run(args: &DocsArgs, format: Format) -> Result<()> {
         open_in_browser(&page)
     };
 
-    // The "no opener found" hint goes to stderr before the result on stdout; the two
-    // streams are independent, so a `--json` or `--path` consumer parsing stdout is
-    // unaffected by the ordering. Only the default (open-attempted) headless case
-    // earns it — `--path` explicitly did not ask to open.
+    // The "no opener found" hint is a human note on stderr, and `note` suppresses it
+    // in `--json` mode so a scripted consumer's stderr stays clean while the JSON on
+    // stdout (with `opened: false`) already conveys the same fact. Only the default
+    // (open-attempted) headless case earns it — `--path` explicitly did not ask to
+    // open, so its "failure" to open is not worth a warning.
     if !opened && !args.path {
         note(
             format,
@@ -318,6 +319,69 @@ mod tests {
         // opened browser.
         for file in BUNDLE {
             assert!(!file.bytes.is_empty(), "{} is empty", file.rel);
+        }
+    }
+
+    /// The bytes of a bundled file by its site-relative path, for tests that read the
+    /// embedded HTML rather than a materialized copy.
+    fn bundled(rel: &str) -> &'static [u8] {
+        BUNDLE
+            .iter()
+            .find(|f| f.rel == rel)
+            .unwrap_or_else(|| panic!("{rel} is not bundled"))
+            .bytes
+    }
+
+    /// Every local `src`/`href` target the given HTML references — the value inside
+    /// `src="..."` or `href="..."` — minus external URLs and in-page anchors, so a
+    /// future `<img>` or `<a>` pointing at an unbundled file is visible to the caller.
+    fn referenced_local_targets(html: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for attr in ["src=\"", "href=\""] {
+            let mut rest = html;
+            while let Some(start) = rest.find(attr) {
+                rest = &rest[start + attr.len()..];
+                let Some(end) = rest.find('"') else { break };
+                let value = &rest[..end];
+                rest = &rest[end + 1..];
+                // Skip absolute URLs and pure in-page anchors; keep only relative
+                // references to files that must travel in the bundle.
+                if value.is_empty()
+                    || value.starts_with('#')
+                    || value.contains("://")
+                    || value.starts_with("mailto:")
+                {
+                    continue;
+                }
+                // Drop any `#fragment` on an otherwise-local link (`ci.md#lanes`).
+                let path = value.split('#').next().unwrap_or(value);
+                if !path.is_empty() {
+                    out.push(path.to_owned());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_local_reference_in_the_overview_is_bundled() {
+        // The regression this guards: someone adds an `<img src="assets/new.png">` or
+        // a link to a new topic page to index.html but forgets to add the file to
+        // BUNDLE. `claim docs` would then open a site with a broken image or dead
+        // link — silent doc-rot, exactly what this project exists to prevent. Every
+        // local target the overview references must be a file the binary ships.
+        let html = std::str::from_utf8(bundled("index.html")).expect("index.html is UTF-8");
+        let targets = referenced_local_targets(html);
+        assert!(
+            !targets.is_empty(),
+            "expected the overview to reference at least the diagram images"
+        );
+        for target in targets {
+            assert!(
+                BUNDLE.iter().any(|f| f.rel == target),
+                "index.html references '{target}', which is not in BUNDLE — add it to the \
+                 bundle or the shipped site has a broken link"
+            );
         }
     }
 

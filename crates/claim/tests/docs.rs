@@ -140,10 +140,13 @@ fn json_shape_is_stable() {
 }
 
 #[test]
-fn headless_without_an_opener_degrades_to_printing_the_path() {
-    // Simulate a box with no browser opener: an empty PATH means `open`/`xdg-open`
-    // cannot be found. Without `--path`, the verb must still exit 0 and print the
-    // path, never fail — a doc a user can open by hand is not an error.
+fn headless_human_output_snapshot() {
+    // The insta obligation (CLAUDE.md): the human output is a deliberate, reviewable
+    // surface. The headless path is the stable one to snapshot — it never opens a
+    // browser and its text does not vary — but the cache-dir prefix is machine- and
+    // version-specific, so redact everything before the final `index.html` to a
+    // fixed `<cache>/` token. What remains is the exact wording and shape a change
+    // must not silently alter.
     let dir = tempfile::TempDir::new().unwrap();
     let out = claim()
         .args(["docs"])
@@ -153,10 +156,42 @@ fn headless_without_an_opener_degrades_to_printing_the_path() {
         .get_output()
         .stdout
         .clone();
-
     let stdout = String::from_utf8(out).unwrap();
-    assert!(
-        stdout.contains("index.html"),
-        "the path is still printed when no opener is found: {stdout}"
-    );
+    let redacted = redact_cache_path(&stdout);
+    insta::assert_snapshot!(redacted);
+}
+
+/// Replace the per-run cache-directory prefix on the printed path with a fixed
+/// `<cache>/` token, so the snapshot captures the wording and structure without the
+/// machine- and version-specific path. The path line is the indented one ending in
+/// `index.html`.
+fn redact_cache_path(stdout: &str) -> String {
+    stdout
+        .lines()
+        .map(|line| {
+            if line.trim_start().ends_with("index.html") && line.starts_with("  ") {
+                "  <cache>/index.html".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn headless_without_an_opener_degrades_to_printing_the_path() {
+    // Simulate a box with no browser opener: an empty PATH means `open`/`xdg-open`
+    // cannot be found. Without `--path`, the verb must still exit 0, print the path on
+    // stdout, and warn on stderr that it could not open — never fail, because a doc a
+    // user can open by hand is not an error. The stderr assertion pins the note so
+    // deleting it is caught (B-N2).
+    let dir = tempfile::TempDir::new().unwrap();
+    claim()
+        .args(["docs"])
+        .env("PATH", dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("index.html"))
+        .stderr(predicate::str::contains("no browser opener was found"));
 }
