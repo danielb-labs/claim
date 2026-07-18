@@ -1,0 +1,10 @@
+{
+  "at": "2026-07-18T18:57:32.248377Z",
+  "commit": "501d5776e1ed313d3daf4e40c4cc53d0f81f2eb5",
+  "actor": "Daniel Balagula <daniel.balagula@pm.me>",
+  "event": {
+    "type": "verification",
+    "verdict": "held",
+    "evidence": "Golden invariant #2 holds. Negation is computed in Rust after exit-code classification, never via a shell. run_check dispatches cmd checks to run_cmd (check.rs:325), which executes the raw command as `sh -c <run>` (check.rs:1041-1042, never wrapped in `!`), classifies via classify_exit, then applies apply_negation (check.rs:419-420). classify_exit (check.rs:942-952) is a total match with no wildcard: only exit 0 -> Held, exit 1 -> Drifted; every other exit code, Signalled, TimedOut, SpawnFailed, and NotExecuted -> Broken. apply_negation (check.rs:961-970) swaps Held<->Drifted only and passes Broken|Unverifiable through unchanged, so a missing binary (exit 127), non-0/1 exit, signal death, timeout, or spawn failure stays Broken under negate. An empty `run` returns Broken before negation is applied (check.rs:404-413). Agent checks have no negate field and negation is not applied to them. verdict.rs:34-38 documents the same contract, and tests at check.rs:1732-1778 assert every Broken-stays-Broken-under-negate path.\ncitations:\n- crates/claim-core/src/check.rs:325\n- crates/claim-core/src/check.rs:404-427 (run_cmd)\n- crates/claim-core/src/check.rs:942-952 (classify_exit)\n- crates/claim-core/src/check.rs:961-970 (apply_negation)\n- crates/claim-core/src/check.rs:1040-1046 (execute: sh -c <run>)\n- crates/claim-core/src/check.rs:1732-1778 (negation tests)\n- crates/claim-core/src/verdict.rs:19-38"
+  }
+}
