@@ -68,8 +68,8 @@ takes `--json`.
 Open the full documentation, bundled into the binary and version-locked to it:
 
 ```sh
-claim docs            # opens the docs site in your browser
-claim docs --path     # just prints the path (headless / scripting)
+claim docs            # prints the path to the bundled site (headless / scripting)
+claim docs --open     # also opens it in your browser
 ```
 
 ## Layout

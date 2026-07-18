@@ -33,7 +33,7 @@
 //! (the worktree checks out a commit); on an unborn repository `--witness-cmd` is
 //! refused with the fix, while the default no-witness path still works.
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use claim_core::{
@@ -85,7 +85,8 @@ struct AddReport {
 /// # Errors
 ///
 /// Fails, with a message naming the fix, on: no store found; a missing required
-/// field with no TTY to prompt for it; an invalid id, trigger, or `max-age`; a
+/// field without `--interactive` to prompt for it; an invalid id, trigger, or
+/// `max-age`; a
 /// duplicate id; a check that is `Drifted` or `Broken` against the current tree; a
 /// `--witness-cmd` whose red is not observed (or that is requested on an unborn
 /// HEAD); a git provenance failure; or an I/O failure writing the file or log.
@@ -96,7 +97,7 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     // needed — every verb agrees on the kind.
     let store = discover(&cwd)?;
 
-    let draft = gather_draft(args, format)?;
+    let draft = gather_draft(args)?;
 
     // The single validation path: render the file and parse it back, reusing
     // claim-core's schema. The parsed claim and the exact bytes come back together,
@@ -269,12 +270,12 @@ fn map_author_error(err: AuthorError) -> anyhow::Error {
     }
 }
 
-/// Gather every claim field from flags, falling back to interactive prompts when a
-/// TTY is present and a field is absent. In JSON/non-TTY mode a missing required
-/// field is a loud error, never a silent default (except `when`, which sensibly
-/// defaults to `on-change`).
-fn gather_draft(args: &AddArgs, format: Format) -> Result<ClaimDraft> {
-    let interactive = !format.is_json() && std::io::stdin().is_terminal();
+/// Gather every claim field from flags, prompting for absent required fields only
+/// under `--interactive`. By default a missing required field is a loud, machine-
+/// actionable error naming the flag — never a silent default (except `when`, which
+/// sensibly defaults to `on-change`) and never a prompt that could hang an agent.
+fn gather_draft(args: &AddArgs) -> Result<ClaimDraft> {
+    let interactive = args.interactive;
 
     let id = require_field(args.id.clone(), "id", "--id", interactive, || {
         prompt("Claim id (kebab-case, e.g. payments/libfoo-pin): ")
@@ -332,7 +333,7 @@ fn require_field(
     }
     Err(app(
         ErrorKind::MissingInput,
-        format!("missing {field}; pass {flag} (no terminal is attached to prompt for it)"),
+        format!("missing {field}; pass {flag} (or run with --interactive to be prompted)"),
     ))
 }
 

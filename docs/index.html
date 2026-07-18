@@ -196,9 +196,10 @@ claim add \
     Commit the new files like any other:</p>
     <pre><code>git add .claims &amp;&amp; git commit -m "record libfoo pin claim"</code></pre>
     <p>Every command takes <code>--json</code> for machine-readable output; the flag may lead or follow
-    the verb (<code>claim --json list</code> or <code>claim list --json</code>). At an interactive
-    terminal, <code>add</code> prompts for any required field you omit; a non-interactive caller (an
-    agent or CI) that omits one gets a clear error instead.</p>
+    the verb (<code>claim --json list</code> or <code>claim list --json</code>). <code>claim</code> is
+    headless by default: <code>add</code> errors with the flag to pass when a required field is omitted,
+    never a prompt that could hang an agent. Pass <code>-i</code>/<code>--interactive</code> to be
+    prompted for omitted fields when authoring a claim by hand.</p>
   </section>
 
   <hr>
@@ -562,7 +563,8 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     <p>Records a claim after running its check once and requiring it holds &mdash; a <span class="chip red">drifted</span>
     or <span class="chip amber">broken</span> check is refused (no recording an already-false or
     unrunnable fact). Flags: <code>--id</code>, <code>--statement</code>, <code>--run</code>, and
-    <code>--max-age</code> are required (prompted at a terminal, a clear error otherwise);
+    <code>--max-age</code> are required (omitting one is a clear error naming the flag; pass
+    <code>-i</code>/<code>--interactive</code> to be prompted instead);
     <code>--when</code> defaults to <code>on-change</code>; <code>--negate</code> inverts the check&rsquo;s
     sense; <code>--supports &lt;TARGET&gt;</code> is repeatable; <code>--witness-cmd</code> optionally
     witnesses a red (see <a href="#witness">above</a>).</p>
@@ -613,16 +615,15 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     fabricated, because the store does not observe them.</p>
 
     <h3>claim docs</h3>
-    <p>Opens this documentation site &mdash; the very page you are reading &mdash; from a copy
+    <p>Locates this documentation site &mdash; the very page you are reading &mdash; from a copy
     <em>bundled into the binary</em>, so an installed user with no checkout of this repository can still
     read the docs, and the docs they read are version-locked to the tool they ran (an old binary never
-    shows a newer site than it was built from). It writes the site to a per-version cache directory and
-    hands it to the platform opener (<code>open</code>, <code>xdg-open</code>, or <code>start</code>),
-    printing the path too. <code>claim docs --path</code> prints the path without opening &mdash; for a
-    headless box or scripting (<code>open "$(claim docs --path)"</code>); a box with no opener degrades to
-    the same, printing the path and exiting <code>0</code> rather than failing. <code>claim docs
-    &lt;topic&gt;</code> opens a deeper page: <code>ci</code>, <code>agent-checks</code>, or
-    <code>dogfooding</code>.</p>
+    shows a newer site than it was built from). Headless by default: it writes the site to a per-version
+    cache directory and prints the path &mdash; only the path, on stdout, so <code>open "$(claim docs)"</code>
+    composes. Pass <code>--open</code> to also hand the page to the platform opener (<code>open</code>,
+    <code>xdg-open</code>, or <code>start</code>); a box with no opener still just prints the path and exits
+    <code>0</code> rather than failing. <code>claim docs &lt;topic&gt;</code> selects a deeper page:
+    <code>ci</code>, <code>agent-checks</code>, or <code>dogfooding</code>.</p>
   </section>
 
   <section id="docs">
@@ -647,8 +648,8 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     <p>Both. People read claims to understand what the team believes and why; agents read them at the
     start of a session (through the <a href="#mcp">MCP <code>query</code> tool</a> or <code>--json</code>)
     to inherit verified premises instead of re-deriving the world, and record what they learn with
-    <code>report</code>. The interactive prompts you may hit only appear for a person at a terminal &mdash;
-    run non-interactively with flags and the tool never prompts.</p>
+    <code>report</code>. The tool is headless by default and never prompts unless a person opts in with
+    <code>-i</code>/<code>--interactive</code> on <code>claim add</code>, so an agent never hits a prompt.</p>
     <h3>Is a drifted claim a build failure?</h3>
     <p>No. Drift is a review item routed to the decision&rsquo;s owner, not a red build for whoever
     changed the world. Neither CI lane fails the build; the escalation ladder in v1 has exactly two rungs
