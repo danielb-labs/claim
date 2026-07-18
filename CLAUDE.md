@@ -67,8 +67,12 @@ Layout is a Cargo workspace:
   execution. No terminal, network, or process concerns leak in except where a
   check genuinely runs a subprocess. This is where correctness lives and where
   test coverage is densest.
-- `crates/claim` — the `claim` CLI, a thin shell over core.
-- `crates/claim-mcp` — the MCP server, a thin shell over core.
+- `crates/claim-store` — the shared infrastructure over core: store discovery,
+  loading a store's claims, and git provenance (commit author, HEAD sha). Both
+  front doors depend on it so they read one store and attribute verdicts
+  identically.
+- `crates/claim` — the `claim` CLI, a thin shell over core and store.
+- `crates/claim-mcp` — the MCP server, a thin shell over core and store.
 
 **Approved dependencies.** `serde`/`serde_json` (models and `--json` output),
 `thiserror` (library errors), `anyhow` (binary errors), `clap` (CLI, derive
