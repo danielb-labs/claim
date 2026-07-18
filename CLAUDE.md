@@ -76,7 +76,11 @@ first item to need it picks one and records the choice in this file. **Chosen:
 `serde_norway`** (item 01), for its more recent release cadence over
 `serde_yaml_ng` — a live signal that dependency and security fixes keep landing,
 which is what a trust tool needs from its parser; rationale in
-`crates/claim-core/Cargo.toml`. Adding any
+`crates/claim-core/Cargo.toml`. For instant and duration arithmetic (the verdict
+log's timestamps and status computation), **`jiff`** (item 02): correctness-first,
+with unambiguous UTC instants, lossless RFC 3339 round-trips, and total duration
+math — chosen over `time`/`chrono`; rationale in `crates/claim-core/Cargo.toml`.
+Adding any
 other dependency requires a one-line justification in the crate's `Cargo.toml`
 and a note in the review — every dependency is attack surface and maintenance.
 
