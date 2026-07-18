@@ -430,6 +430,32 @@ pub fn parse_claim_file(path: &str, contents: &str) -> Result<Claim> {
     build_claim(path, yaml, body, source)
 }
 
+/// Whether a file's text *intends* to be a standalone claim: it opens with a
+/// `---` frontmatter fence (after an optional UTF-8 BOM).
+///
+/// This is the discriminator a store scanner uses to tell a claim file from a
+/// plain document living beside it (a `README.md` in `.claims/`). A file that
+/// opens with the fence is treated as a claim and parsed — so malformed YAML
+/// under an opening fence is still a *loud* [`parse_claim_file`] error, never
+/// silently skipped (invariant #6: a file that means to be a claim must nag when
+/// it is broken). A file that does *not* open with the fence is a plain document
+/// the scanner may skip.
+///
+/// The rule is exactly [`parse_claim_file`]'s opening-fence test — the fence
+/// alone on the first line — so the scanner and the parser can never disagree
+/// about what counts as a claim file. It only inspects the first line and reads
+/// no further, so it is cheap enough to run on every `.md` in a store.
+#[must_use]
+pub fn has_frontmatter_fence(contents: &str) -> bool {
+    let text = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    // Mirror `split_frontmatter`'s opening test exactly: the first line must *start*
+    // with `---` (no leading whitespace — an indented `---` is not a fence) and carry
+    // nothing but whitespace after it.
+    text.strip_prefix(FRONTMATTER_FENCE)
+        .map(|rest| rest.split_once('\n').map_or(rest, |(head, _)| head))
+        .is_some_and(|line_rest| line_rest.trim().is_empty())
+}
+
 /// Extract every `<!-- claim ... -->` block embedded in a host file.
 ///
 /// A host file (CLAUDE.md, AGENTS.md, or any text file) may carry several claims.
@@ -1364,6 +1390,23 @@ See [[libfoo-cjk-repro]] for the reproduction.
             links.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
             ["real"]
         );
+    }
+
+    #[test]
+    fn frontmatter_fence_detection_matches_the_opening_fence_rule() {
+        // A store scanner uses this to tell a claim from a plain doc; it must agree
+        // exactly with `split_frontmatter`'s opening test, or a fenced-but-broken
+        // claim could be skipped instead of erroring loudly.
+        assert!(has_frontmatter_fence("---\nid: a\n---\nS.\n"));
+        assert!(has_frontmatter_fence("---   \nid: a\n---\nS.\n")); // trailing space is fine
+        assert!(has_frontmatter_fence("\u{feff}---\nid: a\n")); // a leading BOM is tolerated
+        assert!(has_frontmatter_fence("---")); // fence alone, no newline
+
+        assert!(!has_frontmatter_fence("# README\n\nnot a claim\n"));
+        assert!(!has_frontmatter_fence("")); // empty file
+        assert!(!has_frontmatter_fence("----\nid: a\n")); // four dashes is not the fence
+        assert!(!has_frontmatter_fence("---foo\nid: a\n")); // fence must be alone on its line
+        assert!(!has_frontmatter_fence(" ---\nid: a\n")); // leading space disqualifies it
     }
 
     // --- Negative paths: every validation must fail loudly and name the fix. ---

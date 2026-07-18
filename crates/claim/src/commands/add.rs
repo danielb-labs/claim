@@ -37,8 +37,8 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use claim_core::{
-    append_entry, run_check, Check, CheckContext, CheckOutcome, Claim, ClaimId, Event, LogEntry,
-    Timestamp, Verdict,
+    append_entry, resolve_supports, run_check, Check, CheckContext, CheckOutcome, Claim, ClaimId,
+    Event, LogEntry, Timestamp, Verdict,
 };
 use serde::Serialize;
 
@@ -47,8 +47,8 @@ use crate::claimfile::{
     primary_cmd_check, render_and_validate, CheckDraft, CheckDraftKind, ClaimDraft,
 };
 use crate::cli::AddArgs;
-use crate::output::{emit, note, Format};
-use claim_store::{discover, git, Store};
+use crate::output::{emit, note, warn, Format};
+use claim_store::{discover, git, Store, StoreLoad};
 
 /// The machine form of `claim add`.
 #[derive(Debug, Serialize)]
@@ -109,7 +109,11 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
         )
     })?;
 
-    reject_duplicate(&store, &claim)?;
+    // Load the corpus once and reuse it: the duplicate-id check needs every existing
+    // id, and the supports warning needs them as the known-id set.
+    let existing = store.load_all()?;
+    reject_duplicate(&store, &existing, &claim)?;
+    warn_unresolved_supports(&store, &existing, &claim);
 
     // Provenance is resolved up front, before the check runs: a missing git identity
     // or absent repository should fail while nothing has been written, not after.
@@ -248,11 +252,11 @@ fn parse_id(raw: &str) -> Result<ClaimId> {
 /// verdict log (`.claims/log/<id>/`), so their histories interleave and a drifted
 /// fact can read as verified. Checking only the canonical path `.claims/<id>.md`
 /// misses a claim that declares the same id from a *differently named* file, so
-/// this scans every parsed claim's id, not just the one path — the id, not the
-/// filename, is what must be unique. A canonical-path collision is still checked
-/// too, in case a file exists but does not parse (and so is absent from the id
-/// scan).
-fn reject_duplicate(store: &Store, claim: &Claim) -> Result<()> {
+/// this scans every parsed claim's id in `existing`, not just the one path — the
+/// id, not the filename, is what must be unique. A canonical-path collision is
+/// still checked too, in case a file exists but does not parse (and so is absent
+/// from the id scan).
+fn reject_duplicate(store: &Store, existing: &StoreLoad, claim: &Claim) -> Result<()> {
     let canonical = store.claim_file(&claim.id);
     if canonical.exists() {
         return Err(app(
@@ -265,8 +269,7 @@ fn reject_duplicate(store: &Store, claim: &Claim) -> Result<()> {
         ));
     }
 
-    let load = store.load_all()?;
-    if let Some(existing) = load.claims.iter().find(|c| c.claim.id == claim.id) {
+    if let Some(existing) = existing.claims.iter().find(|c| c.claim.id == claim.id) {
         return Err(app(
             ErrorKind::DuplicateId,
             format!(
@@ -277,6 +280,39 @@ fn reject_duplicate(store: &Store, claim: &Claim) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Warn — never fail — for each `supports` target that does not resolve now.
+///
+/// A support edge is a soft signal, and a forward reference (a decision ref to a
+/// file or anchor not yet written) is legitimate, so an unresolvable target at
+/// author time is a warning, not a hard error: it nags the author to fix a typo
+/// (the common case — a GitHub-slug `#approved-dependencies` where the file says
+/// "Approved dependencies") without blocking a deliberate forward reference.
+/// Without this, an author sees the target accepted silently and is surprised by
+/// `UNRESOLVED` only at `check` time.
+///
+/// Resolution reuses claim-core's [`resolve_supports`] against the same store root
+/// and known-id set `check` uses, so `add` and `check` agree on what resolves. The
+/// warning goes to stderr in every mode ([`warn`]), so a `--json` caller still sees
+/// it without its stdout being contaminated.
+fn warn_unresolved_supports(store: &Store, existing: &StoreLoad, claim: &Claim) {
+    if claim.supports.is_empty() {
+        return;
+    }
+    let known_ids: Vec<ClaimId> = existing.claims.iter().map(|c| c.claim.id.clone()).collect();
+    for res in resolve_supports(&claim.supports, store.root(), &known_ids) {
+        if !res.resolved {
+            let reason = res.reason.as_deref().unwrap_or("does not resolve");
+            warn(&format!(
+                "supports target '{}' does not resolve: {reason}. The claim will be created, but \
+                 `claim check` will flag this as an unresolved support until it resolves. If you \
+                 meant a Markdown heading, `#anchor` is a literal text scan, not a slug — use the \
+                 words as written.",
+                res.target
+            ));
+        }
+    }
 }
 
 /// Run the check against the current tree and require `Held`, showing the evidence.

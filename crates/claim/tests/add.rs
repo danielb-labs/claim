@@ -454,6 +454,97 @@ fn rejects_a_missing_required_field_without_a_tty() {
         .stderr(predicate::str::contains("--statement"));
 }
 
+#[test]
+fn rejects_a_missing_max_age_without_a_tty_clearly() {
+    // `--max-age` reads as optional in the args but is required: a non-interactive
+    // caller (an agent or CI, the common case) that omits it must get a clear error
+    // naming the flag, not a silent default and not a hang on a prompt.
+    let repo = ready_repo();
+    repo.claim()
+        .args(["add", "--id", "x", "--statement", "S.", "--run", HOLDS])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("missing max-age"))
+        .stderr(predicate::str::contains("--max-age"));
+}
+
+// --- Supports: an unresolvable target warns at author time but does not fail. ---
+
+#[test]
+fn add_warns_on_an_unresolvable_supports_but_still_creates_the_claim() {
+    // A GitHub-slug anchor (`#approved-dependencies`) against a file whose heading
+    // reads "Approved dependencies" does not resolve — `#anchor` is a literal text
+    // scan, not a slug. The author must see a warning now, not a surprise UNRESOLVED
+    // at `check` time. It is a warning, not a hard failure: a forward reference is
+    // legitimate, so the claim is still created (exit 0).
+    let repo = ready_repo();
+    repo.write(
+        "DECISIONS.md",
+        "# Approved dependencies\n\nserde is fine.\n",
+    );
+    repo.git(&["add", "DECISIONS.md"]);
+    repo.git(&["commit", "-q", "-m", "add decisions"]);
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "dep-note",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--supports",
+            "DECISIONS.md#approved-dependencies",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("does not resolve"))
+        .stderr(predicate::str::contains(
+            "DECISIONS.md#approved-dependencies",
+        ));
+
+    // The claim was created despite the warning.
+    assert!(repo.exists(".claims/dep-note.md"));
+}
+
+#[test]
+fn add_does_not_warn_when_every_supports_resolves() {
+    // The mirror of the above: an anchor whose literal words appear in the file
+    // resolves, so no warning is printed. Guards against a warning that fires on
+    // valid input (which would train authors to ignore it).
+    let repo = ready_repo();
+    repo.write(
+        "DECISIONS.md",
+        "# Approved dependencies\n\nserde is fine.\n",
+    );
+    repo.git(&["add", "DECISIONS.md"]);
+    repo.git(&["commit", "-q", "-m", "add decisions"]);
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "dep-note",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            // The literal words are present, so the anchor resolves.
+            "--supports",
+            "DECISIONS.md#Approved dependencies",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("does not resolve").not());
+
+    assert!(repo.exists(".claims/dep-note.md"));
+}
+
 // --- Optional witnessed-red: extra confidence, in an isolated worktree. ---
 
 #[test]

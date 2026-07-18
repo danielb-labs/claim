@@ -520,9 +520,10 @@ mod tests {
             "good",
             &TestStore::claim_text("good", "A valid claim.", &[]),
         );
-        // A file with no frontmatter cannot parse; it must not crash the query nor
-        // drop the good claim.
-        s.write_claim("bad", "not a claim, no frontmatter at all\n");
+        // A file that opens with a `---` fence declares itself a claim, so its
+        // malformed YAML is a loud error (a fenceless doc would be skipped as a
+        // non-claim now); it must not crash the query nor drop the good claim.
+        s.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
         let resp = run_query(
             &s.store,
             &QueryRequest::default(),

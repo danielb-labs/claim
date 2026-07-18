@@ -79,6 +79,46 @@ fn a_broken_check_is_broken_and_exit_two() {
 }
 
 #[test]
+fn a_plain_readme_in_the_store_is_ignored_and_check_succeeds() {
+    // The dogfooding bug: a plain `.claims/README.md` (no frontmatter fence) is a
+    // document, not a claim, and must not be parsed. Without the scanner fix it
+    // fails "missing frontmatter" and forces `check` to exit 2, silencing the whole
+    // store. Here it coexists with a real claim: the claim is checked, the README is
+    // skipped, and the run is a clean exit 0.
+    let repo = ready_repo();
+    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    repo.write(
+        ".claims/README.md",
+        "# Our claim store\n\nThis directory holds the repo's claims.\n",
+    );
+
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("held"))
+        .stdout(predicate::str::contains("README").not());
+}
+
+#[test]
+fn a_frontmatter_fenced_but_malformed_claim_stays_a_loud_error() {
+    // The other half of the scanner rule: a file that *opens with a `---` fence*
+    // declared its intent to be a claim, so malformed YAML under it must stay a loud
+    // exit-2 error naming the file — never silently skipped as if it were a plain
+    // doc. Invariant #6: a real-but-broken claim is never dropped.
+    let repo = ready_repo();
+    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+    // Opens with the fence, but the YAML is unterminated.
+    repo.write(".claims/broken.md", "---\nchecks: [unclosed\n---\nS.\n");
+
+    repo.claim()
+        .args(["check", "--all"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(".claims/broken.md"));
+}
+
+#[test]
 fn report_only_writes_no_log_entry_but_still_reports_and_sets_exit() {
     let repo = ready_repo();
     repo.write_claim("pin", &pin_claim("pin", "on-change"));
@@ -388,10 +428,12 @@ fn a_duplicate_id_across_two_files_is_a_loud_error_naming_both() {
 #[test]
 fn a_malformed_sibling_does_not_stop_checking_the_good_claims() {
     // M1: one bad file must not brick the run. The good claim still checks and
-    // persists; the bad one is reported; the exit is floored at 2.
+    // persists; the bad one is reported; the exit is floored at 2. The bad sibling
+    // must *open with a frontmatter fence* to count as a broken claim (a fenceless
+    // doc is a skipped non-claim now); its YAML is then malformed.
     let repo = ready_repo();
     repo.write_claim("good", &pin_claim("good", "on-change"));
-    repo.write_claim("bad", "no frontmatter here, not a claim\n");
+    repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
 
     let output = repo
         .claim()
