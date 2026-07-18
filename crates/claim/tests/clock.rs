@@ -1,9 +1,14 @@
 //! Integration tests for the `CLAIM_NOW` clock seam (debug-only, loud).
 //!
-//! These run against the *debug* binary (assert_cmd's default), where the seam is
-//! compiled in. A release binary ignores `CLAIM_NOW` entirely — that path is not
-//! directly testable here without a release build, but it is enforced by
-//! `#[cfg(debug_assertions)]` in `clock.rs` and documented there.
+//! The seam itself is `#[cfg(debug_assertions)]` in `clock.rs`: a release binary
+//! ignores `CLAIM_NOW` entirely, so it cannot be made to lie about "now". These
+//! tests exercise the seam, so the whole target is gated on the same
+//! `#![cfg(debug_assertions)]` — `assert_cmd` builds the binary under test in the
+//! harness's own profile, so a release test run has no seam to assert on and this
+//! file compiles to nothing, keeping `cargo test --release` clean. The release
+//! path (override ignored) is guaranteed by the `#[cfg]` in `clock.rs`, not
+//! re-asserted here.
+#![cfg(debug_assertions)]
 
 mod common;
 

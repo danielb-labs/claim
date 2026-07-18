@@ -37,7 +37,7 @@ use claim_core::{
 use serde::Serialize;
 
 use crate::output::{emit, Format};
-use crate::store::{discover, LoadError};
+use claim_store::{discover, LoadError};
 
 /// Run `claim stats`. Always returns `Ok(())` (exit 0); it is informational.
 ///

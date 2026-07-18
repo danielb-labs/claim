@@ -1,32 +1,32 @@
 //! Locating and scaffolding a claim store on disk.
 //!
 //! A store is a `.claims/` directory holding claim files (`.claims/**/*.md`) and
-//! the verdict log (`.claims/log/<id>/`). This module owns two questions every
-//! verb shares, so they are answered in exactly one place:
+//! the verdict log (`.claims/log/<id>/`). This module owns the questions every
+//! consumer — the CLI's read/verify verbs and the MCP server — shares, so they
+//! are answered in exactly one place and the two binaries cannot drift apart:
 //!
 //! - **Where is the store?** [`discover`] walks up from a starting directory to
 //!   the nearest ancestor containing a `.claims/`, the same way git finds `.git/`.
-//!   `claim add` (and later `check`, `list`, `log`, …) call this so they work from
-//!   anywhere inside a repository, not only its root.
+//!   Every consumer calls this so it works from anywhere inside a repository, not
+//!   only its root.
 //! - **How is one created?** [`Store::init`] scaffolds `.claims/` and
 //!   `.claims/log/` in a chosen directory, idempotently.
 //! - **What claims does it hold?** [`Store::load_all`] walks `.claims/**/*.md`,
-//!   parses each, and returns the whole corpus, so the read/verify verbs
-//!   (`check`, `list`, `log`, `drift`) share one definition of "every claim in
-//!   the store" rather than each re-deriving the walk.
+//!   parses each, and returns the whole corpus, so every consumer shares one
+//!   definition of "every claim in the store" rather than each re-deriving the
+//!   walk.
 //!
 //! The discovery rule is a deliberate contract: the store root is the directory
 //! *containing* `.claims/`, and there is exactly one per walk (the nearest),
 //! because a claim's `cmd` check paths are written relative to that root
-//! ([`claim_core::CheckContext::cwd`]). Anchoring every later command to the same
-//! root is what keeps a check running against the tree its author wrote it for.
+//! ([`claim_core::CheckContext::cwd`]). Anchoring every consumer to the same root
+//! is what keeps a check running against the tree its author wrote it for.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
 use claim_core::{parse_claim_file, Claim};
 
-use crate::apperror::{app, ErrorKind};
+use crate::error::StoreError;
 
 /// The store directory name, relative to the store root.
 pub const CLAIMS_DIR: &str = ".claims";
@@ -102,11 +102,11 @@ impl Store {
     /// Parse every claim in the store: `.claims/**/*.md`, excluding the verdict
     /// log.
     ///
-    /// The one place the read/verify verbs agree on what "the store's claims" are,
-    /// so `check`, `list`, `log`, and `drift` cannot disagree about which files
-    /// count. Returns them sorted by id for a stable, deterministic order (a
-    /// directory listing is order-unspecified across platforms), so a JSON array or
-    /// a human table reads the same on every run.
+    /// The one place every consumer agrees on what "the store's claims" are, so
+    /// the CLI's `check`, `list`, `log`, and `drift` and the MCP server's `query`
+    /// cannot disagree about which files count. Returns them sorted by id for a
+    /// stable, deterministic order (a directory listing is order-unspecified across
+    /// platforms), so a JSON array or a human table reads the same on every run.
     ///
     /// Two directories under `.claims/` are deliberately skipped: `log/`, which
     /// holds verdict-log JSON (`read_entries` owns those), and any file that is not
@@ -134,7 +134,7 @@ impl Store {
     /// Fails only for a fault that makes the *corpus itself* unreadable — the
     /// `.claims/` directory cannot be listed. A single bad claim file is a
     /// [`LoadError`], not an `Err`.
-    pub fn load_all(&self) -> Result<StoreLoad> {
+    pub fn load_all(&self) -> Result<StoreLoad, StoreError> {
         let claims_dir = self.claims_dir();
         let log_dir = self.log_dir();
         let mut files = Vec::new();
@@ -177,21 +177,20 @@ impl Store {
     /// Fails if the directories cannot be created, or if `.claims` exists but is a
     /// file rather than a directory — a loud error, because silently treating a
     /// stray `.claims` file as a store would hide the real problem.
-    pub fn init(root: impl Into<PathBuf>) -> Result<(Self, bool)> {
+    pub fn init(root: impl Into<PathBuf>) -> Result<(Self, bool), StoreError> {
         let root = root.into();
         let claims = root.join(CLAIMS_DIR);
 
         if claims.exists() && !claims.is_dir() {
-            bail!(
-                "{} exists but is not a directory; move it aside before creating a claim store",
-                claims.display()
-            );
+            return Err(StoreError::NotADirectory { path: claims });
         }
 
         let existed = claims.is_dir();
         let log = claims.join(LOG_DIR);
-        std::fs::create_dir_all(&log)
-            .with_context(|| format!("failed to create the store at {}", claims.display()))?;
+        std::fs::create_dir_all(&log).map_err(|source| StoreError::Io {
+            context: format!("failed to create the store at {}", claims.display()),
+            source,
+        })?;
 
         let created = !existed;
         Ok((Store { root }, created))
@@ -203,8 +202,8 @@ impl Store {
 ///
 /// The nearest match wins, so a nested repository's own store shadows an outer
 /// one — the same containment rule git uses for `.git/`. Runs from any directory
-/// inside a repository, which is why a verb never assumes it was invoked at the
-/// root.
+/// inside a repository, which is why a consumer never assumes it was invoked at
+/// the root.
 ///
 /// The walk stops at the first ancestor that *is* a git repository (contains a
 /// `.git`): a `.claims/` found strictly above that boundary belongs to a different
@@ -212,17 +211,16 @@ impl Store {
 /// from the wrong repo onto claims in this one. A `.claims/` at the repo root or
 /// below is inside the boundary and accepted. When `start` is not inside any git
 /// repository, no boundary is hit and the walk proceeds to the filesystem root — a
-/// bare `.claims/` with no repo is still a usable store for the CLI, and `add` will
-/// separately refuse for lack of a commit to attribute.
+/// bare `.claims/` with no repo is still a usable store for reads, and a write
+/// verb will separately refuse for lack of a commit to attribute.
 ///
 /// # Errors
 ///
-/// Fails when no `.claims/` is found within the boundary. The error carries
-/// [`ErrorKind::NoStore`], so every verb that calls `discover` reports a missing
-/// store with the same machine-readable `kind` an item-7 agent branches on — the
-/// mapping lives here, at the single discovery point, not re-derived per verb. The
-/// message points at `claim init`.
-pub fn discover(start: &Path) -> Result<Store> {
+/// Returns [`StoreError::NoStore`] when no `.claims/` is found within the
+/// boundary. That variant is the single, machine-recognizable "run `claim init`"
+/// signal both binaries branch on — the classification lives here, at the one
+/// discovery point, not re-derived per consumer.
+pub fn discover(start: &Path) -> Result<Store, StoreError> {
     for dir in start.ancestors() {
         let candidate = dir.join(CLAIMS_DIR);
         if candidate.is_dir() {
@@ -237,23 +235,20 @@ pub fn discover(start: &Path) -> Result<Store> {
             break;
         }
     }
-    Err(app(
-        ErrorKind::NoStore,
-        format!(
-            "no claim store found in {} or any parent directory up to the git repository root; \
-             run `claim init` to create one",
-            start.display()
-        ),
-    ))
+    Err(StoreError::NoStore {
+        start: start.to_path_buf(),
+    })
 }
 
 /// The result of loading a store's claims: the ones that parsed cleanly and are
 /// unique, plus a per-file error for each that did not.
 ///
-/// Separating the two lets every read verb honor one rule: report the broken files
-/// loudly (and exit non-zero), yet still act on the good ones. A store is never
-/// silenced by a single bad file. Callers treat a non-empty `errors` as an exit-2
-/// condition — loud — while listing/checking `claims` as usual — useful.
+/// Separating the two lets every consumer honor one rule: report the broken files
+/// loudly (and exit non-zero, or surface them as error entries), yet still act on
+/// the good ones. A store is never silenced by a single bad file. The CLI treats a
+/// non-empty `errors` as an exit-2 condition — loud — while listing/checking
+/// `claims` as usual — useful; the MCP server surfaces the errors alongside the
+/// good matches.
 #[derive(Debug, Clone)]
 pub struct StoreLoad {
     /// The well-formed, unique claims, sorted by id.
@@ -276,9 +271,9 @@ pub struct LoadError {
 /// A claim parsed from the store, paired with the store-relative path it lives at.
 ///
 /// Bundling the parsed [`Claim`] with its store-relative path (for display and
-/// error messages, the way a user sees it on disk) means a caller never re-derives
-/// a path from the id and risks disagreeing with where the file actually is. A
-/// caller needing the absolute path joins it onto [`Store::root`].
+/// error messages, the way a user sees it on disk) means a consumer never
+/// re-derives a path from the id and risks disagreeing with where the file
+/// actually is. A caller needing the absolute path joins it onto [`Store::root`].
 #[derive(Debug, Clone)]
 pub struct LoadedClaim {
     /// The parsed claim.
@@ -291,9 +286,8 @@ pub struct LoadedClaim {
 
 /// Read and parse one claim file, returning a bare reason on failure.
 ///
-/// The reason is bare (not an `Err`/`anyhow`) so the caller folds it into a
-/// [`LoadError`] alongside the file path, keeping the per-file degradation in one
-/// place.
+/// The reason is bare (not an `Err`) so the caller folds it into a [`LoadError`]
+/// alongside the file path, keeping the per-file degradation in one place.
 fn load_one(path: &Path, rel: &str) -> std::result::Result<Claim, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("could not be read: {e}"))?;
     parse_claim_file(rel, &text).map_err(|e| e.to_string())
@@ -355,25 +349,35 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
 /// is by path equality (not name), so a claim legitimately named `log.md` at the
 /// store root is still collected — only the actual `.claims/log/` tree is
 /// excluded.
-fn collect_claim_files(dir: &Path, log_dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_claim_files(
+    dir: &Path,
+    log_dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), StoreError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // A store whose `.claims/` was removed out from under us is not a claim
         // corpus at all; but a missing directory during recursion (a race) is
         // treated as empty rather than fatal — there is nothing there to collect.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(e).with_context(|| format!("failed to list {}", dir.display()));
+        Err(source) => {
+            return Err(StoreError::Io {
+                context: format!("failed to list {}", dir.display()),
+                source,
+            });
         }
     };
 
     for entry in entries {
-        let entry =
-            entry.with_context(|| format!("failed to read an entry in {}", dir.display()))?;
+        let entry = entry.map_err(|source| StoreError::Io {
+            context: format!("failed to read an entry in {}", dir.display()),
+            source,
+        })?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let file_type = entry.file_type().map_err(|source| StoreError::Io {
+            context: format!("failed to stat {}", path.display()),
+            source,
+        })?;
 
         if file_type.is_dir() {
             // The verdict log is not a claim corpus; its JSON entries are owned by
@@ -412,6 +416,24 @@ mod tests {
         let path = store.root().join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn discover_finds_the_nearest_store_and_reports_none_loudly() {
+        // A store at the root is found from a nested subdirectory; a directory with
+        // no store above it (to the git boundary) reports NoStore.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        Store::init(dir.path()).unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let store = discover(&nested).unwrap();
+        assert_eq!(store.root(), dir.path());
+
+        let bare = TempDir::new().unwrap();
+        std::fs::create_dir_all(bare.path().join(".git")).unwrap();
+        let err = discover(bare.path()).unwrap_err();
+        assert!(matches!(err, StoreError::NoStore { .. }));
     }
 
     #[test]
@@ -489,5 +511,13 @@ mod tests {
             load.errors.is_empty(),
             "the log tree is excluded, not parsed"
         );
+    }
+
+    #[test]
+    fn init_rejects_a_claims_path_that_is_a_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(CLAIMS_DIR), b"not a dir").unwrap();
+        let err = Store::init(dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::NotADirectory { .. }));
     }
 }

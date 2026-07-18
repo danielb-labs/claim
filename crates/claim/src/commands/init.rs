@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cli::InitArgs;
-use crate::git;
 use crate::output::{emit, warn, Format};
-use crate::store::Store;
+use claim_store::git::is_inside_work_tree;
+use claim_store::Store;
 
 /// The machine form of `claim init`, stable across runs.
 ///
@@ -31,7 +31,7 @@ struct InitReport {
 /// Scaffold `.claims/` and `.claims/log/` in the target directory, idempotently.
 ///
 /// The store root is the directory the store lives in — `--dir` when given, else
-/// the current directory. This is where later commands anchor: [`crate::store::discover`]
+/// the current directory. This is where later commands anchor: [`claim_store::discover`]
 /// walks up to find this same `.claims/`. Re-running is not an error; it reports
 /// `created: false`.
 ///
@@ -51,7 +51,7 @@ pub fn run(args: &InitArgs, format: Format) -> Result<()> {
     // add` cannot attribute a verdict without a commit and identity, so warn rather
     // than let the user discover it later. Not fatal — `git init` may simply come
     // next.
-    if !git::is_inside_work_tree(store.root()) {
+    if !is_inside_work_tree(store.root()) {
         warn(
             "this store is not inside a git repository; `claim add` needs one to attribute \
              verdicts. Run `git init` here before adding claims.",

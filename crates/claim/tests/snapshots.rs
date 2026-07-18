@@ -59,6 +59,13 @@ fn stdout(repo: &TestRepo, args: &[&str], code: i32) -> String {
     String::from_utf8(out).expect("stdout is UTF-8")
 }
 
+// `list` renders a `now`-relative "STALE-IN" countdown, so its output depends on
+// the `CLAIM_NOW` seam being honored — which only happens in a debug build. A
+// release run reads the wall clock, so the countdown drifts by the days since NOW
+// and the snapshot cannot match. Gated on the same `#[cfg(debug_assertions)]` as
+// the seam, so `cargo test --release` stays clean. The other snapshots below print
+// no clock-relative value and run in either profile.
+#[cfg(debug_assertions)]
 #[test]
 fn list_human_table_snapshot() {
     let repo = mixed_store();
@@ -167,6 +174,10 @@ fn amend_human_snapshot() {
     insta::assert_snapshot!(redact_write_output(&body, repo.path()));
 }
 
+// `stats` counts statuses computed against `now`, so like `list` its output
+// depends on the `CLAIM_NOW` seam and only matches in a debug build. Gated on
+// `#[cfg(debug_assertions)]` so `cargo test --release` stays clean.
+#[cfg(debug_assertions)]
 #[test]
 fn stats_human_snapshot() {
     // A store spanning all four statuses plus a never-verified claim, so the snapshot

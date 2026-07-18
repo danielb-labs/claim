@@ -55,9 +55,8 @@ use crate::claimfile::{
     primary_cmd_check, render_and_validate, CheckDraft, CheckDraftKind, ClaimDraft,
 };
 use crate::cli::AddArgs;
-use crate::git;
 use crate::output::{emit, note, warn, Format};
-use crate::store::{discover, Store};
+use claim_store::{discover, git, Store};
 
 /// The machine form of `claim add`.
 #[derive(Debug, Serialize)]
@@ -97,8 +96,9 @@ struct AddReport {
 /// `Drifted`; a git provenance failure; or an I/O failure writing the file or log.
 pub fn run(args: &AddArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
-    // `discover` already tags a missing store with `ErrorKind::NoStore`, so no
-    // per-verb remapping is needed — every verb agrees on the kind.
+    // `discover` returns `StoreError::NoStore` for a missing store, which
+    // `apperror::kind_of` maps to the `no-store` kind, so no per-verb remapping is
+    // needed — every verb agrees on the kind.
     let store = discover(&cwd)?;
 
     let draft = gather_draft(args, format)?;
@@ -433,7 +433,10 @@ fn witness_scripted(
 fn restore_tree(args: &AddArgs, store: &Store) -> Result<()> {
     match &args.restore_cmd {
         Some(cmd) => run_perturbation(store.root(), cmd).context("the --restore-cmd failed to run"),
-        None => git::revert_tracked_changes(store.root()),
+        None => git::revert_tracked_changes(store.root()).context(
+            "failed to revert tracked changes while restoring the tree; on a repo with no \
+             commit yet, pass --restore-cmd to undo the perturbation",
+        ),
     }
 }
 
