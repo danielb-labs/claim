@@ -1,0 +1,8 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"list\"], 0)"
+---
+ID     STATUS    LAST-VERIFIED  STALE-IN  SUPPORTS
+fresh  verified  2026-07-10     113d      0
+gone   drifted   2026-07-10     —         1
+old    stale     2026-01-01     —         0

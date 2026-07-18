@@ -40,22 +40,47 @@ fn seeded_store() -> TestRepo {
     repo
 }
 
-#[test]
-fn statuses_are_computed_across_a_mixed_store() {
-    let repo = seeded_store();
+/// Parse the `list --json` envelope and return its `claims` array. `list` emits a
+/// self-describing object (`{status, now, claims, errors}`), matching `check`/`drift`.
+fn list_claims(output: &[u8]) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(output).expect("list --json is one object");
+    assert_eq!(v["status"], "ok");
+    assert!(
+        v["now"].is_string(),
+        "the envelope records the computed-at instant"
+    );
+    assert_eq!(v["exit"], 0, "a clean list exits 0");
+    v["claims"].as_array().expect("claims is an array").clone()
+}
+
+/// The ids in a `list --json` result, for set assertions.
+fn ids(claims: &[serde_json::Value]) -> Vec<String> {
+    claims
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn run_list(repo: &TestRepo, args: &[&str]) -> Vec<serde_json::Value> {
+    let mut full = vec!["--json", "list"];
+    full.extend_from_slice(args);
     let output = repo
         .claim_at(NOW)
-        .args(["--json", "list"])
+        .args(full)
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
+    list_claims(&output)
+}
 
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let by_id = |id: &str| -> String {
-        rows.as_array()
-            .unwrap()
+#[test]
+fn statuses_are_computed_across_a_mixed_store() {
+    let repo = seeded_store();
+    let claims = run_list(&repo, &[]);
+    let status_of = |id: &str| -> String {
+        claims
             .iter()
             .find(|r| r["id"] == id)
             .unwrap_or_else(|| panic!("row {id}"))["status"]
@@ -63,26 +88,17 @@ fn statuses_are_computed_across_a_mixed_store() {
             .unwrap()
             .to_owned()
     };
-    assert_eq!(by_id("fresh"), "verified");
-    assert_eq!(by_id("gone"), "drifted");
-    assert_eq!(by_id("old"), "stale");
+    assert_eq!(status_of("fresh"), "verified");
+    assert_eq!(status_of("gone"), "drifted");
+    assert_eq!(status_of("old"), "stale");
 }
 
 #[test]
 fn status_filter_narrows_to_one_status() {
     let repo = seeded_store();
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--status", "drifted"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let arr = rows.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["id"], "gone");
+    let claims = run_list(&repo, &["--status", "drifted"]);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["id"], "gone");
 }
 
 #[test]
@@ -96,49 +112,27 @@ fn unknown_status_filter_errors() {
 }
 
 #[test]
-fn stale_shortcut_shows_overdue_claims() {
+fn stale_shortcut_shows_only_stale_not_drifted() {
     let repo = seeded_store();
-    // `--stale` = due = stale or drifted; so `gone` (drifted) and `old` (stale),
-    // not `fresh`.
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--stale"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let ids: Vec<&str> = rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["id"].as_str().unwrap())
-        .collect();
-    assert!(ids.contains(&"gone"));
-    assert!(ids.contains(&"old"));
-    assert!(!ids.contains(&"fresh"));
+    // `--stale` is `Status::Stale` only (m8): `old` (stale), NOT `gone` (drifted)
+    // and NOT `fresh` (verified). Drift has its own verb.
+    let claims = run_list(&repo, &["--stale"]);
+    let got = ids(&claims);
+    assert_eq!(got, vec!["old"], "--stale is stale-only, not drifted");
 }
 
 #[test]
-fn path_filter_matches_on_segment_boundaries() {
+fn path_filter_matches_repo_relative_paths() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();
     repo.write_claim("payments/pin", &claim_file("payments/pin", "120d"));
     repo.write_claim("infra/db", &claim_file("infra/db", "120d"));
 
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--path", ".claims/payments"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let arr = rows.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["id"], "payments/pin");
+    // `--path payments` matches `.claims/payments/pin.md` — the user thinks in repo
+    // paths, so the `.claims/` prefix is stripped before matching (m1).
+    let claims = run_list(&repo, &["--path", "payments"]);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["id"], "payments/pin");
 }
 
 #[test]
@@ -151,18 +145,9 @@ fn supports_filter_matches_a_declared_target() {
     );
     repo.write_claim("plain", &claim_file("plain", "120d"));
 
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--supports", "requirements.txt#libfoo"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let arr = rows.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["id"], "with-support");
+    let claims = run_list(&repo, &["--supports", "requirements.txt#libfoo"]);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["id"], "with-support");
 }
 
 #[test]
@@ -176,18 +161,9 @@ fn text_term_searches_id_and_statement() {
     repo.write_claim("unrelated", &claim_file("unrelated", "120d"));
 
     // Match on statement text.
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "CJK"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let arr = rows.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["id"], "libfoo-pin");
+    let claims = run_list(&repo, &["CJK"]);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["id"], "libfoo-pin");
 }
 
 #[test]
@@ -222,89 +198,33 @@ fn unverified_surfaces_a_never_verified_and_an_unwitnessed_claim() {
     repo.write_claim("solid", &claim_file("solid", "120d"));
     repo.write_verdict("solid", "2026-07-10T00:00:00Z", "held");
 
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--unverified"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let ids: Vec<&str> = rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["id"].as_str().unwrap())
-        .collect();
+    let got = ids(&run_list(&repo, &["--unverified"]));
+    assert!(got.contains(&"never".to_owned()), "never-verified is debt");
+    assert!(got.contains(&"debt".to_owned()), "unwitnessed hold is debt");
     assert!(
-        ids.contains(&"never"),
-        "a never-verified claim is unverified debt"
+        !got.contains(&"solid".to_owned()),
+        "a witnessed hold is not debt"
     );
-    assert!(
-        ids.contains(&"debt"),
-        "an unwitnessed hold is unverified debt"
-    );
-    assert!(!ids.contains(&"solid"), "a witnessed hold is not debt");
 }
 
 #[test]
 fn filters_combine_with_and() {
     let repo = seeded_store();
-    // `--status stale --path .claims/old` → only `old` (stale AND under that path).
-    let output = repo
-        .claim_at(NOW)
-        .args([
-            "--json",
-            "list",
-            "--status",
-            "stale",
-            "--path",
-            ".claims/old.md",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let arr = rows.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["id"], "old");
+    // `--status stale --path old` → only `old` (stale AND under that path).
+    let claims = run_list(&repo, &["--status", "stale", "--path", "old.md"]);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["id"], "old");
 
     // A contradictory combination (drifted AND that path) → nothing.
-    let output = repo
-        .claim_at(NOW)
-        .args([
-            "--json",
-            "list",
-            "--status",
-            "drifted",
-            "--path",
-            ".claims/old.md",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(rows.as_array().unwrap().len(), 0);
+    let claims = run_list(&repo, &["--status", "drifted", "--path", "old.md"]);
+    assert_eq!(claims.len(), 0);
 }
 
 #[test]
 fn json_row_shape_is_stable() {
     let repo = seeded_store();
-    let output = repo
-        .claim_at(NOW)
-        .args(["--json", "list", "--status", "verified"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let row = &rows.as_array().unwrap()[0];
+    let claims = run_list(&repo, &["--status", "verified"]);
+    let row = &claims[0];
     assert_eq!(row["id"], "fresh");
     assert_eq!(row["status"], "verified");
     assert!(row["file"].as_str().unwrap().ends_with("fresh.md"));
@@ -327,4 +247,37 @@ fn human_output_is_an_aligned_table() {
         .stdout(predicate::str::contains("verified"))
         .stdout(predicate::str::contains("drifted"))
         .stdout(predicate::str::contains("stale"));
+}
+
+#[test]
+fn a_malformed_claim_file_does_not_hide_the_good_ones() {
+    // M1: one bad file must not brick the whole listing. The good claims still
+    // list, the bad one is reported, and the command exits 2 (loud AND useful).
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("good", &claim_file("good", "120d"));
+    repo.write_verdict("good", "2026-07-10T00:00:00Z", "held");
+    // A file that does not parse (no frontmatter).
+    repo.write_claim("bad", "this is not a claim, it has no frontmatter\n");
+
+    let output = repo
+        .claim_at(NOW)
+        .args(["--json", "list"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["exit"], 2, "the envelope's exit matches the process code");
+    // The good claim still listed.
+    let got = ids(v["claims"].as_array().unwrap());
+    assert!(
+        got.contains(&"good".to_owned()),
+        "the good claim still lists"
+    );
+    // The bad file is reported, naming it.
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0]["file"].as_str().unwrap().ends_with("bad.md"));
 }

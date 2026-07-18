@@ -299,6 +299,41 @@ fn rejects_duplicate_id() {
 }
 
 #[test]
+fn rejects_an_id_already_declared_in_a_differently_named_file() {
+    // C1: the canonical-path check misses a claim declaring the same id from a
+    // differently named file. `add` must scan every claim's id, not just the path,
+    // because two files sharing an id share one verdict log.
+    let repo = ready_repo();
+    // A file named `alias.md` that declares id `dup` (its canonical path would be
+    // `dup.md`, so the path check would not catch it).
+    repo.write_claim(
+        "alias",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nExisting claim under an alias filename.\n",
+    );
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "dup",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("already declared in"))
+        .stderr(predicate::str::contains("alias.md"));
+    // The canonical file was never written.
+    assert!(!repo.exists(".claims/dup.md"));
+}
+
+#[test]
 fn rejects_a_green_run_that_is_drifted() {
     // The fact is already false: the grep is for a pin that is not present.
     let repo = ready_repo();

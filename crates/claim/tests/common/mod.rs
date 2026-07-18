@@ -207,6 +207,27 @@ impl TestRepo {
         std::fs::write(dir.join(name), serde_json::to_vec_pretty(&entry).unwrap()).unwrap();
     }
 
+    /// Append a retirement adjudication to a claim's log at a chosen timestamp, so
+    /// a test can build a `Status::Retired` claim without the (unbuilt) `retire`
+    /// verb.
+    pub fn write_retirement(&self, id: &str, at: &str, note: &str) {
+        let dir = self.path().join(".claims/log").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = serde_json::json!({
+            "at": at,
+            "commit": "0".repeat(40),
+            "actor": "Test User <test@example.com>",
+            "event": { "type": "adjudication", "action": { "action": "retire", "note": note } },
+        });
+        let stamp = at.replace(':', "-");
+        let n = self.log_count(id);
+        std::fs::write(
+            dir.join(format!("{stamp}-{n:04}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// A `claim` command with `now` pinned via the `CLAIM_NOW` env seam, so the
     /// due/stale arithmetic is measured against a fixed instant rather than the
     /// racing wall clock. `at` is an RFC 3339 timestamp.

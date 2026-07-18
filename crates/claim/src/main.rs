@@ -15,9 +15,13 @@
 //!
 //! - **`claim check`** — `0` when every check held and every support resolved;
 //!   `1` when at least one check drifted or was unverifiable, or a support did not
-//!   resolve; `2` when a check was broken (or a tool error occurred). Highest code
-//!   wins over a mixed store.
-//! - **`claim drift`** — `0` when no claim has drifted, `1` when any has.
+//!   resolve; `2` when a check was broken, a claim file could not be loaded, or a
+//!   tool error occurred. Highest code wins over a mixed store.
+//! - **`claim drift`** — `0` when no claim has drifted, `1` when any has, `2` when
+//!   a claim file could not be loaded.
+//! - **`claim list`** — `0` normally, `2` when a claim file could not be loaded
+//!   (the well-formed claims are still listed — a broken file nags, it does not
+//!   silence the store).
 //!
 //! Every other verb is binary: `0` on success, `2` on error. A command signals a
 //! non-error exit code by returning it from [`dispatch`]; an `Err` is always
@@ -71,7 +75,7 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
         Command::Init(args) => commands::init::run(args, format).map(|()| 0),
         Command::Add(args) => commands::add::run(args, format).map(|()| 0),
         Command::Check(args) => commands::check::run(args, format),
-        Command::List(args) => commands::list::run(args, format).map(|()| 0),
+        Command::List(args) => commands::list::run(args, format),
         Command::Log(args) => commands::log::run(args, format).map(|()| 0),
         Command::Drift(args) => commands::drift::run(args, format),
         Command::Amend | Command::Retire | Command::Stats => {

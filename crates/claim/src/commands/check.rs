@@ -31,16 +31,17 @@
 
 use anyhow::{Context, Result};
 use claim_core::{
-    append_entry, read_entries, resolve_supports, run_check, CheckContext, CheckOutcome, ClaimId,
-    Event, LogEntry, SupportResolution, Timestamp, Trigger, Verdict,
+    append_entry, compute_status, read_entries, resolve_supports, run_check, CheckContext,
+    CheckOutcome, ClaimId, Event, Grace, LogEntry, ProcessEnd, Status, SupportResolution,
+    Timestamp, Verdict,
 };
 use serde::Serialize;
 
 use crate::cli::CheckArgs;
 use crate::git;
-use crate::output::{emit, verdict_label, Format};
+use crate::output::{emit, trigger_label, verdict_label, Format};
 use crate::scheduling::is_due;
-use crate::store::{discover, LoadedClaim, Store};
+use crate::store::{discover, LoadError, LoadedClaim, Store};
 
 /// The exit code when every check held and every support resolved.
 const EXIT_OK: i32 = 0;
@@ -64,8 +65,8 @@ const EXIT_BROKEN: i32 = 2;
 pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
-    let claims = store.load_all()?;
-    let known_ids: Vec<ClaimId> = claims.iter().map(|c| c.claim.id.clone()).collect();
+    let load = store.load_all()?;
+    let known_ids: Vec<ClaimId> = load.claims.iter().map(|c| c.claim.id.clone()).collect();
 
     // One clock for the whole run: every due decision and every appended verdict
     // shares this instant, so a slow store cannot have its later claims judged
@@ -75,23 +76,36 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
     // Select up front so provenance is resolved only when something will actually
     // be written: a persisting run with nothing selected (an empty store, or
     // `--due` with nothing due) must not fail for a missing git identity it will
-    // never use.
-    let selected: Vec<&LoadedClaim> = claims
-        .iter()
-        .filter(|loaded| {
-            if args.all {
-                return true;
+    // never use. A retired claim is excluded from both `--all` and `--due`: a human
+    // closed it deliberately, so re-checking would resurface it (and a
+    // retired-because-failing check would break CI on a schedule) — its status is
+    // terminal.
+    let mut selected: Vec<&LoadedClaim> = Vec::new();
+    let mut load_notes: Vec<String> = Vec::new();
+    for loaded in &load.claims {
+        // Read once for both the retirement check and the due decision.
+        let history = match read_entries(&store.log_dir(), &loaded.claim.id) {
+            Ok(history) => history,
+            Err(e) => {
+                // A log we cannot read must nag, never silently drop or skip the
+                // claim: include it (so its checks still run) and record the fault
+                // for the report.
+                load_notes.push(format!(
+                    "{}: could not read the verdict log ({e}); checking anyway",
+                    loaded.path
+                ));
+                selected.push(loaded);
+                continue;
             }
-            // A read failure here is a real fault, but the loop cannot return an
-            // error; defer it by re-reading inside `check_one`. In practice
-            // `load_all` already proved the store readable, so a per-claim log read
-            // failing is an I/O race, surfaced when the claim is checked.
-            match read_entries(&store.log_dir(), &loaded.claim.id) {
-                Ok(history) => is_due(&loaded.claim, &history, now),
-                Err(_) => true,
-            }
-        })
-        .collect();
+        };
+        let status = compute_status(loaded.claim.max_age, &history, now, Grace::DEFAULT).status;
+        if status == Status::Retired {
+            continue;
+        }
+        if args.all || is_due(&loaded.claim, &history, now) {
+            selected.push(loaded);
+        }
+    }
 
     // Provenance is resolved once, up front, and only for a persisting run that has
     // work to do. `Some` means "persist with this commit/actor"; `None` means
@@ -118,8 +132,12 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
         results.push(check_one(&run, loaded)?);
     }
 
-    let exit = overall_exit(&results);
-    report(format, &results, args, exit);
+    // A load error (a malformed sibling, a duplicate id) or a log-read fault is a
+    // review-worthy fault that must not be masked by otherwise-clean checks: it
+    // floors the exit at 2 and is reported alongside the results.
+    let has_faults = !load.errors.is_empty() || !load_notes.is_empty();
+    let exit = overall_exit(&results).max(if has_faults { EXIT_BROKEN } else { EXIT_OK });
+    report(format, &results, &load.errors, &load_notes, args, exit, now);
     Ok(exit)
 }
 
@@ -150,8 +168,14 @@ struct Provenance {
 struct CheckResult {
     /// The verdict the check reported.
     verdict: Verdict,
+    /// The structured process end (item 3's [`ProcessEnd`]): `exited` with a code,
+    /// `timed-out`, `signalled`, `spawn-failed`, `not-executed`. An agent branches
+    /// on this tagged structure rather than parsing the English `detail` string —
+    /// e.g. "every timeout" is `end.kind == "timed-out"`, not a substring hunt.
+    end: ProcessEnd,
     /// The human one-liner describing how the process ended (`exit 0`, `exit 127`,
-    /// `timed out after 60s`), so a broken verdict says why it broke.
+    /// `timed out after 60s`), so a broken verdict reads plainly. Derived from
+    /// `end`; the structured form is authoritative.
     detail: String,
     /// The evidence the check recorded, if any.
     evidence: Option<String>,
@@ -214,6 +238,7 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> Result<ClaimResult> {
         checks.push(CheckResult {
             verdict: outcome.verdict,
             detail: outcome.status(),
+            end: outcome.end.clone(),
             evidence: outcome.evidence.clone(),
             when: trigger_label(check.when),
         });
@@ -298,28 +323,37 @@ fn overall_exit(results: &[ClaimResult]) -> i32 {
     results.iter().map(|r| r.exit).max().unwrap_or(EXIT_OK)
 }
 
-/// A short label for a trigger, for the report.
-fn trigger_label(when: Trigger) -> String {
-    match when {
-        Trigger::OnChange => "on-change".to_owned(),
-        Trigger::Every { days } => format!("every {days}d"),
-    }
-}
-
 /// Emit the check report: a JSON object in `--json` mode, an aligned human summary
-/// otherwise.
-fn report(format: Format, results: &[ClaimResult], args: &CheckArgs, exit: i32) {
+/// otherwise. `load_errors` are per-file load faults (malformed sibling, duplicate
+/// id); `load_notes` are per-claim log-read faults — both floor the exit at 2 and
+/// are surfaced so a broken file nags without denying the store's whole report.
+#[allow(clippy::too_many_arguments)]
+fn report(
+    format: Format,
+    results: &[ClaimResult],
+    load_errors: &[LoadError],
+    load_notes: &[String],
+    args: &CheckArgs,
+    exit: i32,
+    now: Timestamp,
+) {
     let selection = if args.all { "all" } else { "due" };
     let report = CheckReport {
         status: "ok",
         selection,
         report_only: args.report_only,
+        now: now.to_string(),
         exit,
         checked: results.len(),
         claims: results,
+        errors: load_errors,
+        notes: load_notes,
     };
 
-    emit(format, &report, || human(results, args, exit)).unwrap_or_else(|e| {
+    emit(format, &report, || {
+        human(results, load_errors, load_notes, args, exit);
+    })
+    .unwrap_or_else(|e| {
         // A failure to *write output* is a real fault, but the checks already ran
         // and (if persisting) were recorded; surface it on stderr rather than
         // discarding the exit code the caller scripts on.
@@ -337,6 +371,9 @@ struct CheckReport<'a> {
     selection: &'static str,
     /// Whether this run persisted nothing (`--report-only`).
     report_only: bool,
+    /// The instant the run measured due/staleness against, RFC 3339, so a consumer
+    /// can reproduce the selection.
+    now: String,
     /// The overall exit code (0/1/2), duplicated in the process exit so a consumer
     /// that captured stdout need not also inspect `$?`.
     exit: i32,
@@ -344,11 +381,25 @@ struct CheckReport<'a> {
     checked: usize,
     /// The per-claim results.
     claims: &'a [ClaimResult],
+    /// Per-file load errors (a malformed claim file, a duplicate id): reported, not
+    /// fatal, so the good claims above still ran. A non-empty list floors `exit` at
+    /// 2.
+    errors: &'a [LoadError],
+    /// Per-claim non-fatal notes (a verdict log that could not be read); the claim
+    /// was checked anyway. A non-empty list floors `exit` at 2.
+    notes: &'a [String],
 }
 
-/// Print the human summary: one block per claim, then a one-line tally.
-fn human(results: &[ClaimResult], args: &CheckArgs, exit: i32) {
-    if results.is_empty() {
+/// Print the human summary: one block per claim, the load faults, then a one-line
+/// tally.
+fn human(
+    results: &[ClaimResult],
+    load_errors: &[LoadError],
+    load_notes: &[String],
+    args: &CheckArgs,
+    exit: i32,
+) {
+    if results.is_empty() && load_errors.is_empty() && load_notes.is_empty() {
         let scope = if args.all { "" } else { " due" };
         println!("No{scope} claims to check.");
         return;
@@ -383,6 +434,13 @@ fn human(results: &[ClaimResult], args: &CheckArgs, exit: i32) {
         }
     }
 
+    for err in load_errors {
+        println!("error: {}: {}", err.file, err.message);
+    }
+    for note in load_notes {
+        println!("error: {note}");
+    }
+
     println!();
     println!(
         "Checked {} claim(s). Exit {}: {}.",
@@ -408,7 +466,7 @@ fn exit_meaning(exit: i32) -> &'static str {
     match exit {
         EXIT_OK => "all held, all supports resolved",
         EXIT_REVIEW => "review needed (drift, unverifiable, or unresolved support)",
-        _ => "broken check",
+        _ => "a broken check or an unloadable claim file",
     }
 }
 
@@ -419,6 +477,7 @@ mod tests {
     fn held() -> CheckResult {
         CheckResult {
             verdict: Verdict::Held,
+            end: ProcessEnd::Exited { code: 0 },
             detail: "exit 0".to_owned(),
             evidence: None,
             when: "on-change".to_owned(),
@@ -428,6 +487,7 @@ mod tests {
     fn with(verdict: Verdict) -> CheckResult {
         CheckResult {
             verdict,
+            end: ProcessEnd::Exited { code: 0 },
             detail: "x".to_owned(),
             evidence: None,
             when: "on-change".to_owned(),

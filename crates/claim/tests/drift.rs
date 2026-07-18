@@ -91,3 +91,55 @@ fn drift_on_an_empty_store_exits_zero() {
     repo.claim().arg("init").assert().success();
     repo.claim_at(NOW).args(["drift"]).assert().code(0);
 }
+
+#[test]
+fn drift_json_envelope_carries_now_and_exit() {
+    // m5: the drift envelope includes `now` and `exit`, matching `check`.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("gone", &claim_file("gone", ""));
+    repo.write_verdict("gone", "2026-07-15T00:00:00Z", "drifted");
+
+    let output = repo
+        .claim_at(NOW)
+        .args(["--json", "drift"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(
+        v["now"].is_string(),
+        "the envelope records the computed-at instant"
+    );
+    assert_eq!(v["exit"], 1);
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn drift_reports_a_load_error_and_exits_two() {
+    // M1: a malformed file floors drift's exit at 2 while the good claims triage.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("gone", &claim_file("gone", ""));
+    repo.write_verdict("gone", "2026-07-15T00:00:00Z", "drifted");
+    repo.write_claim("bad", "not a claim\n");
+
+    let output = repo
+        .claim_at(NOW)
+        .args(["--json", "drift"])
+        .assert()
+        .code(2) // a load error is the loudest condition, above drift's 1
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    // The good drifted claim still triaged.
+    assert_eq!(v["drifted_count"], 1);
+    assert_eq!(v["drifted"][0]["id"], "gone");
+    // The bad file reported.
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0]["file"].as_str().unwrap().ends_with("bad.md"));
+}

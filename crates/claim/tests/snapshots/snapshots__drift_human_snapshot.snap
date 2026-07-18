@@ -1,0 +1,10 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"drift\"], 1)"
+---
+1 drifted claim(s) — each fact below is no longer true:
+
+gone  (.claims/gone.md)
+  Statement for gone.
+  supports:
+    - requirements.txt#libfoo

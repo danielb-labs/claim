@@ -175,6 +175,14 @@ pub struct AddArgs {
     pub unwitnessed: bool,
 }
 
+/// The scriptable exit-code contract for `claim check`, shown under
+/// `--help`/`--long-help` so a CI author sees it without reading the source.
+const CHECK_EXIT_HELP: &str = "\
+EXIT CODES (highest applicable wins, 2 > 1 > 0):
+  0  every check held and every support resolved
+  1  a drifted or unverifiable verdict, or an unresolved support (review needed)
+  2  a broken check, an unloadable/duplicate-id claim file, or a tool error";
+
 /// Arguments to `claim check`: the verify loop.
 ///
 /// Selection is `--due` (default) or `--all`; they are mutually exclusive. By
@@ -182,12 +190,13 @@ pub struct AddArgs {
 /// suppresses every write (the fork-PR / CI-advisory mode) while still reporting
 /// and still setting the exit code.
 #[derive(Debug, clap::Args)]
+#[command(after_long_help = CHECK_EXIT_HELP)]
 pub struct CheckArgs {
     /// Run every claim's checks, ignoring whether they are currently due.
     ///
     /// Mutually exclusive with `--due`. When neither is given, `--due` is the
     /// default: only claims whose cadence has elapsed (or that have never run) are
-    /// checked.
+    /// checked. Retired claims are never checked under either flag.
     #[arg(long, conflicts_with = "due")]
     pub all: bool,
 
@@ -205,6 +214,11 @@ pub struct CheckArgs {
     /// verdicts in its output only; trusted runs persist). The exit code is still
     /// set from the verdicts, so CI can gate on it — only the persistence is
     /// suppressed. Because nothing is written, no git identity or commit is needed.
+    ///
+    /// Note: writing nothing means this run does not advance a claim's due clock —
+    /// an `every Nd` claim stays due until a *persisting* run records a verdict. A
+    /// nightly report-only job therefore leaves everything perpetually due; pair it
+    /// with a trusted persisting run to reset the cadence.
     #[arg(long)]
     pub report_only: bool,
 }
@@ -230,9 +244,10 @@ pub struct ListArgs {
     #[arg(long, value_name = "TARGET")]
     pub supports: Option<String>,
 
-    /// Keep only claims that are overdue (computed status `stale` or `drifted` —
-    /// anything past its window and wanting attention). A shortcut for the common
-    /// "what needs looking at" query.
+    /// Keep only claims whose computed status is `stale` (overdue: never verified,
+    /// or past `max-age`). Equivalent to `--status stale`; a shortcut for the
+    /// common "what has gone unverified" query. Drift is a distinct status — use
+    /// `claim drift` or `--status drifted` for that.
     #[arg(long)]
     pub stale: bool,
 
@@ -254,6 +269,14 @@ pub struct LogArgs {
     pub id: String,
 }
 
+/// The scriptable exit-code contract for `claim drift`, shown under `--help`.
+const DRIFT_EXIT_HELP: &str = "\
+EXIT CODES:
+  0  no claim has drifted
+  1  at least one claim has drifted (the review queue is non-empty)
+  2  a tool error (unloadable store or claim file)";
+
 /// Arguments to `claim drift`: the review queue of drifted claims.
 #[derive(Debug, clap::Args)]
+#[command(after_long_help = DRIFT_EXIT_HELP)]
 pub struct DriftArgs {}

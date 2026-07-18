@@ -104,10 +104,6 @@ mod tests {
     /// A claim with the given trigger on a single cmd check. The rest of the fields
     /// are inert for scheduling — only `checks[*].when` and the history matter.
     fn claim_with(trigger: Trigger) -> Claim {
-        parse(trigger)
-    }
-
-    fn parse(trigger: Trigger) -> Claim {
         let when = match trigger {
             Trigger::OnChange => "on-change".to_owned(),
             Trigger::Every { days } => format!("every {days}d"),

@@ -15,7 +15,7 @@
 use std::io::Write;
 
 use anyhow::Result;
-use claim_core::{Status, Verdict};
+use claim_core::{Status, Trigger, Verdict};
 use serde::Serialize;
 
 /// Which form a command should print in.
@@ -120,5 +120,16 @@ pub fn status_label(s: Status) -> &'static str {
         Status::Drifted => "drifted",
         Status::Stale => "stale",
         Status::Retired => "retired",
+    }
+}
+
+/// The canonical string form of a trigger — `on-change` or `every <N>d` — shared
+/// so `check` and `log` render a claim's cadence identically. Round-trips the
+/// `when:` value a claim file declares.
+#[must_use]
+pub fn trigger_label(when: Trigger) -> String {
+    match when {
+        Trigger::OnChange => "on-change".to_owned(),
+        Trigger::Every { days } => format!("every {days}d"),
     }
 }

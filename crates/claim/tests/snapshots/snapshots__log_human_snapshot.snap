@@ -1,0 +1,17 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"log\", \"gone\"], 0)"
+---
+gone  (.claims/gone.md)
+
+Statement for gone.
+
+max-age: 120d
+checks:
+  - cmd [on-change]  true
+supports:
+  - requirements.txt#libfoo
+
+History (2 entries, oldest first):
+  2026-07-10T00:00:00Z  held          0000000  Test User <test@example.com>
+  2026-07-15T00:00:00Z  drifted       0000000  Test User <test@example.com>

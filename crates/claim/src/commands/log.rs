@@ -7,13 +7,13 @@
 //! re-derives history semantics that core already owns.
 
 use anyhow::{Context, Result};
-use claim_core::{read_entries, Adjudication, Check, CheckKind, Claim, Event, LogEntry, Trigger};
+use claim_core::{read_entries, Adjudication, Check, CheckKind, Claim, Event, LogEntry};
 use serde::Serialize;
 
 use crate::apperror::{app, ErrorKind};
 use crate::cli::LogArgs;
 use crate::git::short_commit;
-use crate::output::{emit, verdict_label, Format};
+use crate::output::{emit, trigger_label, verdict_label, Format};
 use crate::store::discover;
 
 /// Run `claim log`.
@@ -23,30 +23,55 @@ use crate::store::discover;
 /// Fails when no store is found, the id does not exist in the store, or a claim
 /// file or verdict log cannot be read. An unknown id is a clear
 /// [`ErrorKind::InvalidInput`] naming the id, not a silent empty history — a typo
-/// must not read as "a claim with no verdicts".
+/// must not read as "a claim with no verdicts". A malformed *other* claim file does
+/// not block `log <good-id>`: per-file load errors are tolerated (the good claims
+/// still load), but if the requested id's *own* file is the one that failed to
+/// parse, that file's error is surfaced so the id resolves to a clear "could not
+/// load" rather than "not found".
 pub fn run(args: &LogArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
-    let claims = store.load_all()?;
+    let load = store.load_all()?;
 
-    let loaded = claims
-        .iter()
-        .find(|c| c.claim.id.as_str() == args.id)
-        .ok_or_else(|| {
-            app(
+    let Some(loaded) = load.claims.iter().find(|c| c.claim.id.as_str() == args.id) else {
+        // Distinguish "the file this id lives in failed to parse" from "no such
+        // id": a claim file named after the id, or reporting the id, that could not
+        // load should say *why*, not that the claim does not exist.
+        if let Some(err) = load
+            .errors
+            .iter()
+            .find(|e| file_stem_matches_id(&e.file, &args.id))
+        {
+            return Err(app(
                 ErrorKind::InvalidInput,
-                format!(
-                    "no claim with id '{}' in this store; run `claim list` to see the ids that \
-                     exist",
-                    args.id
-                ),
-            )
-        })?;
+                format!("claim '{}' could not be loaded: {}", args.id, err.message),
+            ));
+        }
+        return Err(app(
+            ErrorKind::InvalidInput,
+            format!(
+                "no claim with id '{}' in this store; run `claim list` to see the ids that exist",
+                args.id
+            ),
+        ));
+    };
 
     let history = read_entries(&store.log_dir(), &loaded.claim.id)?;
     let report = History::new(&loaded.claim, &loaded.path, &history);
 
     emit(format, &report, || human(&report))
+}
+
+/// Whether a load-errored file's path could be the file for `id`: its `.md` stem,
+/// relative to `.claims/`, equals the id. A best-effort match so an unparseable
+/// file named after the requested id reports *that* file's error, not a bare "not
+/// found". A claim whose id differs from its filename that fails to parse still
+/// falls through to "not found", which is honest — the tool cannot know the id of a
+/// file it could not parse.
+fn file_stem_matches_id(file: &str, id: &str) -> bool {
+    file.strip_prefix(".claims/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|stem| stem == id)
 }
 
 /// The machine form of `claim log`: the definition and the ordered history.
@@ -169,14 +194,6 @@ impl From<&LogEntry> for Entry {
             commit: entry.commit.clone(),
             evidence,
         }
-    }
-}
-
-/// A short label for a trigger.
-fn trigger_label(when: Trigger) -> String {
-    match when {
-        Trigger::OnChange => "on-change".to_owned(),
-        Trigger::Every { days } => format!("every {days}d"),
     }
 }
 

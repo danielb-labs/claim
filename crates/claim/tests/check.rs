@@ -248,22 +248,165 @@ fn check_json_shape_is_stable() {
     assert_eq!(v["status"], "ok");
     assert_eq!(v["selection"], "all");
     assert_eq!(v["report_only"], false);
+    assert!(
+        v["now"].is_string(),
+        "the envelope records the computed-at instant"
+    );
     assert_eq!(v["exit"], 0);
     assert_eq!(v["checked"], 1);
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0);
     let claims = v["claims"].as_array().unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0]["id"], "pin");
     assert_eq!(claims[0]["persisted"], true);
     assert_eq!(claims[0]["checks"][0]["verdict"], "held");
+    // m9: the structured ProcessEnd is present alongside the human `detail`, so an
+    // agent branches on structure, not prose.
+    assert_eq!(claims[0]["checks"][0]["end"]["kind"], "exited");
+    assert_eq!(claims[0]["checks"][0]["end"]["code"], 0);
+    assert_eq!(claims[0]["checks"][0]["detail"], "exit 0");
     assert_eq!(claims[0]["exit"], 0);
 }
 
 #[test]
-fn check_with_no_claims_exits_zero() {
+fn report_only_json_marks_the_run_and_each_claim() {
+    // m6: assert the report_only:true case (only the false case was covered).
+    let repo = ready_repo();
+    repo.write_claim("pin", &pin_claim("pin", "on-change"));
+
+    let output = repo
+        .claim()
+        .args(["--json", "check", "--all", "--report-only"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["report_only"], true);
+    assert_eq!(v["claims"][0]["persisted"], false);
+}
+
+#[test]
+fn a_broken_check_json_carries_the_structured_end() {
+    // m9: a broken check's structured `end` lets an agent see 'not found' (exit
+    // 127) without parsing English. A missing binary spawns then exits 127.
+    let repo = ready_repo();
+    repo.write_claim(
+        "broken",
+        "---\nid: broken\nchecks:\n  - kind: cmd\n    run: \"this-binary-does-not-exist-xyz\"\n    when: on-change\nmax-age: 120d\n---\nBroken.\n",
+    );
+    let output = repo
+        .claim()
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["claims"][0]["checks"][0]["verdict"], "broken");
+    // The shell ran the command and it exited non-0/1; the structured end is an
+    // `exited` with a non-zero code (127 for not-found on a typical shell).
+    assert_eq!(v["claims"][0]["checks"][0]["end"]["kind"], "exited");
+}
+
+#[test]
+fn check_with_no_claims_reports_the_full_phrase() {
     let repo = ready_repo();
     repo.claim()
         .args(["check", "--all"])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("No"));
+        .stdout(predicate::str::contains("No claims to check."));
+}
+
+#[test]
+fn check_skips_a_retired_claim_under_all_and_due() {
+    // M3: a retired claim is terminal — checking it would resurface it (and a
+    // retired-because-failing check would break CI). It must be skipped and no new
+    // verdict written, under both --all and --due.
+    let repo = ready_repo();
+    repo.write_claim("done", &pin_claim("done", "on-change"));
+    repo.write_verdict("done", "2026-07-10T00:00:00Z", "held");
+    repo.write_retirement(
+        "done",
+        "2026-07-11T00:00:00Z",
+        "closed: replaced by a real test",
+    );
+    let before = repo.log_count("done");
+
+    repo.claim_at("2026-07-17T00:00:00Z")
+        .args(["check", "--all"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("No claims to check."));
+    assert_eq!(
+        repo.log_count("done"),
+        before,
+        "a retired claim gets no new verdict"
+    );
+}
+
+#[test]
+fn a_duplicate_id_across_two_files_is_a_loud_error_naming_both() {
+    // C1: two files sharing an id share one verdict log, so a drifted fact could
+    // read as verified. `check` must error loudly, naming both files, and not run
+    // the ambiguous claim.
+    let repo = ready_repo();
+    repo.write_claim("dup-a", &pin_claim("shared", "on-change"));
+    repo.write_claim("dup-b", &pin_claim("shared", "on-change"));
+
+    let output = repo
+        .claim()
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let errors = v["errors"].as_array().unwrap();
+    // Both files reported, each naming the other.
+    assert_eq!(errors.len(), 2, "both duplicate files are reported");
+    let files: Vec<&str> = errors.iter().map(|e| e["file"].as_str().unwrap()).collect();
+    assert!(files.iter().any(|f| f.ends_with("dup-a.md")));
+    assert!(files.iter().any(|f| f.ends_with("dup-b.md")));
+    for e in errors {
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate claim id 'shared'"),
+            "the message names the shared id"
+        );
+    }
+    // The ambiguous claim did not run: no verdict was appended under the shared id.
+    assert_eq!(repo.log_count("shared"), 0);
+}
+
+#[test]
+fn a_malformed_sibling_does_not_stop_checking_the_good_claims() {
+    // M1: one bad file must not brick the run. The good claim still checks and
+    // persists; the bad one is reported; the exit is floored at 2.
+    let repo = ready_repo();
+    repo.write_claim("good", &pin_claim("good", "on-change"));
+    repo.write_claim("bad", "no frontmatter here, not a claim\n");
+
+    let output = repo
+        .claim()
+        .args(["--json", "check", "--all"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    // The good claim ran and was recorded.
+    assert_eq!(v["claims"][0]["id"], "good");
+    assert_eq!(repo.log_count("good"), 1, "the good claim still persisted");
+    // The bad file is reported.
+    let errors = v["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0]["file"].as_str().unwrap().ends_with("bad.md"));
 }

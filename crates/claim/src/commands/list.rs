@@ -19,24 +19,36 @@ use serde::Serialize;
 
 use crate::cli::ListArgs;
 use crate::output::{emit, status_label, Format};
-use crate::store::{discover, LoadedClaim};
+use crate::store::{discover, LoadError, LoadedClaim};
 
 /// Run `claim list`.
 ///
+/// A malformed or duplicate-id claim file is *reported* (in the envelope's `errors`
+/// array, or an error line in the human output) rather than aborting the listing —
+/// the well-formed claims still show. Their presence then makes the command exit 2:
+/// the good claims are emitted first, then an `Err` is returned so `main` reports
+/// the fault and exits non-zero. Loud and useful, never a store silenced by one bad
+/// file.
+///
+/// Returns the process exit code: `0` when every file loaded, `2` when any claim
+/// file could not be loaded (the good claims are still listed — loud and useful,
+/// never a store silenced by one bad file).
+///
 /// # Errors
 ///
-/// Fails when no store is found, a claim file cannot be parsed, or a verdict log
-/// cannot be read.
-pub fn run(args: &ListArgs, format: Format) -> Result<()> {
+/// Fails only when no store is found or a verdict log cannot be read. A per-file
+/// load error is not an `Err` — it is reported in the output and reflected in the
+/// returned exit code.
+pub fn run(args: &ListArgs, format: Format) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
-    let claims = store.load_all()?;
+    let load = store.load_all()?;
 
     let now = crate::clock::now()?;
     let status_filter = parse_status_filter(args.status.as_deref())?;
 
     let mut rows = Vec::new();
-    for loaded in &claims {
+    for loaded in &load.claims {
         // One read of the log per claim: the status computation and the
         // `--unverified` filter both derive from the same history.
         let history = read_entries(&store.log_dir(), &loaded.claim.id)?;
@@ -46,7 +58,16 @@ pub fn run(args: &ListArgs, format: Format) -> Result<()> {
         }
     }
 
-    emit(format, &rows, || human(&rows))
+    let exit = if load.errors.is_empty() { 0 } else { 2 };
+    let inventory = Inventory {
+        status: "ok",
+        now: now.to_string(),
+        exit,
+        claims: &rows,
+        errors: &load.errors,
+    };
+    emit(format, &inventory, || human(&rows, &load.errors))?;
+    Ok(exit)
 }
 
 /// Whether a claim passes every active filter (AND semantics).
@@ -67,10 +88,10 @@ fn keep(
         }
     }
 
-    // `--stale` is the "needs attention" shortcut: anything past its window and
-    // wanting a look. `report.due` is true for both Stale and Drifted, which is
-    // exactly the overdue set, and false for Verified and Retired.
-    if args.stale && !report.due {
+    // `--stale` means the `Status::Stale` status only, matching its name and
+    // `--status stale`. Drift is a distinct status (surfaced by `claim drift`); a
+    // `--stale` that also matched drifted would give the word two meanings.
+    if args.stale && report.status != Status::Stale {
         return false;
     }
 
@@ -128,30 +149,40 @@ fn is_unverified(history: &[LogEntry]) -> bool {
     history.iter().any(evidence_admits_unwitnessed)
 }
 
-/// Whether an entry's evidence marks it as an unwitnessed establishment.
+/// Whether an entry's evidence is the `unwitnessed:` debt marker.
 ///
-/// `claim add --unwitnessed` records the birth `Held` with an evidence note
-/// beginning `unwitnessed:` (see `commands::add`). Matching that marker surfaces
-/// the acknowledged debt without a new schema field — the debt lives in the log,
-/// where it is committed and auditable, not in the definition file.
+/// `claim add --unwitnessed` records the birth `Held` with an evidence note whose
+/// first line is exactly `unwitnessed: ...` (see `commands::add::unwitnessed_note`).
+/// Matching the `unwitnessed:` *prefix* — not a bare `contains("unwitnessed")` —
+/// avoids flagging any claim whose evidence merely mentions the word (a human note
+/// saying "this was previously unwitnessed", say). The debt lives in the log, where
+/// it is committed and auditable, not in the definition file.
 fn evidence_admits_unwitnessed(entry: &LogEntry) -> bool {
     matches!(
         &entry.event,
         claim_core::Event::Verification {
             evidence: Some(note),
             ..
-        } if note.contains("unwitnessed")
+        } if note.starts_with("unwitnessed:")
     )
 }
 
 /// Whether a claim's file path or any watched path lies under `prefix`.
 ///
+/// The claim file's path is matched *inside* the `.claims/` store, not with the
+/// store prefix: a claim at `.claims/src/a.md` matches `--path src`, because the
+/// user thinks in repo paths (`src/…`), not in the store's internal layout. The
+/// `.claims/` prefix is stripped before matching. A `supports` decision ref, by
+/// contrast, already names a repo-relative path (`requirements.txt#libfoo`) and is
+/// matched as-is.
+///
 /// "Watched paths" are best-effort: v1 does not trace a check's read-set, so the
-/// paths a claim is *about* are approximated by its `supports` targets (a decision
-/// ref names a file) plus the claim file's own location. This catches the common
-/// "claims under src/payments/" query without read-set tracing, which is deferred.
+/// paths a claim is *about* are approximated by its `supports` targets plus the
+/// claim file's own location. This catches the common "claims under src/payments/"
+/// query without read-set tracing, which is deferred.
 fn path_matches(loaded: &LoadedClaim, prefix: &str) -> bool {
-    if under_prefix(&loaded.path, prefix) {
+    let claim_path = loaded.path.strip_prefix(".claims/").unwrap_or(&loaded.path);
+    if under_prefix(claim_path, prefix) {
         return true;
     }
     loaded.claim.supports.iter().any(|s| {
@@ -206,6 +237,25 @@ fn parse_status_filter(raw: Option<&str>) -> Result<Option<Status>> {
     Ok(Some(status))
 }
 
+/// The machine form of `claim list`: a self-describing envelope, so it matches the
+/// shape of `check`/`drift` (an object with `status`/`now`, not a bare array), and
+/// carries the load errors and the instant statuses were computed against.
+#[derive(Debug, Serialize)]
+struct Inventory<'a> {
+    /// Always `"ok"`: the verb ran.
+    status: &'static str,
+    /// The instant statuses were computed against, RFC 3339.
+    now: String,
+    /// The exit code (0 clean, 2 when a claim file could not be loaded), so a
+    /// consumer that captured stdout need not also inspect `$?`. Matches `check`/`drift`.
+    exit: i32,
+    /// The matching claims.
+    claims: &'a [Row],
+    /// Per-file load errors (malformed or duplicate-id files); reported, not fatal.
+    /// A non-empty list makes the command exit 2.
+    errors: &'a [LoadError],
+}
+
 /// One inventory row: the machine form of a listed claim.
 #[derive(Debug, Serialize)]
 struct Row {
@@ -252,42 +302,75 @@ fn whole_days_between(now: Timestamp, at: Timestamp) -> i64 {
     at.duration_since(now).as_secs() / 86_400
 }
 
-/// Print the inventory as an aligned table, or a friendly note when empty.
-fn human(rows: &[Row]) {
+/// The table's fixed column headers, in order.
+const HEADERS: [&str; 5] = ["ID", "STATUS", "LAST-VERIFIED", "STALE-IN", "SUPPORTS"];
+
+/// Print the inventory as an aligned table (and any load errors), or a friendly
+/// note when empty.
+///
+/// Every column's width is `max(header width, widest cell)`, so the header row and
+/// the data rows always line up regardless of the longest id or a header longer
+/// than its data — the earlier hardcoded widths drifted 1–2 chars under
+/// `LAST-VERIFIED`/`STALE-IN`.
+fn human(rows: &[Row], errors: &[LoadError]) {
     if rows.is_empty() {
         println!("No claims match.");
-        return;
+    } else {
+        let cells: Vec<[String; 5]> = rows.iter().map(row_cells).collect();
+        let widths = column_widths(&cells);
+        print_row(&header_cells(), &widths);
+        for cell in &cells {
+            print_row(cell, &widths);
+        }
     }
 
-    let id_w = rows
-        .iter()
-        .map(|r| r.id.len())
-        .chain(std::iter::once("ID".len()))
-        .max()
-        .unwrap_or(2);
-    let status_w = "unverifiable".len();
-
-    println!(
-        "{:<id_w$}  {:<status_w$}  {:<12}  {:>7}  SUPPORTS",
-        "ID",
-        "STATUS",
-        "LAST-VERIFIED",
-        "STALE-IN",
-        id_w = id_w,
-        status_w = status_w,
-    );
-    for row in rows {
-        println!(
-            "{:<id_w$}  {:<status_w$}  {:<12}  {:>7}  {}",
-            row.id,
-            status_label(row.status),
-            last_verified_cell(row),
-            stale_in_cell(row),
-            row.supports,
-            id_w = id_w,
-            status_w = status_w,
-        );
+    for err in errors {
+        println!("error: {}: {}", err.file, err.message);
     }
+}
+
+/// The header cells as owned strings, so they share the printing path with data.
+fn header_cells() -> [String; 5] {
+    HEADERS.map(ToOwned::to_owned)
+}
+
+/// The five display cells for one row, in header order.
+fn row_cells(row: &Row) -> [String; 5] {
+    [
+        row.id.clone(),
+        status_label(row.status).to_owned(),
+        last_verified_cell(row),
+        stale_in_cell(row),
+        row.supports.to_string(),
+    ]
+}
+
+/// The width of each column: the widest of its header and every cell.
+fn column_widths(cells: &[[String; 5]]) -> [usize; 5] {
+    let mut widths = HEADERS.map(str::len);
+    for row in cells {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    widths
+}
+
+/// Print one row left-aligned to `widths`, two spaces between columns. The last
+/// column is not padded (nothing follows it).
+fn print_row(cells: &[String; 5], widths: &[usize; 5]) {
+    let mut line = String::new();
+    for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
+        if i > 0 {
+            line.push_str("  ");
+        }
+        if i == cells.len() - 1 {
+            line.push_str(cell);
+        } else {
+            line.push_str(&format!("{cell:<w$}"));
+        }
+    }
+    println!("{line}");
 }
 
 /// The last-verified cell: a `YYYY-MM-DD` date, or `never`.
@@ -390,5 +473,32 @@ mod tests {
         assert!(is_unverified(&[held(Some(
             "unwitnessed: this claim was added with --unwitnessed"
         ))]));
+    }
+
+    #[test]
+    fn is_unverified_ignores_evidence_that_merely_mentions_the_word() {
+        // A witnessed Held whose evidence just mentions "unwitnessed" in prose is
+        // NOT debt: only the `unwitnessed:` prefix marker counts (m2).
+        assert!(!is_unverified(&[held(Some(
+            "this claim was previously unwitnessed but is now witnessed"
+        ))]));
+    }
+
+    #[test]
+    fn path_matches_strips_the_claims_prefix() {
+        // A claim at `.claims/src/a.md` matches `--path src`, because the user
+        // thinks in repo paths, not the store's internal layout (m1).
+        let claim = claim_core::parse_claim_file(
+            ".claims/src/a.md",
+            "---\nid: a\nchecks:\n  - kind: cmd\n    run: \"true\"\n    when: on-change\nmax-age: 30d\n---\nS.\n",
+        )
+        .unwrap();
+        let loaded = LoadedClaim {
+            claim,
+            path: ".claims/src/a.md".to_owned(),
+        };
+        assert!(path_matches(&loaded, "src"));
+        assert!(path_matches(&loaded, "src/a.md"));
+        assert!(!path_matches(&loaded, "other"));
     }
 }
