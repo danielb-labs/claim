@@ -137,6 +137,11 @@ merged.
 
 The gate is the same locally and in CI so the two can never disagree.
 
+Every PR is opened with `.github/PULL_REQUEST_TEMPLATE.md`, which surfaces these
+obligations as an author checklist — the gate, a diff scoped to one item, tests on
+the negative paths, docs shipping with the behavior they describe, and a one-line
+justification for any new dependency.
+
 ## Testing
 
 Coverage is not a percentage target; it's a set of obligations:
