@@ -8,12 +8,10 @@
 //! - **A global `--json` flag** ([`Cli::json`]). Agents are the heaviest readers
 //!   (PRODUCT.md section 5), so every command owes a stable machine form. The flag
 //!   is parsed once at the top level and threaded to each command.
-//! - **A stub for every unbuilt verb** ([`Command`]). The full v1 verb list is
-//!   declared so `claim --help` shows the real surface from the first item and a
-//!   later item slots its logic into an existing arm rather than adding one. An
-//!   unbuilt verb (`amend`, `retire`, `stats`) exits 2 (usage/other error) with a
-//!   "not implemented" message, never 0 — an unfinished command must not look like
-//!   a success.
+//! - **One args struct per verb** ([`Command`]). The full v1 verb list is declared
+//!   so `claim --help` shows the real surface, and each verb carries its own typed
+//!   arguments; the whole v1 set — `amend`, `retire`, `stats` included — is now
+//!   implemented in [`crate::commands`].
 
 use clap::{Parser, Subcommand};
 
@@ -41,9 +39,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The `claim` verbs. The full v1 set (PRODUCT.md section 5) is declared so the
-/// help text and dispatch are complete from the start; only the verbs a build item
-/// has reached are implemented, the rest are honest stubs.
+/// The `claim` verbs. The full v1 set (PRODUCT.md section 5).
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scaffold a `.claims/` store in the current directory.
@@ -61,30 +57,12 @@ pub enum Command {
     Log(LogArgs),
     /// List drifted claims with what each supports.
     Drift(DriftArgs),
-    /// Resolve drift by fixing a claim's statement and check. (Not yet built.)
-    Amend,
-    /// Resolve drift by closing a claim with a note. (Not yet built.)
-    Retire,
-    /// Pilot metrics: drifts caught, false alarms, minutes per claim. (Not yet built.)
-    Stats,
-}
-
-impl Command {
-    /// The verb's name, for the "not implemented" message of an unbuilt stub.
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        match self {
-            Command::Init(_) => "init",
-            Command::Add(_) => "add",
-            Command::Check(_) => "check",
-            Command::List(_) => "list",
-            Command::Log(_) => "log",
-            Command::Drift(_) => "drift",
-            Command::Amend => "amend",
-            Command::Retire => "retire",
-            Command::Stats => "stats",
-        }
-    }
+    /// Resolve drift by fixing a claim's statement and check, keeping its history.
+    Amend(AmendArgs),
+    /// Close a claim on purpose with a note; its status becomes `retired`.
+    Retire(RetireArgs),
+    /// Pilot metrics: status and verdict counts, drifts caught, staleness.
+    Stats(StatsArgs),
 }
 
 /// Arguments to `claim init`.
@@ -280,3 +258,77 @@ EXIT CODES:
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DRIFT_EXIT_HELP)]
 pub struct DriftArgs {}
+
+/// Arguments to `claim retire <id>`: close a claim on purpose.
+///
+/// Retirement is a deliberate lifecycle decision, not a check result, so the only
+/// inputs are the claim to close and *why*. The note is required: a retirement
+/// with no reason is the silent closure the tool exists to prevent (invariant #6).
+#[derive(Debug, clap::Args)]
+pub struct RetireArgs {
+    /// The id of the claim to retire.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// Why the claim is being closed: the world changed and the decision was
+    /// re-reviewed, or the fact became a real test and this says where. Required.
+    #[arg(long, value_name = "WHY")]
+    pub note: String,
+}
+
+/// Arguments to `claim amend <id>`: fix a claim's statement and/or check in place,
+/// keeping its verdict history.
+///
+/// Every field is an *overlay*: a flag left off keeps the claim's current value, so
+/// `claim amend pin --run '<new cmd>'` changes only the check. The id is not
+/// amendable — changing the id would be a new claim, not an amendment — so there is
+/// deliberately no `--id` flag; passing one is a usage error clap rejects.
+///
+/// At least one field must be supplied and must actually change something, or the
+/// amend is a no-op error. The amended check is then run and must report `Held`
+/// before anything is written: an amend cannot turn a drifted claim green unless the
+/// new fact actually holds now.
+#[derive(Debug, clap::Args)]
+pub struct AmendArgs {
+    /// The id of the claim to amend. Not itself amendable.
+    #[arg(value_name = "ID")]
+    pub id: String,
+
+    /// The new plain-language statement.
+    #[arg(long)]
+    pub statement: Option<String>,
+
+    /// The new `cmd` check command line. Exit 0 means the fact holds, exit 1 means
+    /// it drifted (unless `--negate` inverts).
+    #[arg(long, value_name = "CMD")]
+    pub run: Option<String>,
+
+    /// The new trigger: `on-change` or `every <N>d`.
+    #[arg(long, value_name = "TRIGGER")]
+    pub when: Option<String>,
+
+    /// Invert the amended check's `Held`/`Drifted` sense. Only meaningful together
+    /// with `--run`: negation is a property of the check, so it is set when the
+    /// command is replaced and otherwise left exactly as the existing check declares
+    /// it. Requiring `--run` means an amend that does not touch the check can never
+    /// silently un-negate a negated one. See [`crate::commands::amend`].
+    #[arg(long, requires = "run")]
+    pub negate: bool,
+
+    /// The new freshness window, as `<N>d` (e.g. `120d`).
+    #[arg(long, value_name = "DAYS")]
+    pub max_age: Option<String>,
+
+    /// Replace the `supports` targets with exactly this set. Repeatable; passing it
+    /// with no value is not possible (clap requires a value), so to *clear* supports
+    /// there is no flag — amend never silently drops edges it was not told to.
+    #[arg(long = "supports", value_name = "TARGET")]
+    pub supports: Vec<String>,
+}
+
+/// Arguments to `claim stats`: the pilot instrumentation (PRODUCT.md section 9).
+///
+/// A read-only rollup over the whole store; no selection flags in v1, because the
+/// pilot wants the corpus-wide picture. `--json` (global) is the structured form.
+#[derive(Debug, clap::Args)]
+pub struct StatsArgs {}

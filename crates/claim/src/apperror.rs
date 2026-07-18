@@ -18,9 +18,10 @@ use std::fmt;
 ///
 /// Kept deliberately small: each variant is a failure mode an agent might handle
 /// differently (retry after committing for `DirtyTree`, pick a new id for
-/// `DuplicateId`, fix the check for `NotWitnessed`). The kebab-case rename is the
-/// wire form; adding a variant is backward-compatible because consumers match known
-/// kinds and fall back on the rest.
+/// `DuplicateId`, fix the check for `NotWitnessed`, supply a real change for
+/// `NoChange`). The kebab-case rename is the wire form; adding a variant is
+/// backward-compatible because consumers match known kinds and fall back on the
+/// rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
@@ -45,8 +46,12 @@ pub enum ErrorKind {
     /// A required input was absent with no terminal to prompt for it, or an
     /// interactive witness was needed in a non-interactive run.
     MissingInput,
-    /// A supplied value (id, trigger, max-age) failed validation.
+    /// A supplied value (id, trigger, max-age) failed validation, or an id that must
+    /// name an existing claim (`retire`, `amend`) does not.
     InvalidInput,
+    /// A `claim amend` supplied no field, or fields identical to the claim's current
+    /// values: there is nothing to change, so nothing is written.
+    NoChange,
     /// Any failure without a more specific contract kind (I/O, git, parse).
     Other,
 }
@@ -65,6 +70,7 @@ impl ErrorKind {
             ErrorKind::NotRestored => "not-restored",
             ErrorKind::MissingInput => "missing-input",
             ErrorKind::InvalidInput => "invalid-input",
+            ErrorKind::NoChange => "no-change",
             ErrorKind::Other => "other",
         }
     }

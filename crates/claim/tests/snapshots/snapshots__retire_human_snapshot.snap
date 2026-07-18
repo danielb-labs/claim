@@ -1,0 +1,12 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "redact_write_output(&body, repo.path())"
+---
+Retired claim 'gone'.
+  note: libfoo 5.0 shipped
+Its status is now `retired` (computed from this log entry); the claim file and its history are kept.
+Recorded the retirement at commit <sha>.
+
+Nothing is committed yet. Review, then commit:
+  git -C <root> add .claims/log/gone/<entry>.json
+  git -C <root> commit -m "Retire claim gone"

@@ -89,3 +89,95 @@ fn check_human_snapshot() {
     // the "(report-only: not recorded)" line is exercised.
     insta::assert_snapshot!(stdout(&repo, &["check", "--all", "--report-only"], 0));
 }
+
+/// Redact the non-deterministic fragments a write verb prints — the abbreviated
+/// commit sha, the temp store root, and the verdict-log filename's timestamp+hash —
+/// so the snapshot captures the stable wording, not a run's incidental paths. Done
+/// with plain string rewriting (no regex/insta-filters feature): each volatile
+/// fragment sits on a line with a fixed, recognizable prefix, so the redaction keys
+/// off that prefix rather than a pattern.
+fn redact_write_output(body: &str, root: &std::path::Path) -> String {
+    // The tool prints the store root as git discovered it, which on macOS is the
+    // canonicalized `/private/...` form, not the `/var/folders/...` symlink `TempDir`
+    // hands back. Canonicalize so the redaction matches what the output contains.
+    let root = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string();
+    body.lines()
+        .map(|line| {
+            if let Some(idx) = line.find("at commit ") {
+                // "Recorded ... at commit <7hex>." — keep everything up to the sha.
+                format!("{}at commit <sha>.", &line[..idx])
+            } else if line.trim_start().starts_with("git -C ") {
+                // "  git -C <root> add <paths>" — redact the temp root and any
+                // verdict-log filename in the argument list.
+                let redacted_root = line.replacen(&root, "<root>", 1);
+                redact_log_filenames(&redacted_root)
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace any `.claims/log/<id>/<stamp>-<hash>.json` argument with a stable token,
+/// so a verdict-log filename's timestamp and content hash do not churn the snapshot.
+fn redact_log_filenames(line: &str) -> String {
+    line.split(' ')
+        .map(|tok| {
+            if tok.starts_with(".claims/log/") && tok.ends_with(".json") {
+                let id = tok
+                    .strip_prefix(".claims/log/")
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or("<id>");
+                format!(".claims/log/{id}/<entry>.json")
+            } else {
+                tok.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn retire_human_snapshot() {
+    let repo = mixed_store();
+    let body = stdout(
+        &repo,
+        &["retire", "gone", "--note", "libfoo 5.0 shipped"],
+        0,
+    );
+    insta::assert_snapshot!(redact_write_output(&body, repo.path()));
+}
+
+#[test]
+fn amend_human_snapshot() {
+    // A store whose seeded claim's amended check holds against the tree, so the
+    // amend succeeds deterministically (a `true` cmd is always exit 0).
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("pin", &claim_file("pin", "120d", ""));
+    let body = stdout(
+        &repo,
+        &["amend", "pin", "--statement", "We now pin libfoo at 5.0."],
+        0,
+    );
+    insta::assert_snapshot!(redact_write_output(&body, repo.path()));
+}
+
+#[test]
+fn stats_human_snapshot() {
+    // A store spanning all four statuses plus a never-verified claim, so the snapshot
+    // exercises non-zero `retired` and `never verified` rows (not just the all-zero
+    // fixture). `now` is pinned, so every number and the honesty note are stable — no
+    // redaction needed.
+    let repo = mixed_store();
+    repo.write_claim("closed", &claim_file("closed", "120d", ""));
+    repo.write_verdict("closed", "2026-07-10T00:00:00Z", "held");
+    repo.write_retirement("closed", "2026-07-12T00:00:00Z", "superseded");
+    repo.write_claim("blank", &claim_file("blank", "30d", ""));
+    repo.write_verdict("blank", "2026-07-14T00:00:00Z", "broken");
+    insta::assert_snapshot!(stdout(&repo, &["stats"], 0));
+}
