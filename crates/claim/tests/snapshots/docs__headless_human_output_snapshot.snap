@@ -1,0 +1,6 @@
+---
+source: crates/claim/tests/docs.rs
+expression: redacted
+---
+Could not open a browser; open this file yourself:
+  <cache>/index.html

@@ -63,6 +63,9 @@ pub enum Command {
     Retire(RetireArgs),
     /// Pilot metrics: status and verdict counts, drifts caught, staleness.
     Stats(StatsArgs),
+
+    /// Open the product documentation bundled into this binary.
+    Docs(DocsArgs),
 }
 
 /// Arguments to `claim init`.
@@ -348,3 +351,38 @@ pub struct AmendArgs {
 /// pilot wants the corpus-wide picture. `--json` (global) is the structured form.
 #[derive(Debug, clap::Args)]
 pub struct StatsArgs {}
+
+/// Help text for `claim docs`, naming the topics and the two shipping modes so a
+/// user sees the whole surface under `--help` without reading the source.
+const DOCS_HELP: &str = "\
+TOPICS (the page `claim docs <topic>` opens; default is the overview):
+  ci             the two CI lanes, exit codes, and the renderer
+  agent-checks   the CLAIM_AGENT_CMD runner contract and verdict mapping
+  dogfooding     how this repo verifies its own decisions with claim
+
+The site is bundled into this binary, so it always matches the version you ran.
+`claim docs` writes it to a per-version cache directory and opens it; on a headless
+box with no opener it prints the path and exits 0. `claim docs --path` prints the
+path without opening — for scripting: `open \"$(claim docs --path)\"`.";
+
+/// Arguments to `claim docs`: open the version-locked documentation site.
+///
+/// The docs travel *inside* the binary (see [`crate::commands::docs`]), so an
+/// installed user with no repository can still read the docs for exactly the tool
+/// they have. An optional positional `TOPIC` picks a deeper page; `--path` prints
+/// the location without opening it, for headless and scripting use.
+#[derive(Debug, clap::Args)]
+#[command(after_long_help = DOCS_HELP)]
+pub struct DocsArgs {
+    /// The topic page to open: `ci`, `agent-checks`, or `dogfooding`. Omitted, the
+    /// overview (`index.html`) opens.
+    #[arg(value_name = "TOPIC")]
+    pub topic: Option<String>,
+
+    /// Print the path to the bundled site instead of opening it.
+    ///
+    /// For headless environments and scripting — no browser is launched, and only
+    /// the path is written to stdout, so `open "$(claim docs --path)"` composes.
+    #[arg(long)]
+    pub path: bool,
+}

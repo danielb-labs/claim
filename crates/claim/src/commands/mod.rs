@@ -4,6 +4,7 @@
 pub mod add;
 pub mod amend;
 pub mod check;
+pub mod docs;
 pub mod drift;
 pub mod init;
 pub mod list;

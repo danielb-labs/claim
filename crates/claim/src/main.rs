@@ -66,9 +66,9 @@ fn main() {
 /// and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2` and
 /// never a verb's low code.
 ///
-/// `amend`, `retire`, and `stats` are binary: `0` on success (via `.map(|()| 0)`),
-/// `2` on any error — they have no review-worthy middle code the way `check`/`drift`
-/// do.
+/// `amend`, `retire`, `stats`, and `docs` are binary: `0` on success (via
+/// `.map(|()| 0)`), `2` on any error — they have no review-worthy middle code the
+/// way `check`/`drift` do.
 fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
     match command {
         Command::Init(args) => commands::init::run(args, format).map(|()| 0),
@@ -80,6 +80,7 @@ fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
         Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),
         Command::Retire(args) => commands::retire::run(args, format).map(|()| 0),
         Command::Stats(args) => commands::stats::run(args, format).map(|()| 0),
+        Command::Docs(args) => commands::docs::run(args, format).map(|()| 0),
     }
 }
 

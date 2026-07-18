@@ -1,0 +1,10 @@
+{
+  "at": "2026-07-18T14:27:18.246015Z",
+  "commit": "e6331197f2d7cf21473e29168b858acbcbc02a13",
+  "actor": "Daniel Balagula <daniel.balagula@pm.me>",
+  "event": {
+    "type": "verification",
+    "verdict": "held",
+    "evidence": "docs-cover-cli: all 10 verbs and 3 MCP tools are documented in docs/index.html\n"
+  }
+}
