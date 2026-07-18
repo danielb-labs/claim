@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claim — documentation</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #1b1b1a;
+    --muted: #6c6a66;
+    --line: #e7e4de;
+    --accent: #5a51c9;
+    --accent-soft: #efedfb;
+    --code-bg: #f4f2ee;
+    --green-bg: #dbeddd; --green-ink: #256b3f;
+    --red-bg: #f6d9d7; --red-ink: #b23b34;
+    --amber-bg: #f7e6c9; --amber-ink: #966016;
+    --grey-bg: #e6e4df; --grey-ink: #5f5d58;
+    --maxw: 46rem;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); padding: .12em .38em; border-radius: 4px; font-size: .88em; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 1rem 1.1rem; overflow-x: auto; font-size: .86em; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; }
+
+  .layout { display: grid; grid-template-columns: 16rem 1fr; gap: 0; max-width: 78rem; margin: 0 auto; }
+
+  /* Sidebar */
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+    padding: 2rem 1.25rem; border-right: 1px solid var(--line);
+  }
+  aside .brand { font-weight: 700; font-size: 1.15rem; letter-spacing: -.01em; }
+  aside .brand span { color: var(--accent); }
+  aside .tag { color: var(--muted); font-size: .8rem; margin: .2rem 0 1.4rem; }
+  nav a {
+    display: block; color: var(--muted); padding: .28rem 0; font-size: .92rem; border: none;
+  }
+  nav a:hover { color: var(--ink); text-decoration: none; }
+  nav a.active { color: var(--accent); font-weight: 600; }
+  nav .group { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: #a6a29b; margin: 1.3rem 0 .35rem; }
+
+  /* Content */
+  main { padding: 2.6rem 2.4rem 6rem; min-width: 0; }
+  .wrap { max-width: var(--maxw); }
+  h1 { font-size: 2.1rem; line-height: 1.15; letter-spacing: -.02em; margin: 0 0 .4rem; }
+  h2 { font-size: 1.4rem; letter-spacing: -.01em; margin: 3.2rem 0 .8rem; padding-top: .6rem; }
+  h3 { font-size: 1.06rem; margin: 1.8rem 0 .5rem; }
+  .lede { font-size: 1.18rem; color: #3a3a38; margin: 0 0 1.4rem; }
+  p, li { color: #2a2a28; }
+  section { scroll-margin-top: 1.5rem; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 3rem 0 0; }
+
+  .callout {
+    background: var(--accent-soft); border: 1px solid #ddd8f4; border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1.4rem 0;
+  }
+  .callout p { margin: .3rem 0; }
+  .callout strong { color: #45409e; }
+
+  figure { margin: 1.6rem 0; }
+  figure img { max-width: 100%; border: 1px solid var(--line); border-radius: 10px; background: #fff; padding: .6rem; }
+  figcaption { color: var(--muted); font-size: .85rem; margin-top: .5rem; }
+
+  dl.glossary { margin: 1rem 0; }
+  dl.glossary dt { font-weight: 650; margin-top: 1.3rem; font-size: 1.02rem; }
+  dl.glossary dd { margin: .25rem 0 0; color: #33322f; }
+
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: .93rem; }
+  th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+
+  .chip { display: inline-block; padding: .08em .5em; border-radius: 100px; font-size: .8em; font-weight: 600; white-space: nowrap; }
+  .chip.green { background: var(--green-bg); color: var(--green-ink); }
+  .chip.red { background: var(--red-bg); color: var(--red-ink); }
+  .chip.amber { background: var(--amber-bg); color: var(--amber-ink); }
+  .chip.grey { background: var(--grey-bg); color: var(--grey-ink); }
+  .chip.done { background: var(--green-bg); color: var(--green-ink); }
+
+  @media (max-width: 880px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
+    main { padding: 1.8rem 1.3rem 4rem; }
+    nav { columns: 2; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <div class="brand"><span>claim</span></div>
+    <div class="tag">continuous verification for recorded knowledge</div>
+    <nav id="toc">
+      <div class="group">Start here</div>
+      <a href="#what">What it is</a>
+      <a href="#model">The core idea</a>
+      <a href="#start">Getting started</a>
+      <div class="group">Concepts</div>
+      <a href="#claim">Claims</a>
+      <a href="#checks">Checks &amp; verdicts</a>
+      <a href="#status">Status &amp; freshness</a>
+      <a href="#witness">Witnessing the red</a>
+      <a href="#supports">Supports &amp; drift</a>
+      <a href="#agent">Agent checks</a>
+      <div class="group">How it works</div>
+      <a href="#store">The store &amp; git</a>
+      <a href="#rules">The honesty rules</a>
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#ci">CI: the two lanes</a>
+      <a href="#mcp">The MCP server</a>
+      <div class="group">Reference</div>
+      <a href="#cli">CLI reference</a>
+      <a href="#docs">More docs</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+  </aside>
+
+  <main>
+  <div class="wrap">
+
+  <section id="what">
+    <h1>claim</h1>
+    <p class="lede">A tool that checks whether the facts you wrote down are still true.</p>
+    <p>Every codebase is full of recorded reasons: a security exception that says a vulnerability
+    doesn&rsquo;t apply, a dependency pinned to an old version, a skipped test, a line in an agent&rsquo;s
+    context file. Each was true when someone wrote it. Nothing checks it afterward, so it quietly
+    rots &mdash; and the person who later makes it false usually has no idea the note exists.</p>
+    <p><code>claim</code> binds each of those facts to a way of re-checking it. When a fact stops being
+    true, the system notices and says so, instead of leaving a confident sentence that is now wrong.
+    The one-line version: <strong>recorded knowledge either re-verifies itself or comes back to a human
+    &mdash; the failure mode is a nag, never a lie.</strong></p>
+  </section>
+
+  <section id="model">
+    <h2>The core idea</h2>
+    <p>A <strong>claim</strong> is three things written down together:</p>
+    <ol>
+      <li>a <strong>statement</strong> &mdash; a fact, in plain language;</li>
+      <li>a <strong>check</strong> &mdash; a way to re-verify the fact;</li>
+      <li>a <strong>schedule</strong> &mdash; when the check should run.</li>
+    </ol>
+    <p>You write claims where you already record decisions. The tool runs the checks on their schedule
+    and keeps a history of what each one found. A passing check keeps the claim fresh; a failing check
+    marks it <span class="chip red">drifted</span> and puts it in front of whoever the fact matters to.
+    That&rsquo;s the whole loop: <em>record &rarr; check &rarr; notice drift &rarr; adjudicate</em>.</p>
+    <div class="callout">
+      <p><strong>Why not just write a test?</strong> A failing test asks &ldquo;is the change that
+      triggered me wrong?&rdquo; When the honest answer is &ldquo;no, the world legitimately changed,&rdquo;
+      whoever tripped the test edits it away, and the reason it existed is lost. A claim carries the
+      reason with it and routes drift to the decision&rsquo;s owner, not to whoever happened to change
+      the world. (Some facts <em>should</em> become tests &mdash; after they&rsquo;ve earned it; that
+      is what <code>claim retire</code> with a closing note is for.)</p>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Getting started</h2>
+    <h3>Install</h3>
+    <p>Build the CLI from source with Rust&rsquo;s package manager, from a checkout of this repository:</p>
+    <pre><code>cargo install --path crates/claim
+claim --help</code></pre>
+    <p>The binary lands on your <code>PATH</code> at <code>~/.cargo/bin/claim</code>. To run against a
+    development build instead, use <code>cargo build -p claim</code> and <code>./target/debug/claim</code>.</p>
+    <h3>A first claim</h3>
+    <p>In a git repo, scaffold a store and record a claim about a pinned dependency:</p>
+    <pre><code># set the scene
+echo 'libfoo==4.2' &gt; requirements.txt
+git add -A &amp;&amp; git commit -m init
+
+claim init                         # create the .claims/ store
+
+claim add \
+  --id libfoo-pin \
+  --statement "Pin libfoo at 4.2 &mdash; 5.x corrupts CJK PDF export." \
+  --run "grep -q 'libfoo==4.2' requirements.txt" \
+  --max-age 120d \
+  --supports requirements.txt#libfoo</code></pre>
+    <p>The <code>--run</code> command is the check: it exits 0 while the pin holds. <code>add</code> runs
+    it once, requires it to pass (a passing check <em>is</em> the verification), and writes the claim
+    under <code>.claims/</code> with its first recorded result. It never touches your working tree.
+    Commit the new files like any other:</p>
+    <pre><code>git add .claims &amp;&amp; git commit -m "record libfoo pin claim"</code></pre>
+    <p>Every command takes <code>--json</code> for machine-readable output; the flag may lead or follow
+    the verb (<code>claim --json list</code> or <code>claim list --json</code>). At an interactive
+    terminal, <code>add</code> prompts for any required field you omit; a non-interactive caller (an
+    agent or CI) that omits one gets a clear error instead.</p>
+  </section>
+
+  <hr>
+
+  <section id="claim">
+    <h2>Claims</h2>
+    <p>A claim lives in one Markdown file under <code>.claims/</code>. The body is the statement a human
+    reads; the front-matter is what the tool acts on.</p>
+    <pre><code>---
+id: libfoo-pin
+checks:
+  - kind: cmd
+    run: "grep -q 'libfoo==4.2' requirements.txt"
+    when: on-change
+max-age: 120d
+supports: [requirements.txt#libfoo]
+---
+We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre>
+    <p>The same schema can also travel inside another file (like an agent&rsquo;s <code>CLAUDE.md</code>)
+    as an <code>&lt;!-- claim ... --&gt;</code> HTML comment block, so a context file can carry the checks
+    that keep it honest. (The CLI authors and reads standalone <code>.claims/*.md</code> files; embedded
+    blocks are part of the format for hand-authoring.)</p>
+    <dl class="glossary">
+      <dt id="g-id">id</dt>
+      <dd>A required kebab-case slug, unique in the store, optionally namespaced with <code>/</code>
+      (e.g. <code>payments/libfoo-pin</code>).</dd>
+      <dt>statement</dt>
+      <dd>The Markdown body: the fact, in plain language &mdash; what a person reads when the claim comes
+      up for review. Required; a claim with no statement is rejected.</dd>
+      <dt>checks</dt>
+      <dd>A required, non-empty list. Each check has a <code>kind</code> (<code>cmd</code>,
+      <code>agent</code>, or <code>human</code>) and a <code>when</code> trigger. See
+      <a href="#checks">Checks &amp; verdicts</a>.</dd>
+      <dt>max-age</dt>
+      <dd>A required <code>&lt;N&gt;d</code> duration &mdash; the freshness window. See
+      <a href="#status">Status &amp; freshness</a>.</dd>
+      <dt>supports</dt>
+      <dd>An optional top-level list of the decisions this fact justifies &mdash; a decision ref like
+      <code>requirements.txt#libfoo</code> or another claim&rsquo;s id. See
+      <a href="#supports">Supports &amp; drift</a>.</dd>
+    </dl>
+    <p>Notably absent: no author, reviewer, owner, or status field. Anything typed into a file can be
+    forged or go stale, so those are derived, not stored &mdash; see <a href="#store">The store &amp;
+    git</a>.</p>
+  </section>
+
+  <section id="checks">
+    <h2>Checks &amp; verdicts</h2>
+    <p>A <strong>check</strong> is how a claim gets re-verified. The most common kind is <code>cmd</code>,
+    an ordinary command: the tool runs it and reads its exit code. (<code>agent</code> checks, for facts
+    no command can settle, are covered <a href="#agent">below</a>; <code>human</code> checks are a
+    scheduled human look.) The tool turns a check&rsquo;s outcome into a <strong>verdict</strong>. This
+    mapping is the heart of the tool, so it is deliberately strict:</p>
+    <table>
+      <thead><tr><th>The <code>cmd</code> check&hellip;</th><th>Verdict</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td>exits <code>0</code></td><td><span class="chip green">held</span></td><td>the fact is still true</td></tr>
+        <tr><td>exits <code>1</code></td><td><span class="chip red">drifted</span></td><td>the fact is no longer true</td></tr>
+        <tr><td>any other exit, fails to spawn, is signalled, or times out</td><td><span class="chip amber">broken</span></td><td>the check itself couldn&rsquo;t run</td></tr>
+      </tbody>
+    </table>
+    <p>The rule that matters: <strong>only a clean exit 0 counts as &ldquo;still true.&rdquo;</strong>
+    A missing tool, a deleted directory, a typo, a hung command &mdash; anything that stops the check from
+    completing &mdash; is <span class="chip amber">broken</span>, which ages the claim toward review
+    exactly like a check that never ran. There is no path from &ldquo;couldn&rsquo;t check&rdquo; to
+    &ldquo;it&rsquo;s fine.&rdquo; A fourth verdict, <span class="chip amber">unverifiable</span> (ran,
+    but the evidence was inconclusive), exists for agent checks; a plain <code>cmd</code> check never
+    returns it.</p>
+    <h3>Negation</h3>
+    <p>Some facts are phrased as an absence (&ldquo;the archived <code>serde_yaml</code> is not in the
+    lockfile&rdquo;). Set <code>negate: true</code> and the tool flips <span class="chip green">held</span>
+    and <span class="chip red">drifted</span> &mdash; but never turns <span class="chip amber">broken</span>
+    into a pass. The tool owns the inversion; you never write a shell <code>!</code>, because a missing
+    tool would then flip a failure into a false &ldquo;fine.&rdquo; On the CLI this is
+    <code>--negate</code>; in the file it is the check&rsquo;s <code>negate</code> field.</p>
+    <h3>Triggers &mdash; when a check runs</h3>
+    <p>Each check carries a <code>when</code>:</p>
+    <ul>
+      <li><code>on-change</code> &mdash; for facts only a code change can break (&ldquo;nothing imports
+      X&rdquo;). Runs in the on-change lane, on every pull request.</li>
+      <li><code>every 30d</code> &mdash; for facts the outside world can break (&ldquo;the vendor&rsquo;s
+      rate limit is still 100/s&rdquo;). Runs on a clock, since no commit of yours would signal the
+      change.</li>
+    </ul>
+    <p>These are the two triggers in v1. A claim is &ldquo;due&rdquo; when it has an <code>on-change</code>
+    check (always, in v1) or when an <code>every Nd</code> check&rsquo;s interval has elapsed since its
+    last recorded run. <code>claim check</code> defaults to running only the due claims; <code>--all</code>
+    runs every claim&rsquo;s checks regardless.</p>
+  </section>
+
+  <section id="status">
+    <h2>Status &amp; freshness</h2>
+    <p>A verdict is the result of one check at one moment. A claim&rsquo;s <strong>status</strong> is the
+    standing you get by looking at its whole history. It is never stored &mdash; it&rsquo;s computed from
+    the verdict log and the claim&rsquo;s <code>max-age</code> every time you ask.</p>
+    <table>
+      <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><span class="chip green">verified</span></td><td>the latest check held and the claim is within its <code>max-age</code></td></tr>
+        <tr><td><span class="chip red">drifted</span></td><td>the claim&rsquo;s own check says the fact is no longer true</td></tr>
+        <tr><td><span class="chip amber">stale</span></td><td>overdue &mdash; never verified, past its <code>max-age</code>, or its checks have been broken or inconclusive too long</td></tr>
+        <tr><td><span class="chip grey">retired</span></td><td>closed on purpose &mdash; the decision was re-reviewed and the claim was put to rest with a note</td></tr>
+      </tbody>
+    </table>
+    <p>(<code>suspect</code> &mdash; a claim whose foundation drifted &mdash; is in the design but not
+    v1; until it ships, the drift report lists what a drifted claim supports, which at small scale is
+    the same information.)</p>
+    <h3>max-age &mdash; the dead-man&rsquo;s switch</h3>
+    <p>Every claim carries a required <code>max-age</code>. A passing check renews it. If checks stop
+    passing &mdash; the check broke, kept coming back inconclusive, or there was never a check at all
+    &mdash; the claim eventually goes <span class="chip amber">stale</span> and a human is asked to look.
+    This is the backstop under everything: whatever else goes wrong, the end state is a nag, never a stale
+    green light. A claim hand-committed with no recorded verdict is not a special state &mdash; it is
+    simply stale, and due immediately, until a check runs.</p>
+    <p>Because staleness is arithmetic against a log, nothing has to <em>run</em> for a claim to
+    <em>become</em> stale, the same way nothing runs for a certificate to expire. What has to run is
+    something that <em>asks</em> regularly, so staleness gets noticed &mdash; that is the
+    <a href="#ci">clock lane&rsquo;s</a> job, or, on a bare single machine, the next time anyone runs the
+    CLI.</p>
+  </section>
+
+  <section id="witness">
+    <h2>Witnessing the red</h2>
+    <p>A check is only worth trusting if it can actually fail. It&rsquo;s easy to write one that passes
+    today but would never catch the fact breaking &mdash; a grep for the wrong string, a command that
+    always exits 0. That check is green now and green forever, which is worse than no check, because it
+    looks like protection.</p>
+    <p><strong>Witnessing a check go red is an optional confidence signal, not a gate.</strong> A passing
+    check already verifies the fact, so <code>claim add</code> records a claim the moment its check holds
+    against reality. Where a fact&rsquo;s failure <em>can</em> be staged, you can ask the tool to watch
+    the check discriminate: pass <code>--witness-cmd</code> with a command that makes the fact false. The
+    tool applies that command in a <em>throwaway git worktree detached at HEAD</em>, runs the check there
+    expecting <span class="chip red">drifted</span>, and tears the worktree down &mdash; so your working
+    tree is never touched and no clean tree is required. The observed red is recorded as evidence on the
+    establishing verdict. (It needs a commit to check out, so it is refused on a brand-new repo with no
+    commit yet.)</p>
+    <p>It&rsquo;s the same as testing a smoke alarm by holding a match under it &mdash; nice to see it go
+    off before you trust it, but a fact whose red can&rsquo;t be staged (a future world-event, not a file
+    you can edit) is still verified by its passing check, never marked &ldquo;unverified&rdquo; for a red
+    nobody could produce. <code>claim list --unverified</code> surfaces claims with no passing verdict on
+    record at all &mdash; genuinely never verified, not merely un-witnessed.</p>
+  </section>
+
+  <section id="supports">
+    <h2>Supports &amp; drift</h2>
+    <p>A claim can name the decisions it justifies, with <code>supports</code>. The
+    &ldquo;user input never reaches <code>XmlParser</code>&rdquo; claim <em>supports</em> a security
+    exception; a &ldquo;PDF export uses CJK fonts&rdquo; claim <em>supports</em> the libfoo pin. This is
+    what lets a drift carry meaning: when a fact breaks, the tool can point at what rested on it.</p>
+    <p>A <code>supports</code> target is either a decision ref (<code>path#anchor</code>) or a bare claim
+    id or file path. A decision ref resolves when <code>path</code> exists and the literal text
+    <code>anchor</code> occurs in it as a case-sensitive, word-boundary text scan &mdash; <em>not</em> a
+    GitHub heading slug. To point at a heading &ldquo;## Approved dependencies&rdquo;, write the words as
+    they appear (<code>CLAUDE.md#Approved dependencies</code>), not <code>#approved-dependencies</code>.
+    <code>claim add</code> checks each target and warns on any that does not resolve (a forward reference
+    is allowed, so it is a warning, not a hard failure); <code>claim check</code> later reports an
+    unresolved target as review-needed.</p>
+    <p>When a claim&rsquo;s check confirms the fact is false, its status becomes
+    <span class="chip red">drifted</span>. Drift is not a build failure &mdash; it&rsquo;s a review item.
+    The right response is one of:</p>
+    <ul>
+      <li><strong><code>claim amend</code></strong> &mdash; the fact changed shape; update the statement
+      and check, keeping the claim&rsquo;s history.</li>
+      <li><strong><code>claim retire</code></strong> &mdash; the decision was re-reviewed and no longer
+      needs the fact (or the fact became a real test, and a closing <code>--note</code> says where).</li>
+    </ul>
+    <p>Every check run also confirms a claim&rsquo;s <code>supports</code> targets still resolve. If the
+    decision a claim justified was deleted, the claim goes loud instead of sitting there quietly green
+    &mdash; an unresolved support is exit 1, review-needed.</p>
+  </section>
+
+  <section id="agent">
+    <h2>Agent checks (<code>kind: agent</code>)</h2>
+    <p>Many facts have no command that settles them &mdash; &ldquo;has the upstream CJK-corruption bug
+    been fixed in libfoo 5.x?&rdquo; is a reading of a changelog and an issue tracker, a judgement. An
+    <code>agent</code> check binds that judgement to a natural-language <code>instruction</code> that an
+    agent (a model behind a CLI) carries out, returning a verdict <em>and the evidence for it</em>.</p>
+    <p>Agent checks are strictly <strong>opt-in</strong>. They execute only when the
+    <code>CLAIM_AGENT_CMD</code> environment variable points <code>claim check</code> at a runner &mdash;
+    a shell command that receives the prompt on stdin and prints a verdict JSON object on stdout. With it
+    unset (the default), every agent check is reported <span class="chip amber">unverifiable</span>, no
+    subprocess is spawned, and no model is contacted &mdash; a plain <code>claim check</code> never makes
+    an API call. The runner, its credentials, and its budget are the operator&rsquo;s; the tool ships no
+    model client.</p>
+    <p>The honesty contract is identical to a <code>cmd</code> check: a crash, a timeout, a non-zero exit,
+    a missing or malformed verdict, or two conflicting verdicts all map to <span class="chip amber">broken</span>,
+    never a fake <span class="chip green">held</span>. A runner cannot fake a pass by claiming one &mdash;
+    it must exit 0 <em>and</em> emit exactly one well-formed <code>held</code> on stdout. The full
+    contract, response schema, and the exact verdict mapping are in
+    <a href="agent-checks.md">docs/agent-checks.md</a>.</p>
+  </section>
+
+  <hr>
+
+  <section id="store">
+    <h2>The store &amp; git</h2>
+    <p>Claims are plain files in a <code>.claims/</code> directory, and their history is an append-only
+    log beside them (<code>.claims/log/&lt;id&gt;/</code>, one small file per result). There is no
+    database and no server: <strong>git is the store.</strong> That means claims are versioned, reviewed,
+    merged, and attributed exactly like code, and two people (or agents) recording claims at the same
+    time is just two commits.</p>
+    <p>The store scanner treats every <code>.md</code> under <code>.claims/</code> that opens with a
+    <code>---</code> frontmatter fence as a claim, and skips the <code>log/</code> tree. A plain document
+    with no fence &mdash; a <code>README.md</code> describing the store &mdash; is not a claim and is
+    skipped silently, so it can coexist with claims. A file that <em>does</em> open with a fence but is
+    malformed stays a loud per-file error rather than being dropped.</p>
+    <p>One consequence worth stating: a claim&rsquo;s author, its reviewer, and its status are never
+    written into the file, because anything typed into a file can be forged or go stale. Author and
+    reviewer come from the commit and the pull request; status is computed from the log. The file holds
+    only what someone <em>decides</em> &mdash; the statement, the check, the schedule.</p>
+  </section>
+
+  <section id="rules">
+    <h2>The honesty rules</h2>
+    <p>The tool&rsquo;s whole value is that you can trust what it says, so a handful of golden invariants
+    are non-negotiable (they live in <code>CLAUDE.md</code>):</p>
+    <ul>
+      <li><strong>A broken check never reports a pass.</strong> Exit 0 &rarr; held; exit 1 &rarr; drifted;
+      any other exit, a failure to spawn, a signal, or a timeout &rarr; broken. Broken counts against
+      freshness exactly like &ldquo;never checked.&rdquo;</li>
+      <li><strong>The tool owns negation.</strong> Inversion happens in the tool, never as a shell
+      <code>!</code> that a missing binary could flip into a false pass.</li>
+      <li><strong>Status and provenance are derived, never stored.</strong> Status comes from the log;
+      author and reviewer from git and the forge &mdash; not from fields a file could lie about.</li>
+      <li><strong>A write to the truth is a commit.</strong> The tool appends verdicts as files to
+      commit; there is no side channel, no database, no write API to the truth.</li>
+      <li><strong>Witnessing a red is optional confidence, never a lie.</strong> A passing check verifies
+      the fact; a witnessed red adds confidence where a failure can be staged.</li>
+      <li><strong>The failure mode is a nag, never a lie.</strong> Every path degrades toward a human
+      being asked to look, never toward a stale green light.</li>
+    </ul>
+  </section>
+
+  <section id="lifecycle">
+    <h2>Lifecycle</h2>
+    <p>A claim exists once its file is merged into a store. From there its status moves with what its
+    checks find and what a human decides:</p>
+    <figure>
+      <img src="assets/lifecycle.png" alt="Claim lifecycle diagram">
+      <figcaption>How a claim moves between verified, drifted, stale, and retired. Status is computed
+      from the log, never stored.</figcaption>
+    </figure>
+  </section>
+
+  <section id="architecture">
+    <h2>Architecture</h2>
+    <p>The tool is built in layers, each usable without the ones above it: plain claim files, git as the
+    history and review layer, and (in the design, not v1) an optional hub that indexes many repos without
+    ever becoming the source of truth.</p>
+    <figure>
+      <img src="assets/architecture.png" alt="System architecture diagram">
+      <figcaption>The CLI, the MCP server, and CI talk to the repos; a hub, if present, is a derived
+      layer that reads by syncing and writes only through commits and PRs.</figcaption>
+    </figure>
+    <p>Doubt travels along <code>supports</code> edges, never confidence: when a claim drifts, everything
+    resting on it is flagged for a second look, but a verified parent never makes a child true &mdash;
+    only the child&rsquo;s own check can. (Propagation and the <code>suspect</code> status are in the
+    design; v1 shows the one-hop supports listing instead.)</p>
+    <figure>
+      <img src="assets/graph-propagation.png" alt="Graph propagation diagram">
+      <figcaption>A drifted claim sends doubt along its edges, marking dependents suspect; verification
+      never travels the other way.</figcaption>
+    </figure>
+  </section>
+
+  <section id="ci">
+    <h2>CI: the two lanes</h2>
+    <p><code>claim</code> verifies facts in two places, on two clocks. Both end at the same verdict log
+    and neither ever fails your build &mdash; drift is information routed to an owner, not a wall in front
+    of a merge.</p>
+    <ul>
+      <li><strong>The on-change lane</strong> runs on every pull request
+      (<code>claim check --all --report-only --json</code>). It answers &ldquo;does this diff break a
+      fact someone wrote down?&rdquo; and posts one grouped, advisory comment on drift &mdash; the
+      statement, what it supports, and the CODEOWNERS owner. It writes nothing and needs no write token,
+      so a fork PR still gets its checks.</li>
+      <li><strong>The clock lane</strong> runs on a schedule (<code>claim check --due --json</code>),
+      records each due claim&rsquo;s verdict, and commits the log files back (a write to the truth is a
+      commit). It maintains one standing <code>claim: due &amp; drifted</code> issue &mdash; created when
+      there is a queue, updated in place, closed when the store is clean. That issue is the entire v1 nag
+      mechanism.</li>
+    </ul>
+    <p>The renderer that turns <code>claim check --json</code> into a comment or issue body lives in
+    <code>ci/render.mjs</code> (Node, no dependencies) and is tested against real fixtures, so a change to
+    the CLI&rsquo;s JSON shape breaks the build rather than mis-rendering in production. Both lanes and
+    their exit-code contract are documented in full in <a href="ci.md">docs/ci.md</a>; drop-in workflow
+    copies are in <code>examples/consumer/</code>.</p>
+    <div class="callout">
+      <p><strong>The exit-code contract</strong> (highest applicable wins): <code>0</code> &mdash; every
+      check held and every support resolved; <code>1</code> &mdash; a drift, an unverifiable, or an
+      unresolved support (review needed); <code>2</code> &mdash; a broken check, an unloadable or
+      duplicate-id claim file, or a tool error. A broken check is the loudest condition, never the
+      quietest.</p>
+    </div>
+  </section>
+
+  <section id="mcp">
+    <h2>The MCP server</h2>
+    <p>The <code>claim-mcp</code> server is how agents touch the store over the Model Context Protocol. It
+    is a thin shell over the same core the CLI uses, discovering the store from the working directory per
+    call, and exposes two tools:</p>
+    <ul>
+      <li><strong>query</strong> &mdash; return the claims recorded for the paths or text at hand, as
+      <em>dated evidence</em>: the statement, its computed status, when it was last verified, what it
+      supports, and an evidence pointer. Run it at the start of work to inherit what the store already
+      believes. Results are framed as observations to weigh against their freshness, never as instructions
+      to obey &mdash; a claims store agents obeyed blindly would be an injection channel with a trust
+      stamp. Read-only; it never writes.</li>
+      <li><strong>report</strong> &mdash; record a verdict the agent reached (<code>held</code>,
+      <code>drifted</code>, or <code>unverifiable</code>) with required evidence, under the agent&rsquo;s
+      own git identity. It appends one entry to the verdict log in the working tree and returns the file
+      to commit &mdash; the server does <em>not</em> commit, because a write to the truth is a commit the
+      caller makes.</li>
+    </ul>
+    <p>(<code>propose</code> and <code>flag</code> from earlier drafts were cut: an in-repo agent already
+    has a checkout, so it writes the file or runs <code>claim add</code>, and <code>flag</code> is just
+    <code>report</code> with a negative verdict.)</p>
+  </section>
+
+  <hr>
+
+  <section id="cli">
+    <h2>CLI reference</h2>
+    <p>Every command takes <code>--json</code> for machine-readable output (it may lead or follow the
+    verb). All verbs below are shipped. Run <code>claim &lt;verb&gt; --help</code> for the authoritative,
+    always-current flag list; the summaries here match version 0.1.0.</p>
+    <table>
+      <thead><tr><th>Command</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>claim init</code></td><td>Scaffold a <code>.claims/</code> store in the current directory <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim add</code></td><td>Create a claim: run its check now, require it holds, write the first log entry <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim check</code></td><td>Run checks and report holds/drifted/unverifiable/broken <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim list</code></td><td>Filter claims by text, path, status, staleness, or supports <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim log</code></td><td>Show a claim&rsquo;s full history and evidence <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim drift</code></td><td>List drifted claims with what each supports <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim amend</code></td><td>Resolve drift by fixing a claim&rsquo;s statement and check, keeping its history <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim retire</code></td><td>Close a claim on purpose with a note; its status becomes <code>retired</code> <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim stats</code></td><td>Pilot metrics: status and verdict counts, drifts caught, staleness <span class="chip done">shipped</span></td></tr>
+      </tbody>
+    </table>
+
+    <h3>claim init</h3>
+    <p>Scaffolds <code>.claims/</code> and <code>.claims/log/</code> in the current directory (or
+    <code>--dir &lt;DIR&gt;</code>). Idempotent: re-running is not an error.</p>
+
+    <h3>claim add</h3>
+    <p>Records a claim after running its check once and requiring it holds &mdash; a <span class="chip red">drifted</span>
+    or <span class="chip amber">broken</span> check is refused (no recording an already-false or
+    unrunnable fact). Flags: <code>--id</code>, <code>--statement</code>, <code>--run</code>, and
+    <code>--max-age</code> are required (prompted at a terminal, a clear error otherwise);
+    <code>--when</code> defaults to <code>on-change</code>; <code>--negate</code> inverts the check&rsquo;s
+    sense; <code>--supports &lt;TARGET&gt;</code> is repeatable; <code>--witness-cmd</code> optionally
+    witnesses a red (see <a href="#witness">above</a>).</p>
+
+    <h3>claim check</h3>
+    <p>Runs checks and records the verdicts, scriptable by <a href="#ci">exit code</a>. By default it
+    runs only <em>due</em> claims; <code>--due</code> names that explicitly and <code>--all</code> runs
+    every claim&rsquo;s checks (mutually exclusive). <code>--report-only</code> runs and reports but writes
+    nothing &mdash; the untrusted-runner mode for a fork PR or a local sanity pass; the exit code is still
+    set from the verdicts, but nothing is persisted (so an <code>every Nd</code> claim stays due until a
+    persisting run records it). Retired claims are never checked. Set <code>CLAIM_AGENT_CMD</code> to
+    execute <a href="#agent"><code>kind: agent</code></a> checks; unset, they are
+    <span class="chip amber">unverifiable</span> and nothing is spawned.</p>
+
+    <h3>claim list</h3>
+    <p>Inventories claims with their computed status. Optional <code>[TERM]</code> is a case-sensitive
+    substring matched against id and statement. Filters: <code>--status &lt;verified|drifted|stale|retired&gt;</code>,
+    <code>--path &lt;PREFIX&gt;</code>, <code>--supports &lt;TARGET&gt;</code>, <code>--stale</code>
+    (shortcut for <code>--status stale</code>), and <code>--unverified</code> (claims with no passing
+    verdict on record).</p>
+
+    <h3>claim log</h3>
+    <p><code>claim log &lt;ID&gt;</code> prints one claim&rsquo;s definition and its full verdict history
+    &mdash; each entry&rsquo;s timestamp, verdict, the commit it was taken against, the git-derived actor,
+    and any evidence (including a witnessed-red note on an establishing entry).</p>
+
+    <h3>claim drift</h3>
+    <p>Lists only the drifted claims, each with what it supports &mdash; the review queue. Exit
+    <code>0</code> when nothing drifted, <code>1</code> when the queue is non-empty, <code>2</code> on a
+    tool error.</p>
+
+    <h3>claim amend</h3>
+    <p><code>claim amend &lt;ID&gt;</code> replaces parts of a claim while keeping its history:
+    <code>--statement</code>, <code>--run</code> (with <code>--negate</code>, which is only meaningful
+    together with <code>--run</code>), <code>--when</code>, <code>--max-age</code>, and
+    <code>--supports</code> (repeatable; replaces the whole set &mdash; it never silently drops edges it
+    was not told to).</p>
+
+    <h3>claim retire</h3>
+    <p><code>claim retire &lt;ID&gt; --note &lt;WHY&gt;</code> closes a claim on purpose; the required
+    note records why (the decision was re-reviewed, or the fact became a real test and this says where).
+    Its status becomes <span class="chip grey">retired</span> and it is no longer checked.</p>
+
+    <h3>claim stats</h3>
+    <p>Pilot metrics: claim counts by status, verdict counts across all history, drifts caught, and the
+    oldest last-verified time. The two &ldquo;kill metrics&rdquo; from the product design &mdash;
+    false-alarm rate and minutes per claim &mdash; are reported as needing human input rather than
+    fabricated, because the store does not observe them.</p>
+  </section>
+
+  <section id="docs">
+    <h2>More docs</h2>
+    <p>This page is the overview. The deeper topic docs, all in <code>docs/</code>:</p>
+    <ul>
+      <li><a href="ci.md">CI: the two lanes</a> &mdash; the on-change and clock lanes in full: the
+      exit-code contract, report-only vs. persisting, the standing issue, idempotency, the renderer, and
+      how to adopt the workflows.</li>
+      <li><a href="agent-checks.md">Agent checks</a> &mdash; the <code>CLAIM_AGENT_CMD</code> contract,
+      the runner&rsquo;s stdin/stdout protocol, the response schema, and the exact verdict mapping that
+      keeps a misbehaving runner from faking a pass.</li>
+      <li><a href="dogfooding.md">Dogfooding</a> &mdash; how this repository uses <code>claim</code> on
+      its own load-bearing decisions, and how to run its checks.</li>
+      <li><a href="README.md">docs index</a> &mdash; a one-line map of every doc.</li>
+    </ul>
+  </section>
+
+  <section id="faq">
+    <h2>FAQ</h2>
+    <h3>Is this meant for AI agents or people?</h3>
+    <p>Both. People read claims to understand what the team believes and why; agents read them at the
+    start of a session (through the <a href="#mcp">MCP <code>query</code> tool</a> or <code>--json</code>)
+    to inherit verified premises instead of re-deriving the world, and record what they learn with
+    <code>report</code>. The interactive prompts you may hit only appear for a person at a terminal &mdash;
+    run non-interactively with flags and the tool never prompts.</p>
+    <h3>Is a drifted claim a build failure?</h3>
+    <p>No. Drift is a review item routed to the decision&rsquo;s owner, not a red build for whoever
+    changed the world. Neither CI lane fails the build; the escalation ladder in v1 has exactly two rungs
+    &mdash; the on-change PR comment and the clock-lane standing issue &mdash; and neither blocks a merge.</p>
+    <h3>Do I have to witness a check fail before recording it?</h3>
+    <p>No &mdash; that used to be mandatory and is now optional. A passing check verifies the fact, so
+    <code>claim add</code> records it the moment the check holds. <code>--witness-cmd</code> is there when
+    you want the extra confidence of seeing the check go red, and it runs in an isolated worktree that
+    never touches your files.</p>
+    <h3>What happens if I never run the checks?</h3>
+    <p>Claims still age. Because <code>max-age</code> is measured against the log, a claim nobody checks
+    eventually reads as <span class="chip amber">stale</span> &mdash; the tool would rather nag you than
+    quietly imply a fact still holds.</p>
+    <h3>Do I have to write claims for everything?</h3>
+    <p>No &mdash; the opposite. A claim is only worth it where you were <em>already</em> recording a
+    decision whose justification cites a fact someone else could change. If nobody would have written the
+    sentence anyway, don&rsquo;t make it a claim.</p>
+  </section>
+
+  </div>
+  </main>
+</div>
+
+<script>
+  // Highlight the current section in the sidebar as you scroll.
+  const links = [...document.querySelectorAll('#toc a')];
+  const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(a => a.classList.remove('active'));
+        const a = map.get(e.target.id);
+        if (a) a.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+  document.querySelectorAll('main section[id]').forEach(s => obs.observe(s));
+</script>
+</body>
+</html>
