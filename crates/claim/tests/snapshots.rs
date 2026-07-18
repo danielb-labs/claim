@@ -53,6 +53,20 @@ fn list_human_table_snapshot() {
 }
 
 #[test]
+fn show_human_snapshot() {
+    // A single rich claim: a negated cmd check with a skip (reason + both guards, a
+    // fixed `until` date, not wall-clock), a second agent check, two supports, and
+    // both hub hints — so the snapshot exercises the whole layout deterministically.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "payments/libfoo-pin",
+        "---\nid: payments/libfoo-pin\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n    negate: true\n    skip:\n      reason: windows CI has no grep\n      unless: \"test -x /usr/bin/grep\"\n      until: 2027-01-01\n  - kind: agent\n    instruction: Check the changelog since 5.0 for a CJK fix.\nsupports:\n  - requirements.txt#libfoo\n  - other-claim\nhub:\n  recheck: 30d\n  max-age: 120d\n---\nWe pin libfoo at 4.2.\n",
+    );
+    insta::assert_snapshot!(stdout(&repo, &["show", "payments/libfoo-pin"], 0));
+}
+
+#[test]
 fn check_human_snapshot() {
     // A store whose checks all hold, so the run is deterministic (a `true` cmd is
     // always exit 0) and no wall-clock durations leak into the output.
