@@ -11,10 +11,11 @@
 //!
 //! At runtime the bundle is materialized into a per-version cache directory (so the
 //! relative `assets/` image links and `.md` cross-links in the HTML resolve as a
-//! normal local site) and handed to the platform's file opener. `--path` prints the
-//! path without opening, for headless and scripting use, and a missing opener (a CI
-//! box, a bare server) degrades to printing the path and exiting `0` rather than
-//! failing — a doc you can't auto-open is still a doc you can `open` yourself.
+//! normal local site) and its path is printed — the headless-first default, so
+//! `open "$(claim docs)"` composes. `--open` additionally hands the page to the
+//! platform's file opener; a missing opener (a CI box, a bare server) degrades to
+//! printing the path and exiting `0` rather than failing — a doc you can't auto-open
+//! is still a doc you can `open` yourself.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,19 +104,19 @@ struct DocsReport {
     /// The absolute path to the page that was selected (the file, not the
     /// directory), so a script can open it itself.
     path: String,
-    /// Whether this run asked the platform opener to open the page. `false` for
-    /// `--path` and for a headless environment where no opener was found.
+    /// Whether this run asked the platform opener to open the page. `false` without
+    /// `--open`, and when `--open` found no opener.
     opened: bool,
 }
 
-/// Materialize the bundled site and open (or just locate) the requested page.
+/// Materialize the bundled site and locate (or, under `--open`, open) the page.
 ///
 /// The page is chosen by `args.topic`: absent means the overview, otherwise the
-/// [`TOPICS`] entry for the topic. `--path` (or a headless box with no opener) only
-/// prints the resolved path; the default opens it with the platform opener. Writing
-/// the whole bundle every run — not just the requested page — keeps the site's
-/// relative links (`assets/*.png`, the inter-page `.md` links) working from the
-/// cache directory.
+/// [`TOPICS`] entry for the topic. The default prints only the resolved path
+/// (headless-first, so `open "$(claim docs)"` composes); `--open` also asks the
+/// platform opener to launch it. Writing the whole bundle every run — not just the
+/// requested page — keeps the site's relative links (`assets/*.png`, the inter-page
+/// `.md` links) working from the cache directory.
 ///
 /// # Errors
 ///
@@ -129,21 +130,21 @@ pub fn run(args: &DocsArgs, format: Format) -> Result<()> {
     let dir = materialize_bundle().context("could not write the bundled documentation site")?;
     let page = dir.join(page_rel);
 
-    // `--path` never opens, for headless and scripting use. Otherwise attempt the
-    // platform opener; a box with none (a CI runner, a bare server) is not a
-    // failure — we print the path and exit 0, so the doc is still reachable.
-    let opened = if args.path {
-        false
-    } else {
+    // Headless-first: only `--open` asks the platform opener to launch the page. A
+    // box with none (a CI runner, a bare server) is not a failure — the path is
+    // printed and the exit stays 0, so the doc is still reachable.
+    let opened = if args.open {
         open_in_browser(&page)
+    } else {
+        false
     };
 
     // The "no opener found" hint is a human note on stderr, and `note` suppresses it
     // in `--json` mode so a scripted consumer's stderr stays clean while the JSON on
-    // stdout (with `opened: false`) already conveys the same fact. Only the default
-    // (open-attempted) headless case earns it — `--path` explicitly did not ask to
-    // open, so its "failure" to open is not worth a warning.
-    if !opened && !args.path {
+    // stdout (with `opened: false`) already conveys the same fact. Only `--open`
+    // (an opener was actually asked for) earns it — the default did not ask to open,
+    // so printing the path is the expected outcome, not a warnable failure.
+    if args.open && !opened {
         note(
             format,
             "no browser opener was found (open/xdg-open/start); printing the site path.",
@@ -160,13 +161,14 @@ pub fn run(args: &DocsArgs, format: Format) -> Result<()> {
         if opened {
             println!("Opened the docs in your browser:");
             println!("  {}", report.path);
-        } else if args.path {
-            // `--path` prints only the path on stdout, so it composes:
-            // `open "$(claim docs --path)"`.
-            println!("{}", report.path);
-        } else {
+        } else if args.open {
+            // `--open` was asked for but no opener was found; still give the path so
+            // the doc is reachable by hand.
             println!("Could not open a browser; open this file yourself:");
             println!("  {}", report.path);
+        } else {
+            // Default: only the path on stdout, so `open "$(claim docs)"` composes.
+            println!("{}", report.path);
         }
     })
 }

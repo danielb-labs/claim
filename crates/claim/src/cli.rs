@@ -82,26 +82,27 @@ pub struct InitArgs {
 /// Arguments to `claim add`.
 ///
 /// The flags cover the whole claim schema so an agent or script can author a claim
-/// non-interactively; when a flag is absent and stdin is a TTY, [`crate::commands::add`]
-/// falls back to prompting. The default path runs the check once, requires `Held`,
-/// and writes — never touching the working tree. [`AddArgs::witness_cmd`] is the
-/// optional extra-confidence path (invariant #5); see the command's module docs.
+/// non-interactively — the default: a missing required flag is an error naming it,
+/// never a prompt. [`AddArgs::interactive`] (`-i`) opts into prompting for omitted
+/// fields when authoring by hand. The default path runs the check once, requires
+/// `Held`, and writes — never touching the working tree. [`AddArgs::witness_cmd`] is
+/// the optional extra-confidence path (invariant #5); see the command's module docs.
 #[derive(Debug, clap::Args)]
 pub struct AddArgs {
     /// The claim's id: a kebab-case slug, optionally namespaced with `/`
-    /// (e.g. `payments/libfoo-pin`). Required (prompted for when a terminal is
-    /// attached; a clear error otherwise).
+    /// (e.g. `payments/libfoo-pin`). Required: pass the flag, or run with
+    /// `--interactive` to be prompted.
     #[arg(long)]
     pub id: Option<String>,
 
-    /// The plain-language statement — the fact the claim records. Required
-    /// (prompted for when a terminal is attached; a clear error otherwise).
+    /// The plain-language statement — the fact the claim records. Required: pass
+    /// the flag, or run with `--interactive` to be prompted.
     #[arg(long)]
     pub statement: Option<String>,
 
     /// The `cmd` check's command line. Runs through the shell; exit 0 means the
-    /// fact holds, exit 1 means it drifted (unless `--negate` inverts). Required
-    /// (prompted for when a terminal is attached; a clear error otherwise).
+    /// fact holds, exit 1 means it drifted (unless `--negate` inverts). Required:
+    /// pass the flag, or run with `--interactive` to be prompted.
     #[arg(long, value_name = "CMD")]
     pub run: Option<String>,
 
@@ -115,15 +116,24 @@ pub struct AddArgs {
     #[arg(long)]
     pub negate: bool,
 
+    /// Prompt for any required field left unset (`--id`, `--statement`, `--run`,
+    /// `--max-age`) instead of erroring.
+    ///
+    /// Off by default: `claim` is headless-first, so a missing required field is a
+    /// machine-actionable error naming the flag, never a prompt that could hang an
+    /// agent running under a pseudo-terminal. Pass this when authoring a claim by
+    /// hand and you would rather be walked through the fields.
+    #[arg(long, short = 'i')]
+    pub interactive: bool,
+
     /// The dead-man's switch: how long a passing check keeps the claim fresh, as
     /// `<N>d` (e.g. `120d`).
     ///
-    /// Required. Like `--id`, `--statement`, and `--run`, it is prompted for when a
-    /// terminal is attached; a non-interactive caller (an agent or CI, with no TTY)
-    /// that omits it fails with a clear "missing max-age; pass --max-age" error,
-    /// because a claim with no freshness window can never be nagged and would rot
-    /// silently. There is no default: how long a fact stays fresh is the author's
-    /// judgment, not the tool's.
+    /// Required. Like `--id`, `--statement`, and `--run`, it is prompted for only
+    /// under `--interactive`; by default (an agent or CI) omitting it fails with a
+    /// clear "missing max-age; pass --max-age" error, because a claim with no
+    /// freshness window can never be nagged and would rot silently. There is no
+    /// default: how long a fact stays fresh is the author's judgment, not the tool's.
     #[arg(long, value_name = "DAYS")]
     pub max_age: Option<String>,
 
@@ -355,34 +365,36 @@ pub struct StatsArgs {}
 /// Help text for `claim docs`, naming the topics and the two shipping modes so a
 /// user sees the whole surface under `--help` without reading the source.
 const DOCS_HELP: &str = "\
-TOPICS (the page `claim docs <topic>` opens; default is the overview):
+TOPICS (the page `claim docs <topic>` selects; default is the overview):
   ci             the two CI lanes, exit codes, and the renderer
   agent-checks   the CLAIM_AGENT_CMD runner contract and verdict mapping
   dogfooding     how this repo verifies its own decisions with claim
 
 The site is bundled into this binary, so it always matches the version you ran.
-`claim docs` writes it to a per-version cache directory and opens it; on a headless
-box with no opener it prints the path and exits 0. `claim docs --path` prints the
-path without opening — for scripting: `open \"$(claim docs --path)\"`.";
+`claim docs` writes it to a per-version cache directory and prints the path — only
+the path, on stdout, so `open \"$(claim docs)\"` composes. Pass `--open` to also
+launch a browser; on a box with no opener it still just prints the path and exits 0.";
 
-/// Arguments to `claim docs`: open the version-locked documentation site.
+/// Arguments to `claim docs`: locate (or open) the version-locked documentation site.
 ///
 /// The docs travel *inside* the binary (see [`crate::commands::docs`]), so an
 /// installed user with no repository can still read the docs for exactly the tool
-/// they have. An optional positional `TOPIC` picks a deeper page; `--path` prints
-/// the location without opening it, for headless and scripting use.
+/// they have. An optional positional `TOPIC` picks a deeper page; by default the
+/// path is printed for headless and scripting use, and `--open` launches a browser.
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DOCS_HELP)]
 pub struct DocsArgs {
-    /// The topic page to open: `ci`, `agent-checks`, or `dogfooding`. Omitted, the
-    /// overview (`index.html`) opens.
+    /// The topic page: `ci`, `agent-checks`, or `dogfooding`. Omitted, the overview
+    /// (`index.html`).
     #[arg(value_name = "TOPIC")]
     pub topic: Option<String>,
 
-    /// Print the path to the bundled site instead of opening it.
+    /// Open the page in a browser instead of just printing its path.
     ///
-    /// For headless environments and scripting — no browser is launched, and only
-    /// the path is written to stdout, so `open "$(claim docs --path)"` composes.
+    /// Off by default: `claim` is headless-first, so `claim docs` writes the bundled
+    /// site and prints only the path, on stdout, so `open "$(claim docs)"` composes.
+    /// Pass `--open` to also launch the platform opener; on a box with no opener it
+    /// still just prints the path and exits 0.
     #[arg(long)]
-    pub path: bool,
+    pub open: bool,
 }

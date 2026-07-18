@@ -1,12 +1,13 @@
 //! Integration tests for `claim docs`, driving the built binary.
 //!
 //! The load-bearing properties: the bundled site is *self-contained* (the path
-//! `--path` prints is a real file whose sibling `assets/` images exist, so an
-//! installed binary with no repository behind it still resolves every diagram), and
-//! the verb *degrades* on a headless box (no opener on `PATH`) to printing the path
-//! and exiting 0 rather than failing. These are what make the docs reachable for the
-//! user this verb exists for — someone who `cargo install`ed the tool and has no
-//! `docs/` on disk.
+//! `claim docs` prints is a real file whose sibling `assets/` images exist, so an
+//! installed binary with no repository behind it still resolves every diagram); the
+//! verb is *headless by default* — it prints the path and never opens a browser
+//! unless `--open` is passed; and `--open` still *degrades* on a box with no opener
+//! to printing the path and exiting 0 rather than failing. These make the docs
+//! reachable for the user this verb exists for — someone who `cargo install`ed the
+//! tool and has no `docs/` on disk.
 
 use std::path::Path;
 use std::process::Command;
@@ -16,12 +17,12 @@ use predicates::prelude::*;
 
 /// A `claim` command that inherits the ambient environment (the docs verb needs no
 /// store, so no temp repo is set up). Individual tests override `PATH` when they
-/// need to simulate a headless box.
+/// need to simulate a box with no opener.
 fn claim() -> assert_cmd::Command {
     assert_cmd::Command::from_std(Command::new(cargo_bin("claim")))
 }
 
-/// The single line of stdout `--path` prints, trimmed — the resolved page path.
+/// The single line of stdout the default prints, trimmed — the resolved page path.
 fn path_line(output: &[u8]) -> String {
     String::from_utf8(output.to_vec())
         .expect("utf-8 stdout")
@@ -30,9 +31,9 @@ fn path_line(output: &[u8]) -> String {
 }
 
 #[test]
-fn path_prints_a_real_file_and_only_the_path() {
+fn default_prints_a_real_file_and_only_the_path() {
     let out = claim()
-        .args(["docs", "--path"])
+        .args(["docs"])
         .assert()
         .success()
         .get_output()
@@ -41,16 +42,16 @@ fn path_prints_a_real_file_and_only_the_path() {
 
     let path = path_line(&out);
     let page = Path::new(&path);
-    assert!(page.is_file(), "--path must print a real file: {path}");
+    assert!(page.is_file(), "docs must print a real file: {path}");
     assert!(
         page.ends_with("index.html"),
         "the default page is the overview: {path}"
     );
-    // stdout is *only* the path, so `open "$(claim docs --path)"` composes.
+    // stdout is *only* the path, so `open "$(claim docs)"` composes.
     assert_eq!(
         path.lines().count(),
         1,
-        "--path prints exactly one line: {path:?}"
+        "docs prints exactly one line: {path:?}"
     );
 }
 
@@ -61,7 +62,7 @@ fn the_bundled_site_is_self_contained() {
     // it. If they did not, an installed user (no repo, no docs/ on disk) would open a
     // page with broken diagrams.
     let out = claim()
-        .args(["docs", "--path"])
+        .args(["docs"])
         .assert()
         .success()
         .get_output()
@@ -94,9 +95,9 @@ fn the_bundled_site_is_self_contained() {
 }
 
 #[test]
-fn a_topic_opens_that_page() {
+fn a_topic_selects_that_page() {
     let out = claim()
-        .args(["docs", "ci", "--path"])
+        .args(["docs", "ci"])
         .assert()
         .success()
         .get_output()
@@ -111,7 +112,7 @@ fn a_topic_opens_that_page() {
 #[test]
 fn an_unknown_topic_is_a_usage_error_naming_the_valid_ones() {
     claim()
-        .args(["docs", "not-a-topic", "--path"])
+        .args(["docs", "not-a-topic"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("not-a-topic"))
@@ -122,7 +123,7 @@ fn an_unknown_topic_is_a_usage_error_naming_the_valid_ones() {
 #[test]
 fn json_shape_is_stable() {
     let out = claim()
-        .args(["--json", "docs", "--path"])
+        .args(["--json", "docs"])
         .assert()
         .success()
         .get_output()
@@ -130,7 +131,7 @@ fn json_shape_is_stable() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON on stdout");
     assert_eq!(v["status"], "ok");
-    assert_eq!(v["opened"], false, "--path never opens");
+    assert_eq!(v["opened"], false, "the default never opens");
     assert!(
         v["path"]
             .as_str()
@@ -140,17 +141,14 @@ fn json_shape_is_stable() {
 }
 
 #[test]
-fn headless_human_output_snapshot() {
+fn default_human_output_snapshot() {
     // The insta obligation (CLAUDE.md): the human output is a deliberate, reviewable
-    // surface. The headless path is the stable one to snapshot — it never opens a
-    // browser and its text does not vary — but the cache-dir prefix is machine- and
-    // version-specific, so redact everything before the final `index.html` to a
-    // fixed `<cache>/` token. What remains is the exact wording and shape a change
-    // must not silently alter.
-    let dir = tempfile::TempDir::new().unwrap();
+    // surface. The default path is the stable one to snapshot — it never opens a
+    // browser and prints only the resolved path — but the cache-dir prefix is machine-
+    // and version-specific, so redact it to a fixed `<cache>/` token. What remains is
+    // the exact shape a change must not silently alter: a single bare path line.
     let out = claim()
         .args(["docs"])
-        .env("PATH", dir.path())
         .assert()
         .success()
         .get_output()
@@ -162,15 +160,15 @@ fn headless_human_output_snapshot() {
 }
 
 /// Replace the per-run cache-directory prefix on the printed path with a fixed
-/// `<cache>/` token, so the snapshot captures the wording and structure without the
-/// machine- and version-specific path. The path line is the indented one ending in
+/// `<cache>/` token, so the snapshot captures the shape without the machine- and
+/// version-specific path. The default prints one bare line: the path ending in
 /// `index.html`.
 fn redact_cache_path(stdout: &str) -> String {
     stdout
         .lines()
         .map(|line| {
-            if line.trim_start().ends_with("index.html") && line.starts_with("  ") {
-                "  <cache>/index.html".to_owned()
+            if line.trim_end().ends_with("index.html") {
+                "<cache>/index.html".to_owned()
             } else {
                 line.to_owned()
             }
@@ -180,15 +178,17 @@ fn redact_cache_path(stdout: &str) -> String {
 }
 
 #[test]
-fn headless_without_an_opener_degrades_to_printing_the_path() {
+fn open_without_an_opener_degrades_to_printing_the_path() {
     // Simulate a box with no browser opener: an empty PATH means `open`/`xdg-open`
-    // cannot be found. Without `--path`, the verb must still exit 0, print the path on
-    // stdout, and warn on stderr that it could not open — never fail, because a doc a
-    // user can open by hand is not an error. The stderr assertion pins the note so
-    // deleting it is caught (B-N2).
+    // cannot be found. With `--open` asked for but unavailable, the verb must still
+    // exit 0, print the path on stdout, and warn on stderr that it could not open —
+    // never fail, because a doc a user can open by hand is not an error. The stderr
+    // assertion pins the note so deleting it is caught. (`--open` is the only path
+    // that ever launches an opener, so it is the only one safe to exercise with an
+    // empty PATH; the default never opens and so is exercised freely above.)
     let dir = tempfile::TempDir::new().unwrap();
     claim()
-        .args(["docs"])
+        .args(["docs", "--open"])
         .env("PATH", dir.path())
         .assert()
         .success()

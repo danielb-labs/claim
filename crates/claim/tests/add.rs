@@ -503,22 +503,25 @@ fn rejects_when_no_store_exists() {
 }
 
 #[test]
-fn rejects_a_missing_required_field_without_a_tty() {
-    // No --statement, and no TTY under assert_cmd, so it must error naming the flag
-    // rather than hang on a prompt.
+fn rejects_a_missing_required_field_by_default() {
+    // No --statement and no --interactive, so add is headless by default: it must
+    // error naming the flag, never prompt (which could hang an agent under a PTY).
     let repo = ready_repo();
     repo.claim()
         .args(["add", "--id", "x", "--run", HOLDS, "--max-age", "30d"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("--statement"));
+        .stderr(predicate::str::contains("--statement"))
+        // The error's actionability for a human is load-bearing: it must name the
+        // `--interactive` escape hatch, not just the missing flag.
+        .stderr(predicate::str::contains("--interactive"));
 }
 
 #[test]
-fn rejects_a_missing_max_age_without_a_tty_clearly() {
-    // `--max-age` reads as optional in the args but is required: a non-interactive
+fn rejects_a_missing_max_age_by_default_clearly() {
+    // `--max-age` reads as optional in the args but is required: the default headless
     // caller (an agent or CI, the common case) that omits it must get a clear error
-    // naming the flag, not a silent default and not a hang on a prompt.
+    // naming the flag, not a silent default and not a prompt.
     let repo = ready_repo();
     repo.claim()
         .args(["add", "--id", "x", "--statement", "S.", "--run", HOLDS])
@@ -1162,21 +1165,95 @@ fn assert_error_kind(repo: &TestRepo, args: &[&str], expected_kind: &str) {
     assert_eq!(v["kind"], expected_kind, "kind for args {args:?}");
 }
 
-// --- m1: non-TTY human-mode with a missing field refuses clearly. ---
+// --- Default (headless) mode with a missing field refuses; `-i` opts into prompts. ---
 
 #[test]
-fn non_tty_human_mode_with_a_missing_field_refuses_clearly() {
-    // m1 regression. Without a TTY and with a required field absent, prompting is
-    // impossible; it must refuse pointing at the flag, not die with a confusing
-    // "input ended". assert_cmd provides no TTY. (The witness flow is no longer
-    // required, so a fully-specified add needs no TTY at all.)
+fn default_mode_with_a_missing_field_refuses_clearly() {
+    // m1 regression. By default (no --interactive) a missing required field must
+    // refuse pointing at the flag and must never read stdin — even when stdin has
+    // content, as here — so it can never hang or die with a confusing "input ended".
     let repo = ready_repo();
     repo.claim()
         .args(["add", "--id", "x", "--run", HOLDS, "--max-age", "30d"])
-        .write_stdin("") // non-TTY stdin
+        .write_stdin("ignored: default mode never reads stdin")
         .assert()
         .code(2)
         .stderr(predicate::str::contains("--statement"));
+}
+
+#[test]
+fn interactive_prompts_for_missing_fields_and_reads_stdin() {
+    // `-i` is the opt-in that turns a missing required field into a prompt instead of
+    // an error. With everything but --statement supplied, `-i` prompts for the one
+    // missing field and reads the answer from stdin — proving the prompt path keys on
+    // the flag, not on a detected terminal (assert_cmd provides no TTY).
+    let repo = ready_repo();
+    repo.claim()
+        .args([
+            "add",
+            "-i",
+            "--id",
+            "greeted",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+        ])
+        .write_stdin("The service greets on boot.\n")
+        .assert()
+        .success();
+
+    let file = repo.read(".claims/greeted.md");
+    assert!(
+        file.contains("The service greets on boot."),
+        "the statement read from stdin under -i must be recorded: {file}"
+    );
+}
+
+#[test]
+fn interactive_reads_missing_fields_in_order_from_stdin() {
+    // With no flags and `-i`, add prompts id, statement, run, max-age in that order,
+    // one stdin line each. Distinguishable values prove the mapping: a swapped order
+    // would feed a non-command into `--run` (refused) or land the statement in the
+    // wrong field, so a clean success with each value in its slot is the ordering
+    // proof — a silent line-to-field mismatch would be a data-integrity bug.
+    let repo = ready_repo();
+    repo.claim()
+        .args(["add", "-i"])
+        .write_stdin(format!(
+            "ordered-id\nThe ordered statement.\n{HOLDS}\n45d\n"
+        ))
+        .assert()
+        .success();
+
+    let file = repo.read(".claims/ordered-id.md");
+    assert!(
+        file.contains("id: \"ordered-id\""),
+        "id from stdin line 1: {file}"
+    );
+    assert!(
+        file.contains("The ordered statement."),
+        "statement from stdin line 2: {file}"
+    );
+    assert!(
+        file.contains("max-age: \"45d\""),
+        "max-age from stdin line 4: {file}"
+    );
+}
+
+#[test]
+fn interactive_with_eof_stdin_errors_clearly_instead_of_hanging() {
+    // `-i` with fields missing and stdin at EOF: the first prompt reads zero bytes and
+    // must bail with a clear "input ended" error and a non-zero exit — never hang, and
+    // never silently accept an empty field. assert_cmd would hang here if the process
+    // blocked, so reaching the assertion at all is part of the guarantee.
+    let repo = ready_repo();
+    repo.claim()
+        .args(["add", "-i"])
+        .write_stdin("")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("input ended"));
 }
 
 // --- Git edge: unborn HEAD (default path). ---
