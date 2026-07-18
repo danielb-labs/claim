@@ -65,9 +65,10 @@ as a default and may override it in its own config.
 **`when` is removed.** Whether a fact is re-checked on a code change or on a clock is
 *orchestration* — a CI step or the hub's scheduler decides it — not a property the
 claim asserts about itself. A PR lane runs a cheap subset on every change; a scheduled
-lane runs the rest. This depends on the CLI gaining real **selection** (`claim check
-<id>` / `--path` / `--kind`), which issue #19 restores; without selectors, "run a
-subset" has no expression. The cadence *hint* lives under `hub:` (`recheck`).
+lane runs the rest. The CLI expresses "run a subset" with **selection on `check`** —
+`claim check <id>…` by claim id and `claim check --path <prefix>` by repo path (issue
+#19, shipped). A per-check two-speed cadence is expressed with `skip.unless` rather than
+a `--kind` filter (see below). The cadence *hint* lives under `hub:` (`recheck`).
 
 ## The verdict is telemetry, not source
 
@@ -128,9 +129,14 @@ The other invariants reframe, not break:
   the drifted ones," not "read the log." `list` becomes a plain inventory, not a status
   view. `retire` removes the claim (git *is* the changelog: `git log .claims/`), rather
   than writing a retirement event.
-- **CLI gains (a prerequisite):** selection on `check` — `claim check <id>` / `--path`
-  / `--kind` — so a CI step can run a cheap subset on PRs and the rest on a clock, now
-  that `when` no longer partitions them (issue #19).
+- **CLI gained (a prerequisite, shipped):** selection on `check` — `claim check <id>…`
+  by claim id and `claim check --path <prefix>` by repo path — so a CI step can run a
+  cheap subset on PRs and the rest on a clock, now that `when` no longer partitions them
+  (issue #19). Positional ids are the union with `--path`; an unknown id is a usage error
+  (exit 2), an empty `--path` is not (it reports "no claims matched"). `--kind` was
+  **dropped** in favor of expressing two-speed cadence per-check with `skip.unless`,
+  which is already honest — a skipped check is reported and never a false green, and one
+  claim can carry both a cheap always-run check and an expensive nightly-only check.
 - **Claim file demotes, not removes:** `max_age`/cadence move under `hub:` — validated
   by the CLI, consumed by the hub.
 - **Establishing verdicts** committed by v1 (e.g. the eight dogfood claims and the

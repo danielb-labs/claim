@@ -599,11 +599,24 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     witnesses a red (see <a href="#witness">above</a>).</p>
 
     <h3>claim check</h3>
-    <p>Runs every claim&rsquo;s checks and reports the verdicts, scriptable by <a href="#ci">exit code</a>.
+    <p>Runs claims&rsquo; checks and reports the verdicts, scriptable by <a href="#ci">exit code</a>.
     It stores nothing &mdash; the <code>--json</code> output <em>is</em> the interface a
-    <a href="#hub">hub</a> or CI lane consumes. There are no flags: no <code>--all</code>, no
-    <code>--due</code>, no <code>--report-only</code> (the CLI never writes, so report-only is the only
-    mode there is). Set <code>CLAIM_AGENT_CMD</code> to execute
+    <a href="#hub">hub</a> or CI lane consumes. With no arguments it runs every claim; two selectors
+    narrow the run so a CI step can verify a cheap subset on a PR and leave the rest to a scheduled
+    run:</p>
+    <ul>
+      <li><code>claim check &lt;id&gt;&hellip;</code> &mdash; positional claim ids, e.g.
+      <code>claim check auth/no-cycles billing/tax</code>, run exactly those claims. A named id
+      asserts &ldquo;this claim exists,&rdquo; so an unknown id is a usage error (exit <code>2</code>)
+      naming the unresolved id &mdash; a typo is loud, never a silent pass.</li>
+      <li><code>--path &lt;PREFIX&gt;</code> &mdash; run only claims whose file or <code>supports</code>
+      path is under a repo prefix (the same match <code>claim list --path</code> uses). A path is a
+      filter, not an existence assertion: a prefix that matches nothing exits <code>0</code> and the
+      report says <em>no claims matched</em> &mdash; never &ldquo;all held.&rdquo;</li>
+    </ul>
+    <p>Given both, the selected set is their <strong>union</strong> (id named <em>or</em> path matched).
+    There is no <code>--all</code>, no <code>--due</code>, no <code>--report-only</code> (the CLI never
+    writes, so report-only is the only mode there is). Set <code>CLAIM_AGENT_CMD</code> to execute
     <a href="#agent"><code>kind: agent</code></a> checks; unset, they are
     <span class="chip amber">unverifiable</span> and nothing is spawned.</p>
 
