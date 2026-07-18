@@ -20,3 +20,16 @@ serde_norway = { workspace = true }
 # surfaces out-of-range arithmetic as an error instead of wrapping — the
 # properties a trust tool needs from the clock its staleness is measured against.
 jiff = { workspace = true }
+# Bounds a check's run: wait on the child process with a deadline so a hung
+# command times out to `Broken` instead of hanging the tool. A tiny, single-
+# purpose crate wrapping the platform's timed-wait primitive (`waitpid`/wait
+# objects); chosen over hand-rolling a `waitpid`+`SIGALRM`/self-pipe dance, which
+# is easy to get subtly wrong and is exactly the correctness surface this crate
+# already covers portably.
+wait-timeout = { workspace = true }
+# Raw FFI for the one syscall std does not expose: `killpg`, which kills a
+# timed-out check's whole process group — the shell *and* any children it
+# spawned — so `sleep 100 | foo` leaves no orphan. Std gives us `process_group(0)`
+# to create the group but no way to signal it; libc is the smallest correct way
+# to close that gap. Unix-only; guarded by `#[cfg(unix)]` at the call site.
+libc = { workspace = true }
