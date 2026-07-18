@@ -129,3 +129,33 @@ runners); cross-repo drift routing; canonicalization of equivalent world-claims;
 company-wide connectors (email/chat/docs). Open questions still unresolved:
 automatic contradiction detection, `claim move` with id tombstones, and who
 governs the graph's edge set.
+
+## Dogfooding findings (item 10)
+
+Running `claim` on its own repo (item 10) surfaced real product signal. The
+concrete fixes are scheduled as item 13; the observations worth keeping:
+
+- **Store scanner treats every `.claims/**/*.md` as a claim.** A plain
+  `.claims/README.md` is parsed as a claim, fails "missing frontmatter", and
+  forces `claim check` to exit 2 — a user will hit this the moment they document
+  their store. A non-claim doc (no frontmatter, no embedded block) should be
+  skipped; a frontmatter-fenced-but-malformed file must stay loud. (item 13)
+- **`--max-age` reads as optional but is required** — non-interactive callers
+  (every agent/CI use) hit the error on the first `add`. Mark it required or
+  default it. (item 13)
+- **`--supports` anchors are a literal substring scan, not GitHub slugs** — and
+  an unresolvable anchor is accepted silently at `add`, only caught at `check`.
+  Validate/warn at author time and document the rule. (item 13)
+- **Every `check` writes verdicts**, so a "clean tree" is a moving target during
+  exploration; `--report-only` avoids it but is easy to forget. Consider a
+  "wrote N verdicts; commit them" hint, or report-only-by-default outside CI.
+- **The agent-check gap is real and concrete.** Invariant #2 (the tool owns
+  negation; no shell `!`) *cannot* be a `cmd` claim: the only literal `sh -c "!`
+  in the tree is the doc comment warning against it, so any grep catches the
+  documentation, not a regression. Proving it needs semantic reading of
+  `check.rs` — exactly what `kind: agent` is for. Same for invariant #1 as a
+  *behavior* (exit 137 → Broken). These map the gap agent checks (item 12) fill.
+- **The granularity rule held up** — it actively stopped spam, rejecting hollow
+  candidates ("CLAUDE.md lists 6 invariants", "edition = 2021"). The working
+  line: a claim earns its place only when a real decision cites the fact AND the
+  check would actually drift if the decision changed.
