@@ -3,7 +3,7 @@
 //! `--json` error output must be actionable by an agent without regexing English
 //! prose (item 7's consumers key on the shape, not the wording). So the commands
 //! raise an [`AppError`] whose [`ErrorKind`] is a coarse, stable discriminator —
-//! `dirty-tree`, `not-witnessed`, `duplicate-id`, and so on — alongside the
+//! `not-witnessed`, `duplicate-id`, `drifted-green`, and so on — alongside the
 //! human message.
 //!
 //! Not every failure is an `AppError`: an I/O fault, a git spawn failure, or a
@@ -17,11 +17,10 @@ use std::fmt;
 /// error object's `kind` field.
 ///
 /// Kept deliberately small: each variant is a failure mode an agent might handle
-/// differently (retry after committing for `DirtyTree`, pick a new id for
-/// `DuplicateId`, fix the check for `NotWitnessed`, supply a real change for
-/// `NoChange`). The kebab-case rename is the wire form; adding a variant is
-/// backward-compatible because consumers match known kinds and fall back on the
-/// rest.
+/// differently (pick a new id for `DuplicateId`, fix the check for `NotWitnessed`,
+/// supply a real change for `NoChange`). The kebab-case rename is the wire form;
+/// adding a variant is backward-compatible because consumers match known kinds and
+/// fall back on the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorKind {
@@ -29,22 +28,16 @@ pub enum ErrorKind {
     NoStore,
     /// A claim with the requested id already exists in the store.
     DuplicateId,
-    /// The tracked working tree has uncommitted changes, so the default
-    /// witnessed-red restore would destroy them.
-    DirtyTree,
-    /// The green run against the current tree reported `Drifted` — the fact is
-    /// already false.
+    /// The establishing run against the current tree reported `Drifted` — the fact
+    /// is already false.
     DriftedGreen,
-    /// The green run reported `Broken` — the check cannot run.
+    /// The establishing run reported `Broken` — the check cannot run.
     BrokenGreen,
-    /// The witnessed-red step did not observe a `Drifted`, so the check is not
-    /// trusted.
+    /// The optional `--witness-cmd` step did not observe a `Drifted`, so the check
+    /// could not be shown to discriminate.
     NotWitnessed,
-    /// The tree could not be restored to a state where the fact holds after the
-    /// perturbation.
-    NotRestored,
-    /// A required input was absent with no terminal to prompt for it, or an
-    /// interactive witness was needed in a non-interactive run.
+    /// A required input was absent with no terminal to prompt for it, or
+    /// `--witness-cmd` was requested on an unborn HEAD (no commit to check out).
     MissingInput,
     /// A supplied value (id, trigger, max-age) failed validation, or an id that must
     /// name an existing claim (`retire`, `amend`) does not.
@@ -63,11 +56,9 @@ impl ErrorKind {
         match self {
             ErrorKind::NoStore => "no-store",
             ErrorKind::DuplicateId => "duplicate-id",
-            ErrorKind::DirtyTree => "dirty-tree",
             ErrorKind::DriftedGreen => "drifted-green",
             ErrorKind::BrokenGreen => "broken-green",
             ErrorKind::NotWitnessed => "not-witnessed",
-            ErrorKind::NotRestored => "not-restored",
             ErrorKind::MissingInput => "missing-input",
             ErrorKind::InvalidInput => "invalid-input",
             ErrorKind::NoChange => "no-change",
@@ -141,8 +132,8 @@ pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
 
 /// Shorthand to build an `anyhow::Error` wrapping a typed [`AppError`].
 ///
-/// Lets a command write `return Err(app(ErrorKind::DirtyTree, "…"))` and keeps the
-/// kind recoverable by [`kind_of`].
+/// Lets a command write `return Err(app(ErrorKind::DuplicateId, "…"))` and keeps
+/// the kind recoverable by [`kind_of`].
 pub fn app(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(AppError::new(kind, message))
 }

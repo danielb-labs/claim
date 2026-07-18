@@ -11,8 +11,9 @@
 //!   whole corpus ([`Store::load_all`]), with a malformed or duplicate-id file
 //!   surfaced as a [`LoadError`] rather than silencing the store.
 //! - [`git::resolve_commit`] and [`git::resolve_actor`] — the git-derived
-//!   provenance a verdict-log entry needs (invariant #3), plus the working-tree
-//!   helpers the witnessed-red flow uses.
+//!   provenance a verdict-log entry needs (invariant #3), plus [`git::Worktree`],
+//!   the isolated checkout `claim add --witness-cmd` uses to witness a red without
+//!   touching the caller's tree.
 //! - [`claim_matches_path`] — the "claims about these paths" prefix match both
 //!   `claim list` and the MCP `query` tool share, so the two cannot answer a path
 //!   query differently.

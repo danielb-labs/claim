@@ -285,7 +285,7 @@ claim drift      # drifted claims + the decision each supports = the review queu
 claim retire     # world changed legitimately; decision re-reviewed   (adjudication)
 claim amend      # update statement/verifier to the new truth         (adjudication)
 claim promote    # emit a test/gate stub carrying the reason; mark promoted
-claim list       # inventory; --unverified for the soft-debt view
+claim list       # inventory; --unverified surfaces claims never genuinely verified
 claim log <id>   # truth status over time (thin wrapper over history + git log)
 ```
 

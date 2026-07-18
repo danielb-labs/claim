@@ -18,19 +18,15 @@
 //! (preserved) log with git provenance, so the amended claim is verified against the
 //! tree the amendment was made on, not merely asserted.
 //!
-//! # Why there is no witnessed-red dance here (deliberate)
+//! # Why there is no `--witness-cmd` option here
 //!
-//! `claim add` witnesses a check going red before trusting it (invariant #5). Amend
-//! does **not**, on purpose. TODO.md ("Rethink witnessed-red: demote from mandatory
-//! to optional") records that witnessed-red is being demoted from a mandatory gate
-//! to an optional convenience — it is impossible for world-facts, too harsh a label
-//! for a check that really did evaluate reality, and hostile to the dirty trees
-//! agents work in. Forcing a perturb/restore dance in `amend` would compound exactly
-//! the friction that decision removes, on the verb most likely to run mid-drift on a
-//! dirty tree. So the amend path is: apply the overlay, run the amended check,
-//! require `Held`, write. A passing check verifies the fact; that is enough. (If a
-//! later item adds an optional `--witness-cmd` for parity with `add`, it belongs
-//! here as a convenience, never a gate.)
+//! A passing check verifies the fact (invariant #5): witnessing a check go red is an
+//! optional confidence signal, never a gate. Amend takes the same path as `add`'s
+//! default — apply the overlay, run the amended check, require `Held`, write — and
+//! simply does not offer the witness flag, because amend most often runs mid-drift on
+//! a dirty tree, where the value is fixing the fact with the least ceremony. (If a
+//! later item wants parity with `add`'s optional `--witness-cmd`, it belongs here as
+//! a convenience, run in an isolated worktree, never a gate.)
 //!
 //! # The overlay, and what must change
 //!
@@ -86,8 +82,8 @@ struct AmendReport {
     to_commit: Vec<String>,
 }
 
-/// Run `claim amend`. See the module docs for the require-`Held` guarantee and the
-/// deliberate absence of witnessed-red.
+/// Run `claim amend`. See the module docs for the require-`Held` guarantee and why
+/// amend offers no `--witness-cmd`.
 ///
 /// # Errors
 ///

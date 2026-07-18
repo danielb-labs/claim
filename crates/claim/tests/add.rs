@@ -1,9 +1,11 @@
 //! Integration tests for `claim add`, run against a real temp git store.
 //!
-//! The witnessed-red workflow is exercised through its scriptable form
-//! (`--witness-cmd`/`--restore-cmd`), which is the mechanized, deterministic path;
-//! the interactive prompts are not driven here (they need a TTY), but the flags
-//! reach the same `witness`/`require_drift` logic.
+//! The default path runs the check once and writes on `Held`, touching nothing else
+//! in the tree. The optional `--witness-cmd` path is exercised through its scripted
+//! form, which perturbs an *isolated* throwaway worktree, never the caller's tree —
+//! the property asserted most sharply below (a dirty working-tree file survives a
+//! witnessed add untouched), because that is the data-loss regression this design
+//! makes impossible.
 
 mod common;
 
@@ -14,8 +16,6 @@ use predicates::prelude::*;
 const HOLDS: &str = "grep -q 'libfoo==4.2' requirements.txt";
 /// A command that makes the fact false by rewriting the pinned line.
 const MAKE_RED: &str = "echo 'libfoo==5.0' > requirements.txt";
-/// A command that restores the pinned line.
-const MAKE_GREEN: &str = "echo 'libfoo==4.2' > requirements.txt";
 
 /// A store-ready repo: init'd, one committed file the checks act on.
 fn ready_repo() -> TestRepo {
@@ -24,10 +24,10 @@ fn ready_repo() -> TestRepo {
     repo
 }
 
-// --- Happy path. ---
+// --- Happy path: the default is a single passing check, no tree perturbation. ---
 
 #[test]
-fn add_writes_the_claim_file_and_birth_log() {
+fn add_writes_the_claim_file_and_establishing_log() {
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -40,12 +40,9 @@ fn add_writes_the_claim_file_and_birth_log() {
             HOLDS,
             "--max-age",
             "120d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("witnessed red"))
         .stdout(predicate::str::contains("Created claim 'libfoo-pin'"))
         // The handoff anchors at the store root with `git -C`, so it works from a
         // subdirectory (M2).
@@ -59,37 +56,59 @@ fn add_writes_the_claim_file_and_birth_log() {
     assert!(file.contains("max-age: 120d"));
     assert!(file.contains("We pin libfoo at 4.2."));
 
-    // Two birth entries: a witnessed Drifted, then the establishing Held, in order,
-    // both carrying the resolved commit and actor.
+    // Exactly one birth entry: the establishing Held. The default path witnesses no
+    // red, so there is no separate drift entry.
     let entries = repo.log_entries("libfoo-pin");
-    assert_eq!(entries.len(), 2, "a witnessed add writes two entries");
-    assert_eq!(entries[0]["event"]["verdict"], "drifted");
-    assert_eq!(entries[1]["event"]["verdict"], "held");
-    for entry in &entries {
-        assert_eq!(entry["actor"], "Test User <test@example.com>");
-        let commit = entry["commit"].as_str().unwrap();
-        // A committed repo records the FULL 40-char sha (M3), config-independent —
-        // not the abbreviated form, and not the unborn sentinel.
-        assert_eq!(commit.len(), 40, "the recorded commit is the full sha");
-        assert_ne!(
-            commit, "0000000000000000000000000000000000000000",
-            "a committed repo resolves a real sha, not the unborn sentinel"
-        );
-        assert!(
-            commit.chars().all(|c| c.is_ascii_hexdigit()),
-            "the recorded commit is a hex sha"
-        );
-    }
+    assert_eq!(
+        entries.len(),
+        1,
+        "the default add writes one establishing entry"
+    );
+    assert_eq!(entries[0]["event"]["verdict"], "held");
+    let entry = &entries[0];
+    assert_eq!(entry["actor"], "Test User <test@example.com>");
+    let commit = entry["commit"].as_str().unwrap();
+    // A committed repo records the FULL 40-char sha (M3), config-independent — not
+    // the abbreviated form, and not the unborn sentinel.
+    assert_eq!(commit.len(), 40, "the recorded commit is the full sha");
+    assert_ne!(
+        commit, "0000000000000000000000000000000000000000",
+        "a committed repo resolves a real sha, not the unborn sentinel"
+    );
     assert!(
-        entries[0]["event"]["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("witnessed-red"),
-        "the drift entry records the witnessed-red evidence"
+        commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "the recorded commit is a hex sha"
     );
 
-    // The working tree was restored: the pin is back.
+    // The working tree is untouched by the default path: the pin is exactly as
+    // committed, and no worktree litter was left behind.
     assert_eq!(repo.read("requirements.txt"), "libfoo==4.2\n");
+}
+
+#[test]
+fn add_is_born_verified_with_a_single_hold() {
+    // The birth Held is the latest conclusive verdict, so the claim reads as fresh
+    // (verified), not drifted or stale. With no witnessed red there is only the one
+    // entry, and it is the pass.
+    let repo = ready_repo();
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "v",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+        ])
+        .assert()
+        .success();
+
+    let entries = repo.log_entries("v");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["event"]["verdict"], "held");
 }
 
 #[test]
@@ -108,8 +127,6 @@ fn add_json_shape_is_stable() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success()
@@ -122,7 +139,9 @@ fn add_json_shape_is_stable() {
     assert_eq!(v["id"], "c");
     assert_eq!(v["file"], ".claims/c.md");
     assert_eq!(v["verdict"], "held");
-    assert_eq!(v["witnessed_red"], true);
+    // The default path witnesses no red, so the confidence flag is false — a fully
+    // verified claim, not a penalized one.
+    assert_eq!(v["witnessed_red"], false);
     assert_eq!(v["actor"], "Test User <test@example.com>");
     // The root is present (M2) so a subdir caller can resolve the root-relative
     // `file`/`to_commit`. It is an absolute path to a directory that contains the
@@ -142,53 +161,41 @@ fn add_json_shape_is_stable() {
     // The commit is the full sha (M3), not the abbreviated form.
     assert_eq!(v["commit"].as_str().unwrap().len(), 40);
     let to_commit = v["to_commit"].as_array().unwrap();
-    assert_eq!(to_commit.len(), 3, "the file plus two log entries");
+    assert_eq!(
+        to_commit.len(),
+        2,
+        "the file plus one establishing log entry"
+    );
     assert_eq!(to_commit[0], ".claims/c.md");
 }
 
 #[test]
-fn add_produces_a_born_verified_claim() {
-    // The birth Held must be the latest conclusive verdict, so the claim reads as
-    // fresh — not left Drifted by the witnessed red. Asserted through the log order
-    // the status computation depends on: entries[] is filename-sorted, and the
-    // filename leads with the (fixed-width, chronological) stamp, so entries[1] is
-    // the later one and it must be the Held.
+fn add_succeeds_in_a_dirty_tree_without_witness() {
+    // The default path never touches or inspects the working tree beyond writing the
+    // claim, so a dirty tree is fine and the pre-existing edit survives.
     let repo = ready_repo();
+    repo.write("requirements.txt", "libfoo==4.2\nDIRTY EDIT\n");
+
     repo.claim()
         .args([
             "add",
             "--id",
-            "v",
+            "d",
             "--statement",
             "S.",
             "--run",
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success();
 
-    let entries = repo.log_entries("v");
-    assert_eq!(entries.len(), 2);
+    assert!(repo.exists(".claims/d.md"));
     assert_eq!(
-        entries[0]["event"]["verdict"], "drifted",
-        "the earlier entry (by fixed-width stamp) is the witnessed drift"
-    );
-    assert_eq!(
-        entries[1]["event"]["verdict"], "held",
-        "the later entry is the establishing Held, so the claim is born verified"
-    );
-    // And the parsed instants confirm strict ordering (a string compare would be
-    // wrong: jiff drops trailing zeros, so `.204367Z` vs `.204367001Z` do not
-    // compare lexically).
-    let drift_at: claim_core::Timestamp = entries[0]["at"].as_str().unwrap().parse().unwrap();
-    let held_at: claim_core::Timestamp = entries[1]["at"].as_str().unwrap().parse().unwrap();
-    assert!(
-        held_at > drift_at,
-        "the establishing Held ({held_at}) must be strictly after the witnessed Drift ({drift_at})"
+        repo.read("requirements.txt"),
+        "libfoo==4.2\nDIRTY EDIT\n",
+        "the default path leaves the dirty tree exactly as it was"
     );
 }
 
@@ -206,8 +213,6 @@ fn namespaced_id_nests_the_file() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success();
@@ -220,10 +225,8 @@ fn namespaced_id_nests_the_file() {
 #[test]
 fn negate_when_and_supports_render_and_round_trip() {
     // The whole authoring surface: a negate check on a cadence trigger with two
-    // supports (a decision ref with a `#`, and a bare claim id). The negate sense
-    // is exercised honestly — the check exits 1 (Held under negate) on the true
-    // tree and exits 0 (Drifted under negate) when the forbidden pin appears — so
-    // the witnessed-red proves the inverted check discriminates too.
+    // supports (a decision ref with a `#`, and a bare claim id). The negate sense is
+    // exercised honestly — the check exits 1 (Held under negate) on the true tree.
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -243,8 +246,6 @@ fn negate_when_and_supports_render_and_round_trip() {
             "requirements.txt#libfoo",
             "--supports",
             "other-claim",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success();
@@ -265,11 +266,11 @@ fn negate_when_and_supports_render_and_round_trip() {
         "a bare id is rendered: {file}"
     );
 
-    // The rendered file is valid: the store contains it and the log recorded the
-    // witnessed drift under the inverted sense.
+    // The rendered file is valid and the establishing Held was recorded under the
+    // inverted sense.
     let entries = repo.log_entries("payments/pin");
-    assert_eq!(entries[0]["event"]["verdict"], "drifted");
-    assert_eq!(entries[1]["event"]["verdict"], "held");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["event"]["verdict"], "held");
 }
 
 // --- Rejections. ---
@@ -287,8 +288,6 @@ fn rejects_duplicate_id() {
         HOLDS,
         "--max-age",
         "30d",
-        "--witness-cmd",
-        MAKE_RED,
     ];
     repo.claim().args(args).assert().success();
     repo.claim()
@@ -322,8 +321,6 @@ fn rejects_an_id_already_declared_in_a_differently_named_file() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -334,8 +331,9 @@ fn rejects_an_id_already_declared_in_a_differently_named_file() {
 }
 
 #[test]
-fn rejects_a_green_run_that_is_drifted() {
-    // The fact is already false: the grep is for a pin that is not present.
+fn rejects_a_check_that_is_drifted() {
+    // The fact is already false: the grep is for a pin that is not present. Recording
+    // an already-false fact is refused — that guarantee stays.
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -348,8 +346,6 @@ fn rejects_a_green_run_that_is_drifted() {
             "grep -q 'libfoo==9.9' requirements.txt",
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -362,7 +358,7 @@ fn rejects_a_green_run_that_is_drifted() {
 }
 
 #[test]
-fn rejects_a_green_run_that_is_broken() {
+fn rejects_a_check_that_is_broken() {
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -375,8 +371,6 @@ fn rejects_a_green_run_that_is_broken() {
             "this-binary-does-not-exist-anywhere",
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -398,8 +392,6 @@ fn rejects_an_invalid_id() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -422,8 +414,6 @@ fn rejects_an_invalid_max_age() {
             HOLDS,
             "--max-age",
             "banana",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -446,8 +436,6 @@ fn rejects_when_no_store_exists() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)
@@ -460,10 +448,26 @@ fn rejects_a_missing_required_field_without_a_tty() {
     // rather than hang on a prompt.
     let repo = ready_repo();
     repo.claim()
+        .args(["add", "--id", "x", "--run", HOLDS, "--max-age", "30d"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--statement"));
+}
+
+// --- Optional witnessed-red: extra confidence, in an isolated worktree. ---
+
+#[test]
+fn witness_cmd_records_the_observed_red_as_evidence() {
+    // `--witness-cmd` makes the fact false in a throwaway worktree; the check goes
+    // Drifted there, and that observation is recorded on the establishing entry.
+    let repo = ready_repo();
+    repo.claim()
         .args([
             "add",
             "--id",
-            "x",
+            "real",
+            "--statement",
+            "S.",
             "--run",
             HOLDS,
             "--max-age",
@@ -472,17 +476,125 @@ fn rejects_a_missing_required_field_without_a_tty() {
             MAKE_RED,
         ])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--statement"));
+        .success()
+        .stderr(predicate::str::contains("witnessed red"))
+        .stdout(predicate::str::contains(
+            "witnessed failing in an isolated worktree",
+        ));
+
+    // Still one entry (the establishing Held), now carrying the witnessed-red note.
+    let entries = repo.log_entries("real");
+    assert_eq!(
+        entries.len(),
+        1,
+        "witnessing adds evidence to the establishing entry, not a second entry"
+    );
+    assert_eq!(entries[0]["event"]["verdict"], "held");
+    assert!(
+        entries[0]["event"]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("witnessed-red"),
+        "the establishing entry records the witnessed-red evidence"
+    );
 }
 
-// --- Witnessed-red: the heart of invariant #5. ---
+#[test]
+fn witness_cmd_json_marks_witnessed_red_true() {
+    let repo = ready_repo();
+    let output = repo
+        .claim()
+        .args([
+            "--json",
+            "add",
+            "--id",
+            "w",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["witnessed_red"], true);
+    assert_eq!(v["status"], "ok");
+    // Only the file and one log entry are ever written; the witness added no entry.
+    assert_eq!(v["to_commit"].as_array().unwrap().len(), 2);
+}
 
 #[test]
-fn refuses_when_the_check_does_not_go_red() {
-    // The default path REQUIRES an observed Drifted. A check that stays Held after
-    // the perturbation (here: `true`, which ignores the tree) is decoration and is
-    // refused — nothing is written.
+fn witness_cmd_never_touches_the_working_tree() {
+    // THE data-loss regression that must now be impossible. A pre-existing
+    // uncommitted edit to a tracked file — the exact thing the old mandatory restore
+    // could destroy — MUST survive a witnessed add untouched, because the witness
+    // perturbs only an isolated worktree. Also: the tree the check acts on is
+    // unchanged, and no worktree litter is left in the repo.
+    let repo = ready_repo();
+    // A tracked file with committed content, then an uncommitted edit the user cares
+    // about.
+    repo.write("notes.txt", "committed content\n");
+    repo.git(&["add", "notes.txt"]);
+    repo.git(&["commit", "-q", "-m", "add notes"]);
+    repo.write("notes.txt", "MY UNCOMMITTED EDIT\n");
+    // A pre-existing untracked file too, which a `git clean`-style restore would eat.
+    repo.write("scratch-untracked.txt", "keep me\n");
+
+    repo.claim()
+        .args([
+            "add",
+            "--id",
+            "safe",
+            "--statement",
+            "S.",
+            "--run",
+            HOLDS,
+            "--max-age",
+            "30d",
+            "--witness-cmd",
+            MAKE_RED,
+        ])
+        .assert()
+        .success();
+
+    // The uncommitted tracked edit is exactly as the user left it.
+    assert_eq!(
+        repo.read("notes.txt"),
+        "MY UNCOMMITTED EDIT\n",
+        "a witnessed add must not revert the user's uncommitted work"
+    );
+    // The untracked file survived.
+    assert_eq!(
+        repo.read("scratch-untracked.txt"),
+        "keep me\n",
+        "a witnessed add must not delete untracked files"
+    );
+    // The file the perturbation rewrote (in isolation) is back to the committed pin
+    // in the real tree — the perturbation never reached here.
+    assert_eq!(
+        repo.read("requirements.txt"),
+        "libfoo==4.2\n",
+        "the witness perturbation was confined to the isolated worktree"
+    );
+    // No leftover worktree checkout in the repo.
+    assert!(
+        !repo.exists("requirements.txt.orig") && repo.exists(".claims/safe.md"),
+        "the claim was written and no perturbation artifact leaked into the repo"
+    );
+}
+
+#[test]
+fn refuses_when_the_witnessed_check_does_not_go_red() {
+    // `--witness-cmd` requires an observed Drifted. A check that stays Held after the
+    // perturbation (here: `true`, which ignores the tree) cannot be confirmed to
+    // discriminate, so the witnessed add is refused — nothing is written.
     let repo = ready_repo();
     repo.claim()
         .args([
@@ -503,7 +615,7 @@ fn refuses_when_the_check_does_not_go_red() {
         .stderr(predicate::str::contains("still reports Held"));
     assert!(
         !repo.exists(".claims/decoration.md"),
-        "a check that never goes red must not be recorded"
+        "a check that never goes red under --witness-cmd must not be recorded"
     );
     assert!(
         repo.path()
@@ -515,16 +627,17 @@ fn refuses_when_the_check_does_not_go_red() {
 }
 
 #[test]
-fn witnessed_red_succeeds_when_the_check_actually_goes_red() {
-    // The positive of the pair: the same MAKE_RED perturbation the decoration check
-    // ignored does drive a real grep to Drifted, so the add succeeds and records the
-    // witnessed red.
-    let repo = ready_repo();
+fn witness_cmd_is_refused_on_an_unborn_head() {
+    // The isolated worktree checks out a commit, which an unborn repo does not have.
+    // `--witness-cmd` is refused with the fix; the default (no-witness) path would
+    // still work here.
+    let repo = TestRepo::unborn();
+    repo.claim().arg("init").assert().success();
     repo.claim()
         .args([
             "add",
             "--id",
-            "real",
+            "fresh",
             "--statement",
             "S.",
             "--run",
@@ -533,279 +646,15 @@ fn witnessed_red_succeeds_when_the_check_actually_goes_red() {
             "30d",
             "--witness-cmd",
             MAKE_RED,
-        ])
-        .assert()
-        .success();
-    let entries = repo.log_entries("real");
-    assert_eq!(entries[0]["event"]["verdict"], "drifted");
-}
-
-#[test]
-fn refuses_when_the_tree_is_not_restored_to_green() {
-    // If restoration leaves the fact false, the confirm-green run is not Held and the
-    // add is refused. A --restore-cmd that does not actually restore stages this.
-    let repo = ready_repo();
-    repo.claim()
-        .args([
-            "add",
-            "--id",
-            "norestore",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--witness-cmd",
-            MAKE_RED,
-            "--restore-cmd",
-            "true", // does nothing; pin stays broken
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("not restored"));
-    assert!(!repo.exists(".claims/norestore.md"));
-}
-
-#[test]
-fn unwitnessed_records_the_claim_marked_unverified() {
-    // The escape hatch: no witnessed red, but the claim is recorded with a loud
-    // note and a warning, never silently trusted.
-    let repo = ready_repo();
-    repo.claim()
-        .args([
-            "add",
-            "--id",
-            "uw",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--unwitnessed",
-        ])
-        .assert()
-        .success()
-        // The warning reaches the human on stderr (m2), never contaminating stdout.
-        .stderr(predicate::str::contains("warning:"))
-        .stderr(predicate::str::contains("unwitnessed"));
-
-    // Exactly one entry (the establishing Held), and it is marked unwitnessed so a
-    // later `list --unverified` can surface it.
-    let entries = repo.log_entries("uw");
-    assert_eq!(entries.len(), 1, "unwitnessed writes only the birth Held");
-    assert_eq!(entries[0]["event"]["verdict"], "held");
+        .stderr(predicate::str::contains("unborn HEAD"))
+        .stderr(predicate::str::contains("--witness-cmd"));
     assert!(
-        entries[0]["event"]["evidence"]
-            .as_str()
-            .unwrap()
-            .contains("unwitnessed"),
-        "the log itself records that the check was never witnessed failing"
+        !repo.exists(".claims/fresh.md"),
+        "nothing written on refusal"
     );
-}
-
-#[test]
-fn unwitnessed_json_marks_witnessed_red_false() {
-    let repo = ready_repo();
-    let output = repo
-        .claim()
-        .args([
-            "--json",
-            "add",
-            "--id",
-            "uwj",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--unwitnessed",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(v["witnessed_red"], false);
-    assert_eq!(v["status"], "ok");
-}
-
-#[test]
-fn json_add_without_a_witness_is_refused() {
-    // --json implies a script with no TTY; witnessing needs either --witness-cmd or
-    // --unwitnessed. Neither given, it must refuse rather than hang.
-    let repo = ready_repo();
-    repo.claim()
-        .args([
-            "--json",
-            "add",
-            "--id",
-            "x",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-        ])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("witness"));
-}
-
-// --- C1 (Critical): the default restore must never destroy the user's work. ---
-
-#[test]
-fn refuses_a_dirty_tracked_tree_and_leaves_edits_intact() {
-    // C1 regression. A repo is normally dirty when a claim is added. The default
-    // witnessed-red restore is `git checkout`, which reverts EVERY tracked file — so
-    // a pre-existing uncommitted edit to a tracked file would be silently destroyed.
-    // The add MUST refuse before perturbing, and the edit MUST survive untouched.
-    let repo = ready_repo();
-    // A tracked file with committed content, then an uncommitted edit the user cares
-    // about.
-    repo.write("notes.txt", "committed content\n");
-    repo.git(&["add", "notes.txt"]);
-    repo.git(&["commit", "-q", "-m", "add notes"]);
-    repo.write("notes.txt", "MY UNCOMMITTED EDIT\n");
-
-    repo.claim()
-        .args([
-            "add",
-            "--id",
-            "x",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--witness-cmd",
-            MAKE_RED,
-        ])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("uncommitted changes"))
-        .stderr(predicate::str::contains("stash"));
-
-    // The user's edit survived: the guard refused before any git checkout ran.
-    assert_eq!(
-        repo.read("notes.txt"),
-        "MY UNCOMMITTED EDIT\n",
-        "the pre-existing edit must not be reverted"
-    );
-    assert!(
-        !repo.exists(".claims/x.md"),
-        "nothing is written on refusal"
-    );
-}
-
-#[test]
-fn dirty_tree_json_error_kind_is_dirty_tree() {
-    // The dirty-tree refusal carries the stable machine kind, so a scripting caller
-    // can branch on it (m5) instead of matching prose.
-    let repo = ready_repo();
-    repo.write("requirements.txt", "libfoo==4.2\nDIRTY EDIT\n");
-    let output = repo
-        .claim()
-        .args([
-            "--json",
-            "add",
-            "--id",
-            "x",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--witness-cmd",
-            MAKE_RED,
-        ])
-        .assert()
-        .code(2)
-        .get_output()
-        .stderr
-        .clone();
-    let v: serde_json::Value = serde_json::from_slice(&output).expect("error json on stderr");
-    assert_eq!(v["status"], "error");
-    assert_eq!(v["kind"], "dirty-tree");
-}
-
-#[test]
-fn a_dirty_tree_is_allowed_with_an_explicit_restore_cmd() {
-    // `--restore-cmd` opts out of the git restore — the author's own inverse is
-    // trusted not to clobber unrelated work — so a dirty tree is permitted there.
-    // The unrelated edit survives because the restore only touches what the witness
-    // touched.
-    let repo = ready_repo();
-    repo.write("unrelated.txt", "committed\n");
-    repo.git(&["add", "unrelated.txt"]);
-    repo.git(&["commit", "-q", "-m", "add unrelated"]);
-    repo.write("unrelated.txt", "my dirty edit\n");
-
-    repo.claim()
-        .args([
-            "add",
-            "--id",
-            "ok",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--witness-cmd",
-            MAKE_RED,
-            "--restore-cmd",
-            MAKE_GREEN,
-        ])
-        .assert()
-        .success();
-    assert!(repo.exists(".claims/ok.md"));
-    assert_eq!(
-        repo.read("unrelated.txt"),
-        "my dirty edit\n",
-        "the explicit restore only undoes the witness, leaving unrelated work"
-    );
-}
-
-// --- M4: the default restore must not delete untracked files (no `git clean`). ---
-
-#[test]
-fn default_restore_preserves_untracked_files() {
-    // M4 regression. This fails if the default restore ever becomes `git clean -fd`
-    // (which deletes untracked files, and the store dirs it recreates would hide the
-    // loss). A pre-existing untracked file must survive a witnessed add on the
-    // default-restore path.
-    let repo = ready_repo();
-    repo.write("scratch-untracked.txt", "keep me\n");
-
-    repo.claim()
-        .args([
-            "add",
-            "--id",
-            "keeps-untracked",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-            "--witness-cmd",
-            MAKE_RED,
-        ])
-        .assert()
-        .success();
-
-    assert!(
-        repo.exists("scratch-untracked.txt"),
-        "an untracked file must survive the default restore (no git clean)"
-    );
-    assert_eq!(repo.read("scratch-untracked.txt"), "keep me\n");
 }
 
 // --- M1: `--json` stdout stays a single clean JSON object even if the witness
@@ -813,8 +662,8 @@ fn default_restore_preserves_untracked_files() {
 
 #[test]
 fn json_stdout_is_clean_even_when_the_witness_prints() {
-    // M1 regression. The witness/restore commands run via `sh -c` inheriting stdout;
-    // a witness that echoes (most real ones do) would contaminate the JSON on stdout.
+    // M1 regression. The witness command runs via `sh -c` inheriting stdout; a
+    // witness that echoes (most real ones do) would contaminate the JSON on stdout.
     // The ENTIRE stdout must parse as one JSON object.
     let repo = ready_repo();
     let output = repo
@@ -874,8 +723,6 @@ fn handoff_and_root_work_from_a_subdirectory() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .success()
@@ -923,8 +770,6 @@ fn discovery_does_not_adopt_a_store_across_the_git_boundary() {
             "true",
             "--max-age",
             "30d",
-            "--witness-cmd",
-            "false",
         ])
         .assert()
         .code(2)
@@ -953,8 +798,6 @@ fn corrupt_head_is_loud_not_masked_as_unborn() {
             "true",
             "--max-age",
             "30d",
-            "--witness-cmd",
-            "false",
         ])
         .assert()
         .code(2)
@@ -982,8 +825,6 @@ fn error_json_carries_a_stable_kind() {
         HOLDS,
         "--max-age",
         "30d",
-        "--witness-cmd",
-        MAKE_RED,
     ];
     repo.claim().args(dup).assert().success();
     assert_error_kind(&repo, &dup, "duplicate-id");
@@ -1002,13 +843,11 @@ fn error_json_carries_a_stable_kind() {
             "grep -q 'nope' requirements.txt",
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ],
         "drifted-green",
     );
 
-    // not-witnessed: the check does not go red.
+    // not-witnessed: the check does not go red under --witness-cmd.
     assert_error_kind(
         &repo,
         &[
@@ -1045,43 +884,31 @@ fn assert_error_kind(repo: &TestRepo, args: &[&str], expected_kind: &str) {
     assert_eq!(v["kind"], expected_kind, "kind for args {args:?}");
 }
 
-// --- m1: non-TTY human-mode with no witness flags refuses clearly. ---
+// --- m1: non-TTY human-mode with a missing field refuses clearly. ---
 
 #[test]
-fn non_tty_human_mode_without_witness_flags_refuses_clearly() {
-    // m1 regression. Without a TTY and without --witness-cmd/--unwitnessed, the
-    // interactive path is impossible; it must refuse pointing at the flags, not die
-    // with a confusing "input ended". assert_cmd provides no TTY.
+fn non_tty_human_mode_with_a_missing_field_refuses_clearly() {
+    // m1 regression. Without a TTY and with a required field absent, prompting is
+    // impossible; it must refuse pointing at the flag, not die with a confusing
+    // "input ended". assert_cmd provides no TTY. (The witness flow is no longer
+    // required, so a fully-specified add needs no TTY at all.)
     let repo = ready_repo();
     repo.claim()
-        .args([
-            "add",
-            "--id",
-            "x",
-            "--statement",
-            "S.",
-            "--run",
-            HOLDS,
-            "--max-age",
-            "30d",
-        ])
+        .args(["add", "--id", "x", "--run", HOLDS, "--max-age", "30d"])
         .write_stdin("") // non-TTY stdin
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("not a TTY"))
-        .stderr(predicate::str::contains("--witness-cmd"))
-        .stderr(predicate::str::contains("--unwitnessed"));
+        .stderr(predicate::str::contains("--statement"));
 }
 
-// --- Git edge: unborn HEAD. ---
+// --- Git edge: unborn HEAD (default path). ---
 
 #[test]
 fn add_on_an_unborn_head_uses_the_sentinel_commit() {
     // A brand-new repo with no commit yet. HEAD does not resolve, so the birth
     // verdict records the documented all-zero sentinel — and, critically, a
     // non-empty commit, so the entry is valid (claim-core rejects an empty commit).
-    // The perturbation creates no untracked file to worry the git restore, but
-    // there is no commit to `git checkout` from, so --restore-cmd supplies the undo.
+    // The default path needs no worktree and no commit, so it works on an unborn HEAD.
     let repo = TestRepo::unborn();
     repo.claim().arg("init").assert().success();
     repo.claim()
@@ -1095,23 +922,18 @@ fn add_on_an_unborn_head_uses_the_sentinel_commit() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
-            "--restore-cmd",
-            MAKE_GREEN,
         ])
         .assert()
         .success();
 
     let entries = repo.log_entries("fresh");
-    for entry in &entries {
-        // The sentinel is the full 40-char null object name — non-empty (so the
-        // entry is valid) and width-consistent with a real sha.
-        assert_eq!(
-            entry["commit"], "0000000000000000000000000000000000000000",
-            "an unborn HEAD records the documented 40-char sentinel"
-        );
-    }
+    assert_eq!(entries.len(), 1);
+    // The sentinel is the full 40-char null object name — non-empty (so the entry is
+    // valid) and width-consistent with a real sha.
+    assert_eq!(
+        entries[0]["commit"], "0000000000000000000000000000000000000000",
+        "an unborn HEAD records the documented 40-char sentinel"
+    );
 }
 
 #[test]
@@ -1138,8 +960,6 @@ fn add_fails_with_no_git_identity() {
             HOLDS,
             "--max-age",
             "30d",
-            "--witness-cmd",
-            MAKE_RED,
         ])
         .assert()
         .code(2)

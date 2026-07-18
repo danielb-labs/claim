@@ -107,4 +107,15 @@ pub enum GitError {
         /// The underlying spawn error.
         source: std::io::Error,
     },
+
+    /// A filesystem fault while preparing a temporary worktree for the optional
+    /// witnessed-red dance — the temp directory could not be created. Distinct from
+    /// a git command failure so the message can name the path.
+    #[error("{context}: {source}")]
+    Io {
+        /// What was being attempted, naming the path, so the message is actionable.
+        context: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 }

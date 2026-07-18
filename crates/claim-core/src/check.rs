@@ -252,12 +252,13 @@ impl CheckOutcome {
 /// ages toward a human (invariant #6). The exhaustive `match` on [`CheckKind`]
 /// means a future kind cannot be added without a decision here being forced.
 ///
-/// This is the primitive `claim add`'s witnessed-red workflow (item 4) will call
-/// twice: once against the true state, expecting [`Verdict::Held`], and once
-/// against a perturbed state, expecting [`Verdict::Drifted`], to prove the check
-/// can actually go red before it is trusted. The signature is kept convenient for
-/// that — a borrowed check and context in, a plain outcome out, no I/O setup the
-/// caller must thread through.
+/// This is the primitive every verb that runs a check builds on: `claim add` and
+/// `claim amend` call it against the current tree expecting [`Verdict::Held`], and
+/// `add`'s optional `--witness-cmd` calls it again inside an isolated worktree
+/// expecting [`Verdict::Drifted`] to confirm the check discriminates. The signature
+/// is kept convenient — a borrowed check and context in, a plain outcome out, no I/O
+/// setup the caller must thread through — and the context's `cwd` is what lets the
+/// same primitive run against either the real tree or a throwaway worktree.
 #[must_use]
 pub fn run_check(check: &Check, ctx: &CheckContext) -> CheckOutcome {
     match &check.kind {
