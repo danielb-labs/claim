@@ -1,0 +1,10 @@
+{
+  "at": "2026-07-18T07:48:03.429664Z",
+  "commit": "3bb2ea61a720465cf937c1453eebb0b37562601f",
+  "actor": "Daniel Balagula <daniel.balagula@pm.me>",
+  "event": {
+    "type": "verification",
+    "verdict": "held",
+    "evidence": "witnessed-red: the check was observed reporting Drifted against a perturbed isolated worktree at `claim add` time, proving it detects this fact going false"
+  }
+}
