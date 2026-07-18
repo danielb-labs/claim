@@ -1,11 +1,17 @@
-//! `claim check`: run every claim's checks and report their verdicts.
+//! `claim check`: run the selected claims' checks and report their verdicts.
 //!
 //! This is the runtime verifier — the verb that turns a pile of checks into
-//! `held`/`drifted`/`broken` right now. It runs every claim's checks through
+//! `held`/`drifted`/`broken` right now. It runs each selected claim's checks through
 //! [`claim_core::run_check`] and reports the outcome (human, or `--json`). It
 //! stores nothing: a verdict is telemetry a hub ingests, not source (see
 //! `docs/design/CLI-HUB-BOUNDARY.md`). The `--json` output *is* the interface a
 //! hub, a CI lane, or a person consumes.
+//!
+//! By default every claim runs. Positional ids and `--path` (see [`select`]) narrow
+//! the run to their union, so a CI step can verify a cheap subset on a PR and leave
+//! the rest to a scheduled run. A named id must exist (an unknown id is a usage error,
+//! exit 2); a `--path` that matches nothing is not an error, and the report says "no
+//! claims match" rather than a false "all held" (invariant #6).
 //!
 //! Two honesty properties are load-bearing and tested:
 //!
@@ -33,7 +39,7 @@
 //! `2`. Callers script on this (CI gates on non-zero, a report run gates on `2` for
 //! "broken" versus `1` for "review").
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use claim_core::{
     evaluate_skip, resolve_supports, run_check, CheckContext, ClaimId, ProcessEnd, SkipDecision,
     SupportResolution, Verdict,
@@ -42,7 +48,9 @@ use serde::Serialize;
 
 use crate::cli::CheckArgs;
 use crate::output::{emit, verdict_label, Format};
-use claim_store::{agent_runner_from_env, discover, LoadError, LoadedClaim, Store};
+use claim_store::{
+    agent_runner_from_env, claim_matches_path, discover, LoadError, LoadedClaim, Store,
+};
 
 /// The exit code when every check held and every support resolved.
 const EXIT_OK: i32 = 0;
@@ -53,19 +61,26 @@ const EXIT_REVIEW: i32 = 1;
 /// `main` also maps to this value).
 const EXIT_BROKEN: i32 = 2;
 
-/// Run `claim check`: run every claim's checks and report. See the module docs for
-/// the exit-code contract.
+/// Run `claim check`: run the selected claims' checks and report. See the module
+/// docs for the exit-code contract.
+///
+/// Selection is the union of the positional `ids` and `--path` (see [`select`]).
+/// Given neither, every claim runs.
 ///
 /// # Errors
 ///
-/// Fails (exit 2) when no store is found or a claim file cannot be parsed. A drift,
-/// an unverifiable verdict, a broken check, or an unresolved support is *not* an
-/// error — those are the verb's normal findings and set the returned exit code.
-pub fn run(_args: &CheckArgs, format: Format) -> Result<i32> {
+/// Fails (exit 2) when no store is found, a claim file cannot be parsed, or a
+/// positional id names no loaded claim (a usage error — a typo must be loud, never a
+/// silent pass). A drift, an unverifiable verdict, a broken check, or an unresolved
+/// support is *not* an error — those are the verb's normal findings and set the
+/// returned exit code.
+pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
     let load = store.load_all()?;
     let known_ids: Vec<ClaimId> = load.claims.iter().map(|c| c.claim.id.clone()).collect();
+
+    let selected = select(args, &load.claims)?;
 
     // One clock for the whole run, read once, so every skip's `until` is evaluated
     // against the same instant.
@@ -83,8 +98,8 @@ pub fn run(_args: &CheckArgs, format: Format) -> Result<i32> {
         now,
     };
 
-    let mut results = Vec::with_capacity(load.claims.len());
-    for loaded in &load.claims {
+    let mut results = Vec::with_capacity(selected.len());
+    for loaded in selected {
         results.push(check_one(&run, loaded));
     }
 
@@ -95,6 +110,50 @@ pub fn run(_args: &CheckArgs, format: Format) -> Result<i32> {
     let exit = overall_exit(&results).max(if has_faults { EXIT_BROKEN } else { EXIT_OK });
     report(format, &results, &load.errors, exit);
     Ok(exit)
+}
+
+/// The claims to check, resolved from the selectors against the loaded corpus.
+///
+/// - Neither `ids` nor `--path` given → every loaded claim (unchanged behavior).
+/// - Given, the selected set is the **union**: a claim is kept if its id was named
+///   *or* its file/`supports` path is under `--path`.
+///
+/// # Errors
+///
+/// Every positional id must resolve to a real loaded claim: a named id asserts "this
+/// claim exists," so any id matching no claim is a usage error (exit 2) naming every
+/// unresolved id — a typo must be loud, never a silent no-op. A `--path` matching
+/// zero claims is *not* an error (a path is a filter, not an existence assertion); it
+/// yields an empty selection, which [`report`] renders as "no claims match."
+fn select<'a>(args: &CheckArgs, claims: &'a [LoadedClaim]) -> Result<Vec<&'a LoadedClaim>> {
+    if args.ids.is_empty() && args.path.is_none() {
+        return Ok(claims.iter().collect());
+    }
+
+    let unresolved: Vec<&String> = args
+        .ids
+        .iter()
+        .filter(|id| !claims.iter().any(|c| c.claim.id.as_str() == id.as_str()))
+        .collect();
+    if !unresolved.is_empty() {
+        let named = unresolved
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!("no claim with id {named}"));
+    }
+
+    Ok(claims
+        .iter()
+        .filter(|c| {
+            args.ids.iter().any(|id| id.as_str() == c.claim.id.as_str())
+                || args
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| claim_matches_path(&c.path, &c.claim.supports, p))
+        })
+        .collect())
 }
 
 /// The run-wide inputs every claim's check shares, resolved once.
@@ -276,21 +335,47 @@ fn overall_exit(results: &[ClaimResult]) -> i32 {
     results.iter().map(|r| r.exit).max().unwrap_or(EXIT_OK)
 }
 
+/// How much of a run actually happened: verdict-bearing checks that ran versus
+/// declared skips that suppressed a check this run. The two are counted, not
+/// inferred, so a hub — and the human summary — can see "this run verified nothing"
+/// without re-deriving it. A skip is not a pass, so `ran == 0` is never "all held"
+/// (invariant #6).
+#[derive(Debug, Clone, Copy, Serialize)]
+struct RunTally {
+    /// Checks that produced a verdict (across every selected claim).
+    ran: usize,
+    /// Checks whose declared skip suppressed them this run.
+    skipped: usize,
+}
+
+impl RunTally {
+    /// Tally the ran and skipped checks across every selected claim.
+    fn of(results: &[ClaimResult]) -> Self {
+        RunTally {
+            ran: results.iter().map(|r| r.checks.len()).sum(),
+            skipped: results.iter().map(|r| r.skipped.len()).sum(),
+        }
+    }
+}
+
 /// Emit the check report: a JSON object in `--json` mode, an aligned human summary
 /// otherwise. `load_errors` are per-file load faults (malformed sibling, duplicate
 /// id) that floor the exit at 2 and are surfaced so a broken file nags without
 /// denying the store's whole report.
 fn report(format: Format, results: &[ClaimResult], load_errors: &[LoadError], exit: i32) {
+    let tally = RunTally::of(results);
     let report = CheckReport {
         status: "ok",
         exit,
         checked: results.len(),
+        ran: tally.ran,
+        skipped: tally.skipped,
         claims: results,
         errors: load_errors,
     };
 
     emit(format, &report, || {
-        human(results, load_errors, exit);
+        human(results, load_errors, tally, exit);
     })
     .unwrap_or_else(|e| {
         // A failure to *write output* is a real fault, but the checks already ran;
@@ -309,8 +394,15 @@ struct CheckReport<'a> {
     /// The overall exit code (0/1/2), duplicated in the process exit so a consumer
     /// that captured stdout need not also inspect `$?`.
     exit: i32,
-    /// How many claims were checked.
+    /// How many claims were checked (selected and evaluated).
     checked: usize,
+    /// How many checks produced a verdict this run, across every claim. `0` means the
+    /// run verified nothing — every selected check was skipped, or selection matched
+    /// no claim — which a consumer must not read as "all held" (invariant #6).
+    ran: usize,
+    /// How many checks a declared skip suppressed this run, across every claim. A skip
+    /// is not a pass; it is reported so a hub sees the deferral, never a silent mute.
+    skipped: usize,
     /// The per-claim results.
     claims: &'a [ClaimResult],
     /// Per-file load errors (a malformed claim file, a duplicate id): reported, not
@@ -321,9 +413,12 @@ struct CheckReport<'a> {
 
 /// Print the human summary: one block per claim, the load faults, then a one-line
 /// tally.
-fn human(results: &[ClaimResult], load_errors: &[LoadError], exit: i32) {
+fn human(results: &[ClaimResult], load_errors: &[LoadError], tally: RunTally, exit: i32) {
     if results.is_empty() && load_errors.is_empty() {
-        println!("No claims to check.");
+        // Selection matched no claim (an empty `--path`), or the store is empty. Either
+        // way nothing was verified — say so plainly, never "all held" (invariant #6).
+        // Phrased exactly as `claim list`'s empty line, so the two verbs agree.
+        println!("No claims match.");
         return;
     }
 
@@ -368,7 +463,7 @@ fn human(results: &[ClaimResult], load_errors: &[LoadError], exit: i32) {
         "Checked {} claim(s). Exit {}: {}.",
         results.len(),
         exit,
-        exit_meaning(exit)
+        exit_meaning(exit, tally)
     );
 }
 
@@ -383,12 +478,23 @@ fn first_evidence_line(evidence: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// A one-clause gloss of an exit code for the human tally.
-fn exit_meaning(exit: i32) -> &'static str {
+/// A one-clause gloss of the run's outcome for the human tally.
+///
+/// At exit 0 the wording is honest about how much actually ran: a skip is not a pass
+/// and zero checks run is not "all held" (invariant #6). So the clean-exit line
+/// distinguishes an all-held run, a partly-skipped run, and a run that verified
+/// nothing (every check skipped). Exit 1 and 2 are dominated by their finding — a
+/// drift, an unresolved support, a broken check — so the gloss names that; any skips
+/// are still visible per-claim above.
+fn exit_meaning(exit: i32, tally: RunTally) -> String {
     match exit {
-        EXIT_OK => "all held, all supports resolved",
-        EXIT_REVIEW => "review needed (drift, unverifiable, or unresolved support)",
-        _ => "a broken check or an unloadable claim file",
+        EXIT_OK => match (tally.ran, tally.skipped) {
+            (0, _) => "no checks ran (all skipped)".to_owned(),
+            (_, 0) => "all held, all supports resolved".to_owned(),
+            (_, n) => format!("held; {n} check(s) skipped"),
+        },
+        EXIT_REVIEW => "review needed (drift, unverifiable, or unresolved support)".to_owned(),
+        _ => "a broken check or an unloadable claim file".to_owned(),
     }
 }
 
@@ -475,6 +581,27 @@ mod tests {
         );
     }
 
+    fn skipped(reason: &str) -> SkippedCheck {
+        SkippedCheck {
+            reason: reason.to_owned(),
+            until: None,
+        }
+    }
+
+    /// A `ClaimResult` with the given verdict-bearing checks and skipped checks, so
+    /// `RunTally` and the summary can be exercised without running a subprocess.
+    fn claim_result(checks: Vec<CheckResult>, skipped: Vec<SkippedCheck>) -> ClaimResult {
+        let exit = claim_exit(&checks, &[]);
+        ClaimResult {
+            id: "c".to_owned(),
+            file: "f".to_owned(),
+            checks,
+            skipped,
+            supports: vec![],
+            exit,
+        }
+    }
+
     #[test]
     fn overall_is_the_highest_across_claims() {
         let mk = |exit: i32| ClaimResult {
@@ -493,5 +620,152 @@ mod tests {
         assert_eq!(overall_exit(&[mk(0), mk(0)]), EXIT_OK);
         // Nothing checked -> 0.
         assert_eq!(overall_exit(&[]), EXIT_OK);
+    }
+
+    #[test]
+    fn run_tally_counts_ran_and_skipped_across_claims() {
+        let results = [
+            claim_result(vec![held(), held()], vec![skipped("parked")]),
+            claim_result(vec![], vec![skipped("no runner")]),
+        ];
+        let tally = RunTally::of(&results);
+        assert_eq!(tally.ran, 2);
+        assert_eq!(tally.skipped, 2);
+    }
+
+    #[test]
+    fn exit_meaning_is_honest_about_skips_at_exit_zero() {
+        // The bug this fixes: a run with skips, or a run that verified nothing, must
+        // never read as "all held".
+        let all_held = RunTally { ran: 2, skipped: 0 };
+        assert_eq!(
+            exit_meaning(EXIT_OK, all_held),
+            "all held, all supports resolved"
+        );
+
+        let mixed = RunTally { ran: 1, skipped: 2 };
+        assert_eq!(exit_meaning(EXIT_OK, mixed), "held; 2 check(s) skipped");
+        assert!(!exit_meaning(EXIT_OK, mixed).contains("all held"));
+
+        let all_skipped = RunTally { ran: 0, skipped: 3 };
+        assert_eq!(
+            exit_meaning(EXIT_OK, all_skipped),
+            "no checks ran (all skipped)"
+        );
+        assert!(!exit_meaning(EXIT_OK, all_skipped).contains("all held"));
+
+        // Nothing selected and nothing skipped still verified nothing: not "all held".
+        let nothing = RunTally { ran: 0, skipped: 0 };
+        assert!(!exit_meaning(EXIT_OK, nothing).contains("all held"));
+    }
+
+    #[test]
+    fn the_all_skipped_gloss_never_leaks_out_of_the_exit_zero_arm() {
+        // The #17 safety rests on `exit_meaning` branching on `exit` *before* the tally,
+        // so "no checks ran (all skipped)" is reachable only at EXIT_OK. Pin that: a
+        // review or broken finding with zero verdict-bearing checks (every check skipped,
+        // plus an unresolved support or a broken sibling driving the exit) must report
+        // its finding, never mask it behind "all skipped". A future match-reorder that
+        // moved the tally check outward would fail here.
+        let none_ran = RunTally { ran: 0, skipped: 2 };
+        assert_eq!(
+            exit_meaning(EXIT_REVIEW, none_ran),
+            "review needed (drift, unverifiable, or unresolved support)"
+        );
+        assert_eq!(
+            exit_meaning(EXIT_BROKEN, none_ran),
+            "a broken check or an unloadable claim file"
+        );
+    }
+
+    /// A `LoadedClaim` with the given id and no supports, for exercising `select`
+    /// without a real store on disk.
+    fn loaded(id: &str) -> LoadedClaim {
+        let text =
+            format!("---\nid: {id}\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nStatement.\n");
+        LoadedClaim {
+            claim: claim_core::parse_claim_file(&format!(".claims/{id}.md"), &text).unwrap(),
+            path: format!(".claims/{id}.md"),
+        }
+    }
+
+    fn selected_ids(args: &CheckArgs, claims: &[LoadedClaim]) -> Vec<String> {
+        select(args, claims)
+            .unwrap()
+            .iter()
+            .map(|c| c.claim.id.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn no_selectors_runs_every_claim() {
+        let claims = [loaded("a"), loaded("b")];
+        let args = CheckArgs {
+            ids: vec![],
+            path: None,
+        };
+        assert_eq!(selected_ids(&args, &claims), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_single_id_selects_one_claim() {
+        let claims = [loaded("a"), loaded("b"), loaded("c")];
+        let args = CheckArgs {
+            ids: vec!["b".to_owned()],
+            path: None,
+        };
+        assert_eq!(selected_ids(&args, &claims), vec!["b"]);
+    }
+
+    #[test]
+    fn ids_and_path_select_the_union() {
+        let claims = [loaded("auth/x"), loaded("billing/y"), loaded("infra/z")];
+        // Named `infra/z` OR under `auth/` → both, never the intersection.
+        let args = CheckArgs {
+            ids: vec!["infra/z".to_owned()],
+            path: Some("auth".to_owned()),
+        };
+        let mut got = selected_ids(&args, &claims);
+        got.sort();
+        assert_eq!(got, vec!["auth/x", "infra/z"]);
+    }
+
+    #[test]
+    fn an_unknown_id_is_an_error_naming_it() {
+        let claims = [loaded("a")];
+        let args = CheckArgs {
+            ids: vec!["nope".to_owned()],
+            path: None,
+        };
+        let err = select(&args, &claims).unwrap_err().to_string();
+        assert!(err.contains("'nope'"), "the message names the id: {err}");
+    }
+
+    #[test]
+    fn every_unresolved_id_is_named() {
+        let claims = [loaded("a")];
+        let args = CheckArgs {
+            ids: vec!["x".to_owned(), "a".to_owned(), "y".to_owned()],
+            path: None,
+        };
+        let err = select(&args, &claims).unwrap_err().to_string();
+        assert!(
+            err.contains("'x'") && err.contains("'y'"),
+            "names both: {err}"
+        );
+        assert!(!err.contains("'a'"), "the resolved id is not named: {err}");
+    }
+
+    #[test]
+    fn a_path_matching_nothing_is_an_empty_selection_not_an_error() {
+        let claims = [loaded("auth/x")];
+        let args = CheckArgs {
+            ids: vec![],
+            path: Some("nowhere".to_owned()),
+        };
+        assert!(
+            selected_ids(&args, &claims).is_empty(),
+            "an empty path match yields no claims, and is not an error"
+        );
     }
 }

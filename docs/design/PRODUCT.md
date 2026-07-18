@@ -389,8 +389,9 @@ fact whose red can't be staged is verified by its passing check, never marked
 unverified for it. Running every check on every PR is cheap for a corpus of
 greps and closes the "invalidating change landed in a file nobody watched"
 hole by construction; when a store's checks get too slow for run-everything, a
-CI step will select a subset — once the CLI gains check selection (issue #19) —
-and the hub's scheduler runs the rest.
+CI step selects a subset — `claim check <id>…` by claim id, or `claim check
+--path <prefix>` for the claims about the files a PR touched — and the hub's
+scheduler runs the rest.
 
 ### The MCP server
 
