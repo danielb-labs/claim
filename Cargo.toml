@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
+# YAML for claim frontmatter. `serde_yaml` is archived; this is the chosen
+# maintained fork. See crates/claim-core/Cargo.toml for the rationale.
+serde_norway = "0.9"
 
 # A verification tool must never be slower than the checks it runs, but it also
 # must never trade correctness for speed. Optimize release builds; keep debug

@@ -31,5 +31,19 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Construct a [`Parse`](Error::Parse) error from a path and a reason.
+    ///
+    /// A small convenience so parsers can build the common error without naming
+    /// its fields at every call site. The reason should name the field and the
+    /// fix, not merely restate that something is wrong.
+    pub(crate) fn parse(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Error::Parse {
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// The crate's result alias.
 pub type Result<T> = std::result::Result<T, Error>;
