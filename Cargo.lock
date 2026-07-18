@@ -124,6 +124,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "claim-core",
+ "claim-store",
  "clap",
  "insta",
  "predicates",
@@ -151,6 +152,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "claim-core",
+]
+
+[[package]]
+name = "claim-store"
+version = "0.1.0"
+dependencies = [
+ "claim-core",
+ "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

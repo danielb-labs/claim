@@ -38,10 +38,10 @@ use claim_core::{
 use serde::Serialize;
 
 use crate::cli::CheckArgs;
-use crate::git;
 use crate::output::{emit, trigger_label, verdict_label, Format};
 use crate::scheduling::is_due;
-use crate::store::{discover, LoadError, LoadedClaim, Store};
+use claim_store as git;
+use claim_store::{discover, LoadError, LoadedClaim, Store};
 
 /// The exit code when every check held and every support resolved.
 const EXIT_OK: i32 = 0;

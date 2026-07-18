@@ -1,16 +1,16 @@
 //! Git provenance resolution: the `commit` and `actor` a verdict-log entry needs.
 //!
 //! The trust model derives provenance from git rather than from fields a claim
-//! file asserts about itself (invariant #3). When `claim add` writes the birth
-//! verdict, that entry must carry the commit the check was observed against and
-//! the identity of whoever observed it — both looked up here from the repository,
-//! not typed by the author.
+//! file asserts about itself (invariant #3). When a verdict is written, that entry
+//! must carry the commit the check was observed against and the identity of
+//! whoever observed it — both looked up here from the repository, not typed by the
+//! author. Shared so the CLI's write verbs and the MCP server's `report` resolve
+//! the same `commit`/`actor` and cannot disagree.
 //!
 //! Git is treated as the database (invariant #4), so this shells out to the `git`
 //! binary through [`std::process`] rather than linking a library: the repository
 //! on disk is the source of truth, and the same `git` a human runs is the one the
-//! tool consults. The helpers are kept small and reusable — later verbs (`check`,
-//! `drift`) resolve the same `commit`/`actor` when they append their own entries.
+//! tool consults.
 //!
 //! Two edges are handled deliberately, because [`claim_core::append_entry`] rejects
 //! an empty `commit` or `actor` and an untraceable verdict has no provenance:
@@ -34,7 +34,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use crate::error::GitError;
 
 /// The `commit` recorded when the store's repository has no commit yet (an unborn
 /// HEAD, immediately after `git init`).
@@ -66,11 +66,11 @@ pub const UNBORN_HEAD_SENTINEL: &str = "0000000000000000000000000000000000000000
 ///
 /// # Errors
 ///
-/// Fails when `dir` is not inside a git repository, when `HEAD` is present but
-/// corrupt (distinct from unborn), or when the `git` binary cannot be run, with a
-/// message naming the fix. Those are real misconfigurations for a git-native tool,
-/// not states to silently continue past.
-pub fn resolve_commit(dir: &Path) -> Result<String> {
+/// Returns [`GitError::UnresolvableHead`] when `dir` is not inside a git
+/// repository or when `HEAD` is present but corrupt (distinct from unborn), and
+/// [`GitError::Spawn`] when the `git` binary cannot be run. Those are real
+/// misconfigurations for a git-native tool, not states to silently continue past.
+pub fn resolve_commit(dir: &Path) -> Result<String, GitError> {
     let head = run_git(dir, &["rev-parse", "HEAD"])?;
     if let Some(sha) = head.success_stdout() {
         return Ok(sha);
@@ -92,12 +92,9 @@ pub fn resolve_commit(dir: &Path) -> Result<String> {
         }
     }
 
-    bail!(
-        "could not resolve HEAD in {} (not a git repository, or HEAD is corrupt); \
-         a claim store lives in a git repo — run `git init` or `claim` from inside \
-         your repository. If HEAD is corrupt, repair it before recording a verdict.",
-        dir.display()
-    )
+    Err(GitError::UnresolvableHead {
+        dir: dir.to_path_buf(),
+    })
 }
 
 /// Abbreviate a commit sha for human display, without touching the recorded value.
@@ -120,11 +117,11 @@ pub fn short_commit(sha: &str) -> String {
 ///
 /// # Errors
 ///
-/// Fails when either `user.name` or `user.email` is unset, naming the `git config`
-/// command to set it. An unattributed verdict has no provenance
-/// ([`claim_core::append_entry`] rejects an empty actor), so a missing identity is a
-/// loud error, not a silent blank.
-pub fn resolve_actor(dir: &Path) -> Result<String> {
+/// Returns [`GitError::MissingIdentity`] when either `user.name` or `user.email` is
+/// unset, naming the `git config` command to set it. An unattributed verdict has no
+/// provenance ([`claim_core::append_entry`] rejects an empty actor), so a missing
+/// identity is a loud error, not a silent blank.
+pub fn resolve_actor(dir: &Path) -> Result<String, GitError> {
     let name = git_config(dir, "user.name")?;
     let email = git_config(dir, "user.email")?;
     Ok(format!("{name} <{email}>"))
@@ -147,9 +144,9 @@ pub fn resolve_actor(dir: &Path) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Fails only if git cannot be run at all (not installed); a non-zero *diff* exit is
-/// the "dirty" signal, not an error.
-pub fn tracked_tree_is_dirty(dir: &Path) -> Result<bool> {
+/// Returns [`GitError::Spawn`] only if git cannot be run at all (not installed); a
+/// non-zero *diff* exit is the "dirty" signal, not an error.
+pub fn tracked_tree_is_dirty(dir: &Path) -> Result<bool, GitError> {
     // `diff --quiet` exits 1 when there is a difference, 0 when clean. Distinguish
     // that from a real spawn failure via GitOutput::ok being about the *exit*, not
     // the spawn (run_git already turns a spawn failure into an Err).
@@ -173,16 +170,11 @@ pub fn tracked_tree_is_dirty(dir: &Path) -> Result<bool> {
 ///
 /// # Errors
 ///
-/// Fails if the checkout fails (an unborn HEAD with an empty index has nothing to
-/// restore, or `git` missing), so a botched restore is loud. On an unborn HEAD the
-/// author must supply `--restore-cmd` instead.
-pub fn revert_tracked_changes(dir: &Path) -> Result<()> {
-    run_git(dir, &["checkout", "--", "."])?
-        .into_result()
-        .context(
-            "failed to revert tracked changes while restoring the tree; on a repo with no \
-             commit yet, pass --restore-cmd to undo the perturbation",
-        )
+/// Returns [`GitError::CommandFailed`] if the checkout fails (an unborn HEAD with an
+/// empty index has nothing to restore, or `git` missing), so a botched restore is
+/// loud. On an unborn HEAD the author must supply `--restore-cmd` instead.
+pub fn revert_tracked_changes(dir: &Path) -> Result<(), GitError> {
+    run_git(dir, &["checkout", "--", "."])?.into_result()
 }
 
 /// Whether `dir` is inside a git working tree.
@@ -200,16 +192,14 @@ pub fn is_inside_work_tree(dir: &Path) -> bool {
         == Some("true")
 }
 
-/// Read one git config value, trimmed. `None` maps to a clear "set it" error.
-fn git_config(dir: &Path, key: &str) -> Result<String> {
+/// Read one git config value, trimmed. An unset value maps to a clear "set it"
+/// error naming the key.
+fn git_config(dir: &Path, key: &str) -> Result<String, GitError> {
     let out = run_git(dir, &["config", key])?;
     out.success_stdout()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "git {key} is not set; a verdict needs an attributable author. \
-             Set it with `git config {key} \"...\"`"
-            )
+        .ok_or_else(|| GitError::MissingIdentity {
+            key: key.to_owned(),
         })
 }
 
@@ -230,11 +220,14 @@ impl GitOutput {
 
     /// Turn a non-zero exit into an error carrying git's own stderr, for the git
     /// mutations whose failure must be loud.
-    fn into_result(self) -> Result<()> {
+    fn into_result(self) -> Result<(), GitError> {
         if self.ok {
             Ok(())
         } else {
-            bail!("`git {}` failed: {}", self.args, self.stderr.trim())
+            Err(GitError::CommandFailed {
+                args: self.args,
+                stderr: self.stderr.trim().to_owned(),
+            })
         }
     }
 }
@@ -244,17 +237,15 @@ impl GitOutput {
 /// A failure to *spawn* git at all (git not installed) is an error; a git command
 /// that runs and exits non-zero is not — that is data the caller classifies (an
 /// unborn HEAD, an unset config key), so it comes back in [`GitOutput::ok`].
-fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutput> {
+fn run_git(dir: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
         .output()
-        .with_context(|| {
-            format!(
-                "failed to run `git {}`; is git installed and on PATH?",
-                args.join(" ")
-            )
+        .map_err(|source| GitError::Spawn {
+            args: args.join(" "),
+            source,
         })?;
     Ok(GitOutput {
         ok: output.status.success(),

@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use crate::cli::ListArgs;
 use crate::output::{emit, status_label, Format};
-use crate::store::{discover, LoadError, LoadedClaim};
+use claim_store::{discover, LoadError, LoadedClaim};
 
 /// Run `claim list`.
 ///

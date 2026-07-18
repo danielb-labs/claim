@@ -26,7 +26,7 @@ use serde::Serialize;
 
 use crate::cli::DriftArgs;
 use crate::output::{emit, Format};
-use crate::store::{discover, LoadError};
+use claim_store::{discover, LoadError};
 
 /// The exit code when nothing has drifted and every file loaded.
 const EXIT_NO_DRIFT: i32 = 0;

@@ -33,10 +33,8 @@ mod claimfile;
 mod cli;
 mod clock;
 mod commands;
-mod git;
 mod output;
 mod scheduling;
-mod store;
 
 use clap::Parser;
 

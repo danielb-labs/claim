@@ -113,17 +113,27 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-/// The [`ErrorKind`] of an `anyhow::Error`, found by walking its cause chain for an
-/// [`AppError`].
+/// The [`ErrorKind`] of an `anyhow::Error`, found by walking its cause chain for a
+/// typed failure.
 ///
 /// Walking the chain (not just the top) means a broad `.context("…")` wrapper above
-/// a typed failure does not erase its kind. A chain with no `AppError` — a plain
-/// I/O or git error — reports [`ErrorKind::Other`].
+/// a typed failure does not erase its kind. Two typed families are recognized: the
+/// CLI's own [`AppError`] for contract failures the commands raise, and
+/// [`claim_store::StoreError`] from the shared store crate, whose `NoStore` variant
+/// maps to [`ErrorKind::NoStore`] — the single "run `claim init`" signal every verb
+/// reports identically, now that store discovery lives in `claim-store` rather than
+/// in a CLI module that could construct an `AppError` directly. A chain with neither
+/// — a plain I/O or git error — reports [`ErrorKind::Other`].
 #[must_use]
 pub fn kind_of(err: &anyhow::Error) -> ErrorKind {
     for cause in err.chain() {
         if let Some(app) = cause.downcast_ref::<AppError>() {
             return app.kind();
+        }
+        if let Some(claim_store::StoreError::NoStore { .. }) =
+            cause.downcast_ref::<claim_store::StoreError>()
+        {
+            return ErrorKind::NoStore;
         }
     }
     ErrorKind::Other
