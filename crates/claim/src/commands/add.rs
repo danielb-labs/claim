@@ -37,8 +37,8 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use claim_core::{
-    append_entry, resolve_supports, run_check, Check, CheckContext, CheckOutcome, Claim, ClaimId,
-    Event, LogEntry, Timestamp, Verdict,
+    resolve_supports, run_check, Check, CheckContext, CheckOutcome, Claim, ClaimId, Timestamp,
+    Verdict,
 };
 use serde::Serialize;
 
@@ -48,7 +48,7 @@ use crate::claimfile::{
 };
 use crate::cli::AddArgs;
 use crate::output::{emit, note, warn, Format};
-use claim_store::{discover, git, Store, StoreLoad};
+use claim_store::{author_claim, discover, git, AuthorError, Authored, Store, StoreLoad};
 
 /// The machine form of `claim add`.
 #[derive(Debug, Serialize)]
@@ -109,54 +109,102 @@ pub fn run(args: &AddArgs, format: Format) -> Result<()> {
         )
     })?;
 
-    // Load the corpus once and reuse it: the duplicate-id check needs every existing
-    // id, and the supports warning needs them as the known-id set.
+    // Load the corpus once and reuse it: the shared authoring core's duplicate-id
+    // check needs every existing id, and the supports warning needs them as the
+    // known-id set.
     let existing = store.load_all()?;
-    reject_duplicate(&store, &existing, &claim)?;
     warn_unresolved_supports(&store, &existing, &claim);
 
-    // Provenance is resolved up front, before the check runs: a missing git identity
-    // or absent repository should fail while nothing has been written, not after.
-    let provenance = Provenance {
-        commit: git::resolve_commit(store.root())?,
-        actor: git::resolve_actor(store.root())?,
-    };
-
+    // Optional: witness the check going red in an isolated worktree, for extra
+    // confidence that it discriminates. Never touches the caller's tree. This runs
+    // before the shared establish-and-write: on failure it refuses here, writing
+    // nothing, exactly as a refused establishing run would. When it succeeds, its
+    // observed-red note is folded onto the birth entry as evidence.
     let check = primary_cmd_check(&claim)
         .context("claim add authors a single cmd check; this claim has none to run")?;
-
-    let ctx = CheckContext::new(store.root());
-
-    // The establishing run: the fact must be true against the current tree. This is
-    // the whole of verification — a passing check verifies the fact (invariant #5).
-    let establishing = establishing_run(check, &ctx, format)?;
-
-    // Optional: witness the check going red in an isolated worktree, for extra
-    // confidence that it discriminates. Never touches the caller's tree.
-    let witnessed_red = if let Some(witness_cmd) = &args.witness_cmd {
-        witness_in_isolation(&store, &provenance.commit, check, witness_cmd, format)?;
-        true
+    let witness_note = if let Some(witness_cmd) = &args.witness_cmd {
+        // The isolated worktree needs a commit to check out; resolve it before the
+        // dance so an unborn HEAD is refused with the fix rather than failing mid-git.
+        let head = git::resolve_commit(store.root())?;
+        witness_in_isolation(&store, &head, check, witness_cmd, format)?;
+        Some(witness_note())
     } else {
-        false
+        None
     };
 
-    write_claim_and_log(
+    note(format, "Running the check against the current tree...");
+    let ctx = CheckContext::new(store.root());
+    let now = Timestamp::now();
+    let authored = author_claim(
         &store,
         &claim,
         &file_text,
-        &establishing,
-        witnessed_red,
-        &provenance,
+        &existing,
+        &ctx,
+        now,
+        witness_note,
+    )
+    .map_err(map_author_error)?;
+
+    show_evidence(format, "check", &authored.establishing);
+    report_created(
+        &store,
+        &claim,
+        &authored,
+        args.witness_cmd.is_some(),
         format,
     )
 }
 
-/// The git-derived provenance stamped on the establishing verdict: the commit the
-/// check was observed against and the actor who observed it. Resolved once, before
-/// anything is written, so a missing identity fails fast.
-struct Provenance {
-    commit: String,
-    actor: String,
+/// Map a shared [`AuthorError`] onto the CLI's [`ErrorKind`]s, so the `--json` error
+/// object carries the stable `kind` an agent branches on. The witnessed-red refusal
+/// never reaches here (it fails earlier in [`run`]); a `NotHeld` from the
+/// establishing run is classified by *which* verdict was observed, matching the
+/// distinct `drifted-green`/`broken-green` kinds the CLI has always used.
+fn map_author_error(err: AuthorError) -> anyhow::Error {
+    match err {
+        // The two duplicate cases keep their distinct "already exists at" / "already
+        // declared in" wording (the shared error's own Display names the file and the
+        // fix), tagged with the stable `duplicate-id` kind an agent branches on.
+        dup @ (AuthorError::DuplicateId { .. } | AuthorError::IdAlreadyDeclared { .. }) => {
+            app(ErrorKind::DuplicateId, dup.to_string())
+        }
+        // A `Drifted` fact is already false; a `Broken`/`Unverifiable` check could not
+        // run. Both refuse the establish, and each keeps its distinct
+        // `drifted-green`/`broken-green` kind the CLI has always used.
+        AuthorError::NotHeld {
+            verdict: Verdict::Drifted,
+            status,
+            ..
+        } => app(
+            ErrorKind::DriftedGreen,
+            format!(
+                "the check reports Drifted against the current tree ({status}): the fact is \
+                 already false, so there is nothing true to record. Fix the fact or the check \
+                 first."
+            ),
+        ),
+        AuthorError::NotHeld {
+            verdict: verdict @ (Verdict::Broken | Verdict::Unverifiable),
+            status,
+            ..
+        } => app(
+            ErrorKind::BrokenGreen,
+            format!(
+                "the check is {} against the current tree ({status}): it cannot run, so it cannot \
+                 be trusted. Fix the command first.",
+                verdict_label(verdict)
+            ),
+        ),
+        AuthorError::NotHeld {
+            verdict: Verdict::Held,
+            ..
+        } => unreachable!("author_claim returns NotHeld only for a non-Held verdict"),
+        // Provenance (no git identity, corrupt HEAD) and Write (I/O) are environment
+        // faults with no specific contract kind; they surface as `other` with the
+        // shared crate's message, whose cause chain names the fix.
+        err @ (AuthorError::Provenance(_) | AuthorError::Write(_)) => anyhow::Error::new(err),
+    }
 }
 
 /// Gather every claim field from flags, falling back to interactive prompts when a
@@ -246,42 +294,6 @@ fn parse_id(raw: &str) -> Result<ClaimId> {
         .map_err(|e| app(ErrorKind::InvalidInput, e.to_string()))
 }
 
-/// Refuse a claim whose id already exists anywhere in the store.
-///
-/// A duplicate id is a false-green hazard: two files sharing an id share one
-/// verdict log (`.claims/log/<id>/`), so their histories interleave and a drifted
-/// fact can read as verified. Checking only the canonical path `.claims/<id>.md`
-/// misses a claim that declares the same id from a *differently named* file, so
-/// this scans every parsed claim's id in `existing`, not just the one path — the
-/// id, not the filename, is what must be unique. A canonical-path collision is
-/// still checked too, in case a file exists but does not parse (and so is absent
-/// from the id scan).
-fn reject_duplicate(store: &Store, existing: &StoreLoad, claim: &Claim) -> Result<()> {
-    let canonical = store.claim_file(&claim.id);
-    if canonical.exists() {
-        return Err(app(
-            ErrorKind::DuplicateId,
-            format!(
-                "a claim with id '{}' already exists at {}; choose a different id or edit that file",
-                claim.id,
-                canonical.display()
-            ),
-        ));
-    }
-
-    if let Some(existing) = existing.claims.iter().find(|c| c.claim.id == claim.id) {
-        return Err(app(
-            ErrorKind::DuplicateId,
-            format!(
-                "a claim with id '{}' is already declared in {}; choose a different id or edit \
-                 that file",
-                claim.id, existing.path
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Warn — never fail — for each `supports` target that does not resolve now.
 ///
 /// A support edge is a soft signal, and a forward reference (a decision ref to a
@@ -313,46 +325,6 @@ fn warn_unresolved_supports(store: &Store, existing: &StoreLoad, claim: &Claim) 
                 res.target
             ));
         }
-    }
-}
-
-/// Run the check against the current tree and require `Held`, showing the evidence.
-///
-/// This is the whole of verification: a passing check against reality establishes
-/// the fact (invariant #5). `Drifted` means the fact is already false — recording it
-/// would be a lie. `Broken` means the check cannot run — there is nothing to trust.
-/// Both are refused with the evidence, so the author sees *why*.
-fn establishing_run(check: &Check, ctx: &CheckContext, format: Format) -> Result<CheckOutcome> {
-    note(format, "Running the check against the current tree...");
-    let outcome = run_check(check, ctx);
-    show_evidence(format, "check", &outcome);
-
-    match outcome.verdict {
-        Verdict::Held => Ok(outcome),
-        Verdict::Drifted => Err(app(
-            ErrorKind::DriftedGreen,
-            format!(
-                "the check reports Drifted against the current tree ({}): the fact is already \
-                 false, so there is nothing true to record. Fix the fact or the check first.",
-                outcome.status()
-            ),
-        )),
-        Verdict::Broken => Err(app(
-            ErrorKind::BrokenGreen,
-            format!(
-                "the check is Broken against the current tree ({}): it cannot run, so it cannot be \
-                 trusted. Fix the command first.",
-                outcome.status()
-            ),
-        )),
-        Verdict::Unverifiable => Err(app(
-            ErrorKind::BrokenGreen,
-            format!(
-                "the check is Unverifiable ({}): claim add authors cmd checks, which never return \
-                 this; this indicates an agent/human check, not supported by add in v1.",
-                outcome.status()
-            ),
-        )),
     }
 }
 
@@ -492,44 +464,22 @@ fn run_perturbation(root: &std::path::Path, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write the claim file and append the establishing log entry. The last step, and
-/// the only one that touches the store — everything before it is validation.
-fn write_claim_and_log(
+/// Report a created claim: build the machine record from the shared [`Authored`]
+/// outcome and print the human handoff. The claim and its birth verdict are already
+/// on disk (via [`author_claim`]); this only renders what to commit — the tool does
+/// not commit (invariant #4).
+fn report_created(
     store: &Store,
     claim: &Claim,
-    file_text: &str,
-    establishing: &CheckOutcome,
+    authored: &Authored,
     witnessed_red: bool,
-    provenance: &Provenance,
     format: Format,
 ) -> Result<()> {
-    let commit = provenance.commit.as_str();
-    let actor = provenance.actor.as_str();
-    let now = Timestamp::now();
-
-    let file = store.claim_file(&claim.id);
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    // Guard against a race between the duplicate check and the write: create-new so
-    // a claim file that appeared in between is never clobbered.
-    write_new_file(&file, file_text)?;
-
-    // A single birth entry: the establishing Held, which makes the claim born
-    // verified. When the red was witnessed in isolation, a note records that observed
-    // discrimination as evidence on the same entry.
-    let log_root = store.log_dir();
-    let held_note = if witnessed_red {
-        Some(witness_note())
-    } else {
-        None
-    };
-    let held_entry = verification_entry(now, commit, actor, establishing, held_note);
-    let held_path = append_entry(&log_root, &claim.id, &held_entry)?;
-
-    let file_rel = relative_to(store.root(), &file);
-    let to_commit = vec![file_rel.clone(), relative_to(store.root(), &held_path)];
+    let file_rel = relative_to(store.root(), &authored.claim_file);
+    let to_commit = vec![
+        file_rel.clone(),
+        relative_to(store.root(), &authored.log_file),
+    ];
 
     let root = store.root().display().to_string();
     let report = AddReport {
@@ -537,9 +487,9 @@ fn write_claim_and_log(
         id: claim.id.to_string(),
         root: root.clone(),
         file: file_rel,
-        commit: commit.to_owned(),
-        actor: actor.to_owned(),
-        verdict: Verdict::Held,
+        commit: authored.provenance.commit.clone(),
+        actor: authored.provenance.actor.clone(),
+        verdict: authored.establishing.verdict,
         witnessed_red,
         to_commit,
     };
@@ -567,31 +517,6 @@ fn write_claim_and_log(
             report.root, report.id
         );
     })
-}
-
-/// Build a verification log entry from a check outcome, folding in an optional
-/// extra note ahead of the check's own evidence.
-fn verification_entry(
-    at: Timestamp,
-    commit: &str,
-    actor: &str,
-    outcome: &CheckOutcome,
-    extra_note: Option<String>,
-) -> LogEntry {
-    let evidence = match (extra_note, &outcome.evidence) {
-        (Some(note), Some(ev)) => Some(format!("{note}\n{ev}")),
-        (Some(note), None) => Some(note),
-        (None, ev) => ev.clone(),
-    };
-    LogEntry {
-        at,
-        commit: commit.to_owned(),
-        actor: actor.to_owned(),
-        event: Event::Verification {
-            verdict: outcome.verdict,
-            evidence,
-        },
-    }
 }
 
 /// The evidence note recorded on the establishing entry when `--witness-cmd`
@@ -628,19 +553,6 @@ fn verdict_label(v: Verdict) -> &'static str {
         Verdict::Broken => "Broken",
         Verdict::Unverifiable => "Unverifiable",
     }
-}
-
-/// Create a new file, failing loudly if one already exists (a race with the
-/// duplicate check, or a concurrent `add`).
-fn write_new_file(path: &std::path::Path, contents: &str) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create the claim file {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("failed to write the claim file {}", path.display()))?;
-    Ok(())
 }
 
 /// Render `path` relative to `root` for display, falling back to the full path.

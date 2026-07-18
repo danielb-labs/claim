@@ -14,6 +14,10 @@
 //!   provenance a verdict-log entry needs (invariant #3), plus [`git::Worktree`],
 //!   the isolated checkout `claim add --witness-cmd` uses to witness a red without
 //!   touching the caller's tree.
+//! - [`author_claim`] — the establish-then-write authoring core both `claim add`
+//!   and the MCP `create` tool call, so the two front doors take the same steps to
+//!   record a claim (run the check, require `Held`, write the file and birth
+//!   verdict, never commit) and cannot disagree about what authoring means.
 //! - [`claim_matches_path`] — the "claims about these paths" prefix match both
 //!   `claim list` and the MCP `query` tool share, so the two cannot answer a path
 //!   query differently.
@@ -23,11 +27,13 @@
 //! error — without matching on prose. Everything terminal-, argument-, and
 //! output-shaped stays in the binaries; this crate is pure store-and-git logic.
 
+mod author;
 mod error;
 pub mod git;
 mod path;
 mod store;
 
+pub use author::{author_claim, AuthorError, Authored, Provenance};
 pub use error::{GitError, StoreError};
 pub use path::{claim_matches_path, under_prefix};
 pub use store::{discover, LoadError, LoadedClaim, Store, StoreLoad, CLAIMS_DIR, LOG_DIR};
