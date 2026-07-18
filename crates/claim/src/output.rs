@@ -133,3 +133,17 @@ pub fn trigger_label(when: Trigger) -> String {
         Trigger::Every { days } => format!("every {days}d"),
     }
 }
+
+/// Render `path` relative to `root` for display, falling back to the full path when
+/// it is not under `root`.
+///
+/// The write verbs (`amend`, `retire`) print the files a user must `git add`
+/// relative to the store root, so the printed `git -C <root> add <paths>` line works
+/// from any subdirectory. Shared here so those verbs cannot disagree on the form.
+#[must_use]
+pub fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}

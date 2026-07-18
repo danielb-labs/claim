@@ -40,15 +40,17 @@
 //! *and* actually differ from the current claim, or the amend is a
 //! [`ErrorKind::NoChange`] no-op that writes nothing.
 //!
-//! Amend re-renders through the same render-then-parse path `add` uses, so the
-//! rewritten file is validated byte-for-byte before it replaces the original. That
-//! path renders a single `cmd` check (the v1 `add` shape); a claim whose checks it
-//! cannot faithfully round-trip — more than one check, or an `agent`/`human` check —
-//! is refused with a clear error rather than having checks silently dropped.
+//! Amend re-renders through the same render-then-parse path `add` uses, so the exact
+//! bytes about to replace the original are proven to parse against the schema before
+//! anything is written. That path renders a single `cmd` check (the v1 `add` shape);
+//! a claim whose checks it cannot faithfully round-trip — more than one check, or an
+//! `agent`/`human` check — is refused with a clear error rather than having checks
+//! silently dropped.
 
 use anyhow::{Context, Result};
 use claim_core::{
-    append_entry, run_check, Check, CheckContext, CheckKind, Claim, Event, LogEntry, Verdict,
+    append_entry, compute_status, read_entries, run_check, Check, CheckContext, CheckKind, Claim,
+    Event, Grace, LogEntry, Status, Verdict,
 };
 use serde::Serialize;
 
@@ -56,7 +58,7 @@ use crate::apperror::{app, ErrorKind};
 use crate::claimfile::{render_and_validate, CheckDraft, CheckDraftKind, ClaimDraft};
 use crate::cli::AmendArgs;
 use crate::git;
-use crate::output::{emit, note, trigger_label, Format};
+use crate::output::{emit, note, relative_to, trigger_label, Format};
 use crate::store::{discover, LoadedClaim, Store};
 
 /// The machine form of `claim amend`.
@@ -90,17 +92,20 @@ struct AmendReport {
 ///
 /// # Errors
 ///
-/// Fails, with a message naming the fix, on: no store found; an unknown id; a claim
-/// whose checks amend cannot faithfully re-render (multi-check or non-`cmd`); no
-/// field given or every field unchanged ([`ErrorKind::NoChange`]); an amended claim
-/// that fails schema validation; an amended check that does not report `Held`
-/// (nothing is written); a git provenance failure; or an I/O failure. In every
-/// refusal path the original file and log are left exactly as they were.
+/// Fails, with a message naming the fix, on: no store found; an unknown id; a
+/// *retired* claim (retirement is terminal, so an amend could never change its
+/// status — refused before the check runs); a claim whose checks amend cannot
+/// faithfully re-render (multi-check or non-`cmd`); no field given or every field
+/// unchanged ([`ErrorKind::NoChange`]); an amended claim that fails schema
+/// validation; an amended check that does not report `Held` (nothing is written); a
+/// git provenance failure; or an I/O failure. In every refusal path the original
+/// file and log are left exactly as they were.
 pub fn run(args: &AmendArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
 
     let existing = resolve_claim(&store, &args.id)?;
+    reject_if_retired(&store, &existing)?;
     let current_draft = draft_from_claim(&existing.claim)?;
     let (amended_draft, changed) = apply_overlay(&current_draft, args);
 
@@ -200,6 +205,20 @@ fn resolve_claim(store: &Store, id: &str) -> Result<LoadedClaim> {
     if let Some(loaded) = load.claims.iter().find(|c| c.claim.id.as_str() == id) {
         return Ok(loaded.clone());
     }
+    // A duplicate id is dropped from `claims` and reported as an error on each file
+    // (whose filename may not match the id), so match those first — reporting the
+    // real conflict, not a misleading "no such id". `load_all`'s message begins with
+    // `duplicate claim id '<id>'`.
+    let dup_marker = format!("duplicate claim id '{id}'");
+    if let Some(err) = load.errors.iter().find(|e| e.message.contains(&dup_marker)) {
+        return Err(app(
+            ErrorKind::InvalidInput,
+            format!(
+                "claim '{id}' cannot be amended: {}. Resolve the conflict first.",
+                err.message
+            ),
+        ));
+    }
     if let Some(err) = load
         .errors
         .iter()
@@ -216,6 +235,32 @@ fn resolve_claim(store: &Store, id: &str) -> Result<LoadedClaim> {
             "no claim with id '{id}' in this store; run `claim list` to see the ids that exist"
         ),
     ))
+}
+
+/// Refuse to amend a claim whose computed status is [`Status::Retired`].
+///
+/// Retirement is terminal ([`compute_status`] rule 1): the latest past adjudication
+/// wins over any later verdict, so an amend that rewrote the file and appended a
+/// fresh `Held` would leave the status stuck at `Retired` — the user would commit a
+/// change that changed nothing. Refuse loudly, before the check runs and before
+/// anything is written, and name the real remedy: a retired decision is reopened by
+/// authoring a new claim, not by amending a closed one.
+fn reject_if_retired(store: &Store, existing: &LoadedClaim) -> Result<()> {
+    let history = read_entries(&store.log_dir(), &existing.claim.id)?;
+    let now = crate::clock::now()?;
+    let report = compute_status(existing.claim.max_age, &history, now, Grace::DEFAULT);
+    if report.status == Status::Retired {
+        return Err(app(
+            ErrorKind::InvalidInput,
+            format!(
+                "claim '{}' is retired; retirement is terminal, so amending it would rewrite the \
+                 file and append a verdict but leave the status Retired — nothing would change. \
+                 Nothing was written. To reopen this decision, author a new claim.",
+                existing.claim.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a load-errored file's path could be the file for `id`. Mirrors `log`.
@@ -352,9 +397,8 @@ fn current_cmd(draft: &ClaimDraft) -> (&str, bool) {
     }
 }
 
-/// A field-by-field clone of a draft. `ClaimDraft`/`CheckDraft` are not `Clone` (the
-/// CLI never needed it before), so the overlay rebuilds one rather than widening a
-/// core type's derives for one call site.
+/// A field-by-field clone of a draft, so the overlay mutates a copy and leaves the
+/// caller's `current` draft intact for the change comparison.
 fn clone_draft(d: &ClaimDraft) -> ClaimDraft {
     ClaimDraft {
         id: d.id.clone(),
@@ -488,12 +532,4 @@ fn human(report: &AmendReport) {
         "  git -C {} commit -m \"Amend claim {}\"",
         report.root, report.id
     );
-}
-
-/// Render `path` relative to `root` for display, falling back to the full path.
-fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }

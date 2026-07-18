@@ -148,12 +148,48 @@ fn retire_json_shape_carries_the_essentials() {
     assert_eq!(v["note"], "closed for good");
     assert_eq!(v["commit"].as_str().unwrap().len(), 40);
     assert_eq!(v["actor"], "Test User <test@example.com>");
+    // `root` is load-bearing: an agent invoked from a subdirectory resolves the
+    // root-relative `to_commit` paths against it (m6).
+    assert!(
+        !v["root"].as_str().unwrap().is_empty(),
+        "root is present and non-empty"
+    );
     let to_commit = v["to_commit"].as_array().unwrap();
     assert_eq!(to_commit.len(), 1);
     assert!(to_commit[0]
         .as_str()
         .unwrap()
         .starts_with(".claims/log/pin/"));
+}
+
+#[test]
+fn retire_rejects_a_blank_note_before_writing_anything() {
+    // m1: clap requires --note present but accepts an empty/whitespace value; a
+    // reasonless retirement defeats the invariant the note enforces, so it is
+    // rejected loudly and nothing is written.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim("pin", &claim_file("pin"));
+
+    repo.claim()
+        .args(["retire", "pin", "--note", "   "])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("the retirement note is empty"));
+    assert_eq!(repo.log_count("pin"), 0, "nothing written on a blank note");
+
+    // The JSON error carries the machine kind.
+    let out = repo
+        .claim()
+        .args(["--json", "retire", "pin", "--note", ""])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["kind"], "invalid-input");
+    assert_eq!(repo.log_count("pin"), 0);
 }
 
 #[test]

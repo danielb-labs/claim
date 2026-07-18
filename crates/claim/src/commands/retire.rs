@@ -24,7 +24,7 @@ use serde::Serialize;
 use crate::apperror::{app, ErrorKind};
 use crate::cli::RetireArgs;
 use crate::git;
-use crate::output::{emit, Format};
+use crate::output::{emit, relative_to, Format};
 use crate::store::{discover, Store};
 
 /// The machine form of `claim retire`.
@@ -54,14 +54,27 @@ struct RetireReport {
 ///
 /// # Errors
 ///
-/// Fails, with a message naming the fix, on: no store found; an unknown id
-/// ([`ErrorKind::InvalidInput`], never a silent success — retiring a typo must not
-/// look like closing a real claim); a git provenance failure (no repository, or no
-/// configured identity); or an I/O failure appending the log entry. The `--note` is
-/// required by the CLI grammar, so a reasonless retirement never reaches here.
+/// Fails, with a message naming the fix, on: no store found; a trimmed-empty
+/// `--note` (a reasonless retirement is the silent closure the note exists to
+/// prevent — clap requires the flag present but not that it carries text); an
+/// unknown id ([`ErrorKind::InvalidInput`], never a silent success — retiring a typo
+/// must not look like closing a real claim); a git provenance failure (no
+/// repository, or no configured identity); or an I/O failure appending the log
+/// entry.
 pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
+
+    // A present-but-blank note defeats the invariant the note enforces, so reject it
+    // as loudly as a missing one — mirroring the parser's empty-statement rejection.
+    let note = args.note.trim();
+    if note.is_empty() {
+        return Err(app(
+            ErrorKind::InvalidInput,
+            "the retirement note is empty; --note must say why the claim is being closed \
+             (the world changed and the decision was re-reviewed, or where the fact now lives).",
+        ));
+    }
 
     let claim = resolve_claim(&store, &args.id)?;
 
@@ -80,7 +93,7 @@ pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
         actor: actor.clone(),
         event: Event::Adjudication {
             action: Adjudication::Retire {
-                note: args.note.clone(),
+                note: note.to_owned(),
             },
         },
     };
@@ -94,7 +107,7 @@ pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
         root: store.root().display().to_string(),
         commit,
         actor,
-        note: args.note.clone(),
+        note: note.to_owned(),
         to_commit,
     };
 
@@ -162,12 +175,4 @@ fn human(report: &RetireReport) {
         "  git -C {} commit -m \"Retire claim {}\"",
         report.root, report.id
     );
-}
-
-/// Render `path` relative to `root` for display, falling back to the full path.
-fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }

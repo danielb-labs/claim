@@ -169,9 +169,15 @@ fn amend_human_snapshot() {
 
 #[test]
 fn stats_human_snapshot() {
-    // The mixed store gives a verified/drifted/stale spread and several verdict
-    // kinds; `now` is pinned, so every number and the honesty note are stable — no
+    // A store spanning all four statuses plus a never-verified claim, so the snapshot
+    // exercises non-zero `retired` and `never verified` rows (not just the all-zero
+    // fixture). `now` is pinned, so every number and the honesty note are stable — no
     // redaction needed.
     let repo = mixed_store();
+    repo.write_claim("closed", &claim_file("closed", "120d", ""));
+    repo.write_verdict("closed", "2026-07-10T00:00:00Z", "held");
+    repo.write_retirement("closed", "2026-07-12T00:00:00Z", "superseded");
+    repo.write_claim("blank", &claim_file("blank", "30d", ""));
+    repo.write_verdict("blank", "2026-07-14T00:00:00Z", "broken");
     insta::assert_snapshot!(stdout(&repo, &["stats"], 0));
 }
