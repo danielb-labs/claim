@@ -1,6 +1,6 @@
 [package]
 name = "claim-mcp"
-description = "Model Context Protocol server exposing claim knowledge to agents: query verified facts, report verdicts."
+description = "Model Context Protocol server exposing claim knowledge to agents: query claims and their supports, and author new claims."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

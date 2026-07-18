@@ -1,7 +1,7 @@
 //! Shared test scaffolding for the tool-handler unit tests.
 //!
 //! Builds a throwaway git repo with a `.claims/` store and a deterministic
-//! identity, so the query and report logic can be driven against a real store and
+//! identity, so the query and create logic can be driven against a real store and
 //! a real git provenance source without a network or the developer's ambient git
 //! config. Compiled only under `#[cfg(test)]`.
 
