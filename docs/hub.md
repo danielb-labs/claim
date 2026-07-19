@@ -196,6 +196,113 @@ telemetry away is visible rather than silently aging claims into stale. An
 *unavailable* identity provider is a `503`, not a rejection: the hub could not judge
 the token, so it never calls a possibly-valid push forged — the producer retries.
 
+## Pushing verdicts from CI (the ingest Action)
+
+The hub ships one GitHub Action, **`hub-ingest`**, that closes the write half of the
+loop: it runs `claim check --json` in your repo's CI, mints the runner's GitHub Actions
+OIDC identity, and POSTs the report to the hub's `/ingest`. This is the *one* attested
+path — the CLI stays hub-agnostic (it never learns a hub URL or token), and the
+authenticate-and-push glue lives in the hub's Action, not the core binary (see
+[the CI/hub boundary](ci.md)).
+
+Add it to a workflow that runs on the events you want verdicts for — a push to your
+default branch, a merge, or a schedule:
+
+```yaml
+name: push verdicts to the claim hub
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *"   # a daily re-verify, so a fact gone stale is re-reported
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    # REQUIRED: `id-token: write` lets the runner mint the OIDC token the hub trusts.
+    # `contents: read` checks out the .claims/ store. Without id-token: write the
+    # Action fails loudly rather than pushing an unauthenticated report.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build/install the claim binary (or download a pinned release when one exists).
+      - uses: your-org/claim/.github/actions/install-claim@v1
+        with:
+          source-path: crates/claim
+
+      - name: Push verdicts to the hub
+        uses: your-org/claim/.github/actions/hub-ingest@v1
+        with:
+          hub-url: https://hub.acme.example
+          audience: https://hub.acme.example   # MUST equal the hub's [oidc].audience
+```
+
+### What the Action needs
+
+| Input | Meaning |
+|---|---|
+| `hub-url` | The hub's base URL. `/ingest` is appended. |
+| `audience` | The identifier the OIDC token is minted for. **It must equal the hub's configured `[oidc].audience`**, or the hub rejects the token (`401`, wrong audience). |
+| `claims-dir` | The directory holding the `.claims/` store to check. Default `.`. |
+| `claim-bin` | The `claim` binary to run. Default `claim` (on `PATH`). |
+| `max-time` | Seconds bounding each HTTP request (the token mint and the ingest POST). Default `60`. A hub that stalls after accepting the connection times out into a loud failure rather than hanging the lane. |
+
+Two things are load-bearing:
+
+- **`permissions: id-token: write` on the job.** This is what lets the runner request
+  a short-lived OIDC token proving *which workflow, on which repo, at which commit*
+  produced the push (GitHub Actions OIDC). The hub verifies that token's signature,
+  issuer, audience, expiry, and that its `repository` is a connected store — trust comes
+  from the pipeline's identity, never a shared secret. Omit the permission and the Action
+  fails loudly at the mint step; it never falls back to pushing anonymously.
+- **The repository must be a connected store on the hub.** The hub ingests only for the
+  repos it mirrors (its `[oidc].repositories`); a token from any other repo is rejected
+  `403`. Configure the store on the hub first (the `[[stores]]` and `[oidc]` sections),
+  then point the Action at it.
+
+### It fails loudly, never a stale green
+
+The Action **fails the CI step on any non-2xx from the hub**, printing the hub's
+rejection reason (the `{"error": "..."}` body) into the log — a rejected or broken push
+never passes as green (invariants #1 and #6). A `403` for an unconnected repo, a `401`
+for a wrong audience or a bad signature, a `400` for a claim the hub has not synced, or
+a `503` when the identity provider is unreachable each fail the step with the reason
+named, so a hub silently dropping telemetry can never masquerade as a healthy lane.
+
+The same holds when the hub does not answer at all. A refused connection fails the step
+immediately; a hub that accepts the connection then stalls (a slow-loris or half-dead
+hub) is bounded by `max-time` (default 60 seconds) and fails with `the hub did not
+respond within Ns (timed out)` — never an indefinite hang to the runner's wall-clock. A
+`2xx` is also not trusted on its face: the Action requires the hub's accepted-envelope
+JSON (`{"accepted": N}`) before declaring success, so a proxy interstitial or CDN page
+returning `200` with a non-JSON body fails loudly rather than reading as a phantom
+acceptance.
+
+A **drift is not a failure** of the push: `claim check` exiting `1` (drifted) or `2`
+(broken) is exactly the telemetry the hub exists to receive, so the Action pushes the
+report regardless of the check's verdict and succeeds when the *ingest* is accepted. What
+fails the step is the ingest itself being refused — not a drift the report faithfully
+carries. A **redelivery** (the same run re-run) dedups on the hub to the original success,
+so a retried lane never double-counts.
+
+### The core is testable off a runner
+
+The Action's logic — check, obtain the token, POST, interpret the response, fail loud on
+a non-2xx — lives in `ci/hub-ingest.sh`, and the OIDC-token *acquisition* is
+parameterized so the flow runs without a real runner: the Action's YAML mints the token
+(the one runner-specific step) and hands it to the script through `HUB_INGEST_TOKEN`; a
+test injects a token the local hub accepts through the same seam. The gate exercises the
+whole flow against a locally-served hub with a mocked identity provider
+(`crates/claim-hub/tests/ingest_action.rs`) — proving a valid push succeeds, a drifted or
+broken verdict is still pushed as telemetry, an ingest rejection fails the step with the
+hub's reason, no non-2xx is ever swallowed, and a hub that refuses the connection or never
+responds fails the step loudly (the latter via `--max-time`) rather than hanging — with no
+network to GitHub.
+
 ## The read API (`GET /api/…`)
 
 The read API is the hub's agent-and-human read surface: it derives standing, freshness,
