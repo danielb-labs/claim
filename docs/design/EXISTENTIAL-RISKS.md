@@ -41,9 +41,11 @@ visible:
 - **Mutation-test the check.** Perturbing the world and requiring the check to go
   red is the core of Risk 4, appears as behavioral-equivalence dedup in Risk 1,
   and as a birth-gate strengthening in Risk 3.
-- **Fire at registry/CI time over the whole corpus, not only inside `claim add`.**
-  A gate that only runs in `claim add` is bypassed by a hand-committed file; the
-  stronger approaches under Risks 1 and 3 run over the merged corpus.
+- **The hub over the whole corpus is the authority, not the local `claim add` gate.**
+  The hub's registry sync ingests every claim committed to git regardless of how it
+  was authored, so dedup and verification belong at the hub over the merged corpus,
+  not in a CLI gate; the stronger approaches under Risks 1 and 3 run there for that
+  reason.
 
 ---
 
@@ -55,19 +57,23 @@ checks do not force the redundancy into view: two near-duplicate checks both exi
 forever, so nothing notices they are redundant. The corpus rots by accretion, not
 by going false.
 
-**Why it's hard (the honest catch).** Three constraints any approach must survive:
+**Why it's hard (the honest catch).** Two constraints any approach must survive:
 
 - **The negation twin.** The most similar existing claim by embedding is often the
   opposite fact ("X enabled" vs "X disabled"): antonyms occur in near-identical
   contexts, so they land close in embedding space. High cosine is a good candidate
   generator and a terrible merge decider; a careless reviewer merges two opposite
   facts.
-- **The hand-committed-file bypass.** A claim written by editing a file and
-  committing (never running `claim add`) skips any gate the CLI owns. A dedup gate
-  that only fires inside `claim add` is bypassable by construction.
 - **Checks-don't-dedup.** Two claims that both pass green are never forced into
   comparison by verification; redundancy is invisible to the runtime. Something
   external must force the comparison.
+
+Not a constraint, a placement principle: dedup belongs at the hub, over the synced
+registry, not in the CLI's `claim add` gate. The hub ingests every claim committed
+to git regardless of how it was authored, and the hub — not any local gate — is the
+authority for dedup and verification. Authoring a claim by hand-editing a file does
+not bypass the analysis; it only means the analysis lives where it should, at the
+hub over the whole corpus.
 - The research adds: no surveyed memory system has made purely automatic
   consolidation trustworthy. Mem0's production audit found 97.8% junk, an 808-copy
   feedback loop, and a regression to MD5-exact dedup that stored contradictory
@@ -221,12 +227,12 @@ a path the hub sees, and the negation twin will be the top suggestion.
   from baseline: the plan treats concurrent same-slug creation as a normal git conflict
   for a human; this makes same-*fact* concurrent creation converge automatically.
 
-*Convergence note.* The approaches sort hard by the three catches: anything keyed on
-prose inherits the twin and needs a human backstop; anything firing only in `claim
-add` is bypassed by a hand-commit; anything needing a runtime comparison to happen
-inherits checks-don't-dedup. The approaches that route around all three key on the
-check's machine-readable polarity/behavior (C, E) and fire over the whole corpus at
-registry/CI time.
+*Convergence note.* The approaches sort by the two catches: anything keyed on prose
+inherits the twin and needs a human backstop; anything needing a runtime comparison
+to happen inherits checks-don't-dedup. And dedup belongs at the hub over the synced
+registry — which sees every git-committed claim — not a local `claim add` gate. The
+approaches that route around all of this key on the check's machine-readable
+polarity/behavior (C, E) and run over the whole corpus at the hub.
 
 ---
 
