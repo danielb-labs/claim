@@ -97,6 +97,41 @@ impl SqliteStore {
         Ok(store)
     }
 
+    /// Write a consistent, self-contained backup of the whole database to `dest`,
+    /// safe to run against a live hub.
+    ///
+    /// This is SQLite's online backup (`VACUUM INTO`), not a file copy: it reads a
+    /// transactionally-consistent snapshot through a connection and writes **one** new
+    /// database file with no `-wal`/`-shm` sidecars — the WAL is already folded in. That
+    /// is why it is the export a running hub must use. A live `cp hub.db` is a *hot* copy
+    /// that races the WAL: a checkpoint interleaving the copy can yield a file that passes
+    /// `PRAGMA integrity_check` yet has dropped the ledger tail, silently losing committed
+    /// verdicts (invariants #4 and #6). `VACUUM INTO` cannot lose them — it snapshots
+    /// under a read transaction — so a restore is a single-file copy of `dest` with no
+    /// sidecars to carry.
+    ///
+    /// `dest` must not already exist; SQLite refuses to overwrite, so a backup never
+    /// clobbers a prior one silently. The path is bound as a value (not string-formatted
+    /// into the SQL) so a path with a quote cannot break out of the statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sql`] if `dest` cannot be written (it exists, its directory
+    /// is missing, or the disk is full) or the snapshot read fails.
+    pub async fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        let dest_str = dest.to_str().ok_or_else(|| StoreError::Corrupt {
+            context: "backup destination path is not valid UTF-8".to_owned(),
+            value: dest.display().to_string(),
+        })?;
+        sqlx::query("VACUUM INTO ?")
+            .bind(dest_str)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
     async fn from_options(options: SqliteConnectOptions) -> Result<Self> {
         let pool = SqlitePool::connect_with(options).await?;
         let store = Self { pool };
