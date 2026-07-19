@@ -27,6 +27,10 @@
 //! - **`claim graph`** — `0` normally, `2` when a claim file could not be loaded
 //!   (the graph is still rendered from the well-formed claims; a broken file is
 //!   surfaced, not silenced).
+//! - **`claim show`** — `0` when the requested claim was found and printed, `2`
+//!   when it does not exist or its own file failed to parse. Unlike the store-wide
+//!   read verbs, a malformed *sibling* claim is not its concern: `show` is about
+//!   one claim, so it exits `2` only when *that* claim is missing or unloadable.
 //!
 //! Every other verb is binary: `0` on success, `2` on error. A command signals a
 //! non-error exit code by returning it from [`dispatch`]; an `Err` is always
@@ -69,15 +73,16 @@ fn main() {
 /// reported and mapped to [`EXIT_ERROR`] by `main`, so a failure to run is always `2`
 /// and never a verb's low code.
 ///
-/// `amend`, `retire`, and `docs` are binary: `0` on success (via `.map(|()| 0)`),
-/// `2` on any error — they have no review-worthy middle code the way `check`/`drift`
-/// do.
+/// `show`, `amend`, `retire`, and `docs` are binary: `0` on success (via
+/// `.map(|()| 0)`), `2` on any error — they have no review-worthy middle code the
+/// way `check`/`drift` do.
 fn dispatch(command: &Command, format: Format) -> anyhow::Result<i32> {
     match command {
         Command::Init(args) => commands::init::run(args, format).map(|()| 0),
         Command::Add(args) => commands::add::run(args, format).map(|()| 0),
         Command::Check(args) => commands::check::run(args, format),
         Command::List(args) => commands::list::run(args, format),
+        Command::Show(args) => commands::show::run(args, format).map(|()| 0),
         Command::Drift(args) => commands::drift::run(args, format),
         Command::Graph(args) => commands::graph::run(args, format),
         Command::Amend(args) => commands::amend::run(args, format).map(|()| 0),

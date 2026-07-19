@@ -63,7 +63,7 @@ fn run_script(root: &Path) -> i32 {
 /// `claim <verb>`, the form the CLI reference and examples use.
 fn covered_index() -> String {
     let verbs = [
-        "init", "add", "check", "list", "drift", "amend", "retire", "graph", "docs",
+        "init", "add", "check", "list", "show", "drift", "amend", "retire", "graph", "docs",
     ];
     let mut html = String::from("<html><body>\n");
     for verb in verbs {

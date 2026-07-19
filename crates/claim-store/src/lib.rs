@@ -11,6 +11,11 @@
 //! - [`Store`] and [`discover`] — locating a `.claims/` store and reading its
 //!   whole corpus ([`Store::load_all`]), with a malformed or duplicate-id file
 //!   surfaced as a [`LoadError`] rather than silencing the store.
+//! - [`StoreLoad::resolve`] — the single-claim lookup both `claim show` and
+//!   `claim retire` share, returning a [`Resolved`] that distinguishes a clean
+//!   match, a duplicate id (declared twice, not "not found"), a broken file named
+//!   for the id, and a genuine unknown id — so the two verbs give one honest
+//!   diagnosis and cannot disagree.
 //! - [`git::resolve_commit`] and [`git::resolve_actor`] — the git-derived
 //!   provenance the authoring gate resolves (invariant #3), plus [`git::Worktree`],
 //!   the isolated checkout `claim add --witness-cmd` uses to witness a red without
@@ -43,4 +48,4 @@ pub use author::{author_claim, AuthorError, Authored, Provenance};
 pub use error::{GitError, StoreError};
 pub use path::{claim_matches_path, under_prefix};
 pub use render::{render_claim, CheckRender, ClaimRender, RenderError};
-pub use store::{discover, LoadError, LoadedClaim, Store, StoreLoad, CLAIMS_DIR};
+pub use store::{discover, LoadError, LoadedClaim, Resolved, Store, StoreLoad, CLAIMS_DIR};

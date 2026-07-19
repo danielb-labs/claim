@@ -57,6 +57,9 @@ pub enum Command {
     Check(CheckArgs),
     /// List the store's claims (id, statement, file, supports count).
     List(ListArgs),
+    /// Print one claim's full definition — statement, checks, supports, hub hints.
+    /// Runs nothing (the static counterpart to `claim check <id>`).
+    Show(ShowArgs),
     /// Run checks and show the drifted claims with what each supports.
     Drift(DriftArgs),
     /// Resolve drift by fixing a claim's statement and check; require it holds again.
@@ -239,6 +242,22 @@ pub struct ListArgs {
     /// A substring to match against each claim's id and statement (case-sensitive).
     #[arg(value_name = "TERM")]
     pub term: Option<String>,
+}
+
+/// Arguments to `claim show <id>`: print one claim's full definition.
+///
+/// The static counterpart to `claim check <id>`: it reads the claim and prints
+/// everything the file holds — the statement, each check, the `supports` targets,
+/// and any `hub:` hints — but runs *nothing*. No check executes, no verdict is
+/// produced. A single id, not a list: `show` is about one claim, so an unknown id
+/// is a loud error (exit 2), never an empty success.
+#[derive(Debug, clap::Args)]
+pub struct ShowArgs {
+    /// The id of the claim to print. Unknown → exit 2 naming the id; a target whose
+    /// file failed to parse surfaces that parse error instead, so a broken claim is
+    /// never shown as a silent blank.
+    #[arg(value_name = "ID")]
+    pub id: String,
 }
 
 /// The scriptable exit-code contract for `claim drift`, shown under `--help`.

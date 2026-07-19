@@ -10,3 +10,4 @@ pub mod graph;
 pub mod init;
 pub mod list;
 pub mod retire;
+pub mod show;

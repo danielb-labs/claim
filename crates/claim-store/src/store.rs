@@ -143,7 +143,13 @@ impl Store {
                 .to_string();
             match load_one(&path, &rel) {
                 Ok(claim) => claims.push(LoadedClaim { claim, path: rel }),
-                Err(message) => errors.push(LoadError { file: rel, message }),
+                Err(message) => errors.push(LoadError {
+                    file: rel,
+                    message,
+                    // A parse or read failure produced no claim, so there is no id
+                    // to key on; this file is matched by its path stem instead.
+                    id: None,
+                }),
             }
         }
 
@@ -249,6 +255,89 @@ pub struct StoreLoad {
     pub errors: Vec<LoadError>,
 }
 
+/// The outcome of resolving a single claim id against a loaded store, for the
+/// verbs that act on one named claim (`show`, `retire`).
+///
+/// Distinct from a plain `Option<&LoadedClaim>` because "not shown" has three
+/// causes that demand three different messages, and conflating them is a real bug:
+/// a *duplicate* id that was dropped is **not** "no such claim" (it exists twice),
+/// and a *broken* file named for the id reports *why* it broke. Only
+/// [`NotFound`](Resolved::NotFound) is a true unknown id. Every non-[`Found`](Resolved::Found)
+/// outcome is still exit 2 — no false green — but the diagnosis a caller prints is
+/// now the honest one.
+#[derive(Debug)]
+pub enum Resolved<'a> {
+    /// A single, well-formed claim with this id. The one printable/actionable case.
+    Found(&'a LoadedClaim),
+    /// Two or more files declared this id, so all were dropped ([`load_all`] refuses
+    /// to pick a winner). Carries one of the conflict errors, whose `message` names
+    /// the colliding files, so the caller can say "declared twice" rather than "no
+    /// such claim".
+    ///
+    /// [`load_all`]: Store::load_all
+    Duplicate(&'a LoadError),
+    /// A file whose path is this id failed to parse or could not be read, so no claim
+    /// was produced. Carries that file's error so the caller can surface *why* it
+    /// could not be shown, distinguishing a broken file from a typo.
+    LoadFailed(&'a LoadError),
+    /// No claim, no same-id conflict, and no same-id broken file: a genuine unknown
+    /// id (a typo, or a claim that never existed).
+    NotFound,
+}
+
+impl StoreLoad {
+    /// Resolve one claim id to a precise outcome, so a single-claim verb prints the
+    /// honest diagnosis rather than a blanket "not found".
+    ///
+    /// The order is deliberate: a clean match wins; else a *duplicate* conflict for
+    /// this id (structurally keyed on [`LoadError::id`], never by scanning prose);
+    /// else a *broken file* whose path stem is this id; else a true [`Resolved::NotFound`].
+    /// A duplicate is checked before a stem match because a duplicated claim's files
+    /// are named for *their own* paths (which need not equal the id), so the id-keyed
+    /// check is the only one that catches it — and reporting "declared twice" for a
+    /// claim that exists twice, not "no such claim", is the whole point of this
+    /// method (a bug both `show` and `retire` shared before it existed).
+    ///
+    /// An unrelated broken *sibling* (a different id) is never returned: this answers
+    /// only about the requested id. Store-wide health is `list`/`check`'s concern.
+    #[must_use]
+    pub fn resolve(&self, id: &str) -> Resolved<'_> {
+        if let Some(loaded) = self.claims.iter().find(|c| c.claim.id.as_str() == id) {
+            return Resolved::Found(loaded);
+        }
+        if let Some(err) = self
+            .errors
+            .iter()
+            .find(|e| e.id.as_ref().is_some_and(|eid| eid.as_str() == id))
+        {
+            return Resolved::Duplicate(err);
+        }
+        if let Some(err) = self
+            .errors
+            .iter()
+            .find(|e| file_stem_matches_id(&e.file, id))
+        {
+            return Resolved::LoadFailed(err);
+        }
+        Resolved::NotFound
+    }
+}
+
+/// Whether a load-errored file's path could be the file for `id`: its `.md` stem,
+/// relative to `.claims/`, equals the id. So an unparseable file named after the
+/// requested id is matched to *that* id, and its error reported, rather than the
+/// lookup falling through to "not found".
+///
+/// This is the inverse of [`Store::claim_file_relative`]'s id→path mapping, for the
+/// broken-file case where the file did not parse so its id is unknown but its path
+/// is not. Lives here, beside `resolve`, so the two single-claim verbs share one
+/// definition and cannot disagree.
+fn file_stem_matches_id(file: &str, id: &str) -> bool {
+    file.strip_prefix(&format!("{CLAIMS_DIR}/"))
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|stem| stem == id)
+}
+
 /// A single claim file that failed to load, named for a human to fix.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LoadError {
@@ -257,6 +346,18 @@ pub struct LoadError {
     /// Why it failed, phrased so the author can fix it — a parse reason, an I/O
     /// error, or a duplicate-id conflict naming the other file.
     pub message: String,
+    /// The claim id this error pertains to, when it is known structurally.
+    ///
+    /// A *duplicate-id* conflict knows its id (both files parsed and declared it),
+    /// so this is `Some(id)` — which is what lets [`StoreLoad::resolve`] answer a
+    /// single-id lookup ("show me `X`") with the true "declared twice" diagnosis
+    /// instead of a false "no such claim", without scanning the human `message`.
+    /// A *parse* or I/O failure has no id to record (the file did not parse), so
+    /// this is `None`; such a file is matched by its path stem instead. Skipped in
+    /// the serialized form: the `--json` `errors` shape the read verbs emit is
+    /// unchanged, since a consumer already has `file` and `message`.
+    #[serde(skip)]
+    pub id: Option<claim_core::ClaimId>,
 }
 
 /// A claim parsed from the store, paired with the store-relative path it lives at.
@@ -324,6 +425,10 @@ fn reject_duplicate_ids(claims: &mut Vec<LoadedClaim>, errors: &mut Vec<LoadErro
                         id,
                         others.join(", ")
                     ),
+                    // Both files parsed and declared this id, so it is known: a
+                    // single-id lookup keys on this to answer "declared twice"
+                    // rather than a false "no such claim".
+                    id: Some(id.clone()),
                 });
             }
         }
@@ -591,5 +696,90 @@ mod tests {
         std::fs::write(dir.path().join(CLAIMS_DIR), b"not a dir").unwrap();
         let err = Store::init(dir.path()).unwrap_err();
         assert!(matches!(err, StoreError::NotADirectory { .. }));
+    }
+
+    #[test]
+    fn resolve_finds_a_clean_claim() {
+        let (_dir, store) = store();
+        write(&store, ".claims/pin.md", &claim_text("pin"));
+        let load = store.load_all().unwrap();
+        match load.resolve("pin") {
+            Resolved::Found(loaded) => assert_eq!(loaded.claim.id.as_str(), "pin"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_reports_a_duplicate_id_as_duplicate_not_not_found() {
+        // The bug this method exists to fix: two files declare id `shared`, so both
+        // are dropped and keyed by *their own* filenames (`one`, `two`). A stem scan
+        // for `shared` misses, so a naive lookup falls through to "no such claim" —
+        // a false diagnosis for a claim that exists twice. The id-keyed check catches
+        // it and reports Duplicate.
+        let (_dir, store) = store();
+        write(&store, ".claims/one.md", &claim_text("shared"));
+        write(&store, ".claims/two.md", &claim_text("shared"));
+        let load = store.load_all().unwrap();
+        match load.resolve("shared") {
+            Resolved::Duplicate(err) => {
+                assert!(err.message.contains("duplicate claim id 'shared'"));
+                assert_eq!(err.id.as_ref().map(|i| i.as_str()), Some("shared"));
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_surfaces_a_broken_files_error_by_its_path_stem() {
+        // A file whose path is the requested id failed to parse: no claim was
+        // produced (so `LoadError::id` is None), but its stem names the id, so
+        // resolve returns LoadFailed carrying that file's parse error.
+        let (_dir, store) = store();
+        write(
+            &store,
+            ".claims/broken.md",
+            "---\nchecks: [unterminated\n---\nS.\n",
+        );
+        let load = store.load_all().unwrap();
+        match load.resolve("broken") {
+            Resolved::LoadFailed(err) => {
+                assert_eq!(err.file, ".claims/broken.md");
+                assert!(err.id.is_none(), "a parse failure records no id");
+            }
+            other => panic!("expected LoadFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_returns_not_found_for_a_genuine_unknown_id() {
+        let (_dir, store) = store();
+        write(&store, ".claims/pin.md", &claim_text("pin"));
+        let load = store.load_all().unwrap();
+        assert!(matches!(load.resolve("nope"), Resolved::NotFound));
+    }
+
+    #[test]
+    fn resolve_ignores_an_unrelated_broken_sibling() {
+        // A different id's broken file is not the requested id's concern: resolving a
+        // clean claim returns Found even when the store also holds a broken sibling.
+        let (_dir, store) = store();
+        write(&store, ".claims/good.md", &claim_text("good"));
+        write(
+            &store,
+            ".claims/bad.md",
+            "---\nchecks: [unterminated\n---\nS.\n",
+        );
+        let load = store.load_all().unwrap();
+        assert!(matches!(load.resolve("good"), Resolved::Found(_)));
+    }
+
+    #[test]
+    fn file_stem_matches_id_maps_a_claim_path_to_its_id() {
+        assert!(file_stem_matches_id(
+            ".claims/payments/pin.md",
+            "payments/pin"
+        ));
+        assert!(!file_stem_matches_id(".claims/payments/pin.md", "other"));
+        assert!(!file_stem_matches_id("elsewhere/pin.md", "pin"));
     }
 }

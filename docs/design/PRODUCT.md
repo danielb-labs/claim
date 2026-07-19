@@ -357,6 +357,8 @@ claim check     run every claim's checks and report holds/drifted/
                 unverifiable/broken now; stores nothing
 claim list      inventory: filter by text, path, supports — id, statement,
                 file, supports count (no status column; status is the hub's)
+claim show      print one claim's full definition — statement, checks,
+                supports, hub hints; runs nothing (static twin of check <id>)
 claim drift     run checks, list the drifted claims, each with what it supports
 claim amend     resolve drift: fix a claim's statement and check, require it
                 holds again

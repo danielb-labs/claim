@@ -542,6 +542,7 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
         <tr><td><code>claim add</code></td><td>Create a claim: run its check now, require it holds, write the file (no verdict) <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim check</code></td><td>Run every claim&rsquo;s checks and report holds/drifted/unverifiable/broken <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim list</code></td><td>Inventory claims by text, path, or supports &mdash; id, statement, file, supports count <span class="chip done">shipped</span></td></tr>
+        <tr><td><code>claim show</code></td><td>Print one claim&rsquo;s full definition &mdash; statement, checks, supports, hub hints (runs nothing) <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim drift</code></td><td>Run checks and list the drifted claims with what each supports <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim amend</code></td><td>Resolve drift by fixing a claim&rsquo;s statement and check; require it holds again <span class="chip done">shipped</span></td></tr>
         <tr><td><code>claim retire</code></td><td>Close a claim on purpose with a note; remove its file (a git rm) <span class="chip done">shipped</span></td></tr>
@@ -592,6 +593,19 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     inventory with no status column (status is the <a href="#hub">hub&rsquo;s</a>). Optional
     <code>[TERM]</code> is a case-sensitive substring matched against id and statement. Filters:
     <code>--path &lt;PREFIX&gt;</code> and <code>--supports &lt;TARGET&gt;</code>.</p>
+
+    <h3>claim show</h3>
+    <p><code>claim show &lt;ID&gt;</code> prints one claim&rsquo;s full definition &mdash; the statement, each
+    check (its <code>kind</code>, the <code>run</code> command or <code>agent</code> instruction, a
+    <code>negate</code> flag, and any <code>skip</code> with its reason and guards), the
+    <code>supports</code> targets, and the <a href="#hub"><code>hub:</code></a> hints. It is the static
+    counterpart to <code>claim check &lt;ID&gt;</code>: it runs <em>nothing</em> and produces no verdict.
+    An unknown id is a loud error (exit <code>2</code>) naming the id, never a blank success; a target
+    whose file failed to parse surfaces that parse error so you see <em>why</em> it could not be shown.
+    An unrelated malformed <em>sibling</em> is not its concern &mdash; if the requested claim loaded
+    cleanly it is shown and the command exits <code>0</code> (store-wide health is <code>list</code> and
+    <code>check</code>). <code>--json</code> emits the same definition as a self-describing object,
+    reusing the claim model&rsquo;s own shape so a check reads the way it is written on disk.</p>
 
     <h3>claim drift</h3>
     <p>Runs the checks and lists only the claims whose check reports <span class="chip red">drifted</span>

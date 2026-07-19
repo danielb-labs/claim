@@ -1,0 +1,24 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"show\", \"payments/libfoo-pin\"], 0)"
+---
+payments/libfoo-pin  (.claims/payments/libfoo-pin.md)
+
+We pin libfoo at 4.2.
+
+checks:
+  [0] cmd (negated)
+      run: grep -q 'libfoo==4.2' requirements.txt
+      skip: windows CI has no grep
+        unless: test -x /usr/bin/grep
+        until: 2027-01-01T00:00:00Z
+  [1] agent
+      instruction: Check the changelog since 5.0 for a CJK fix.
+
+supports:
+  - requirements.txt#libfoo
+  - other-claim
+
+hub:
+  recheck: 30d
+  max-age: 120d

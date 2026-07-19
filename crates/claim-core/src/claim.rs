@@ -93,15 +93,24 @@ pub struct Claim {
 /// and stops there; the hub reads these as defaults and may override them in its
 /// own config. Both are optional — a claim with no `hub:` block is valid, and its
 /// cadence is entirely the hub's to decide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct Hub {
     /// The cadence hint: how often the hub scheduler should re-check this claim,
     /// as a `<N>d` day count. `None` when unspecified.
+    ///
+    /// Omitted from `--json` output when `None`, so a hint-free claim carries no
+    /// empty `recheck` key rather than a misleading `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recheck: Option<Days>,
     /// The freshness-window hint: how long a passing check keeps the claim fresh
     /// before the hub should treat it as stale, as a `<N>d` day count. `None` when
     /// unspecified. This is the v1 `max-age`, demoted to a hub hint.
+    ///
+    /// Serialized as `max-age` (kebab-case, the file's spelling) and omitted when
+    /// `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age: Option<Days>,
 }
 
@@ -185,13 +194,23 @@ impl std::fmt::Display for ClaimId {
 /// check-type-specific payload. There is no trigger here: when a check runs is
 /// orchestration a CI step or the hub decides, not a property the claim asserts
 /// (see the module docs).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Check {
     /// The check's mechanism and its payload.
+    ///
+    /// Flattened in `--json` output so the check object carries a top-level `kind`
+    /// discriminator (`cmd`/`agent`/`human`) beside that kind's fields, matching the
+    /// file schema a reader already knows rather than nesting them under a `kind`
+    /// object.
+    #[serde(flatten)]
     pub kind: CheckKind,
     /// An optional declared skip: conditions under which this check is deliberately
     /// not run. `None` — the common case — means the check always runs.
+    ///
+    /// Omitted from `--json` output when absent, so a check that always runs carries
+    /// no empty `skip` key.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skip: Option<Skip>,
 }
 
@@ -211,7 +230,7 @@ pub struct Check {
 /// - [`until`](Skip::until) expires the skip so the debt is eventually called.
 ///
 /// Who added a skip, and when, is git's to say (invariant #3), never the file's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Skip {
     /// Why this check is skipped. Required; a skip with no reason is refused at parse.
@@ -220,9 +239,18 @@ pub struct Skip {
     /// a failure (exit 1) leaves the skip in force. A command that cannot be
     /// evaluated (any other exit, a spawn failure, a timeout) runs the check — a
     /// broken condition must never silently mute a check.
+    ///
+    /// Omitted from `--json` output when absent, so an unconditional skip carries no
+    /// empty `unless` key.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unless: Option<String>,
     /// The instant the skip expires. On or after it the check runs regardless of
     /// `unless`, and the lapse is reported. `None` means the skip has no time bound.
+    ///
+    /// Serialized as an RFC 3339 instant (jiff's default) and omitted when absent, so
+    /// an unbounded skip is a plain missing key a consumer reads as "no expiry" — the
+    /// same fact the human output prints.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<Timestamp>,
 }
 
@@ -235,7 +263,12 @@ pub struct Skip {
 /// forces every consumer — above all check execution — to handle a new kind the
 /// moment one is added, rather than silently skipping it. That compile error is
 /// the point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes internally-tagged by `kind` in kebab-case (`cmd`/`agent`/`human`),
+/// the same discriminator the file schema uses, so a `--json` consumer reads a
+/// check the way it is written on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum CheckKind {
     /// A command line the tool runs, mapping its exit code to a verdict. The tool
     /// owns that mapping and owns negation; see [`crate::verdict::Verdict`].
@@ -256,6 +289,10 @@ pub enum CheckKind {
     /// A scheduled human look. Not executed in v1.
     Human {
         /// An optional prompt shown to the person doing the check.
+        ///
+        /// Omitted from `--json` output when absent, so a promptless human check
+        /// carries no empty `prompt` key.
+        #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
     },
 }
@@ -267,8 +304,22 @@ pub enum CheckKind {
 /// positive: a zero-day window would mean a claim is stale the instant it is
 /// verified, which is never what an author intends, so it is rejected at parse
 /// time.
+///
+/// Serializes as its canonical `<N>d` string — the form an author writes and
+/// [`Display`](std::fmt::Display) prints — not a bare integer, so a `--json`
+/// consumer reads back exactly the spelling the file carries and a day count is
+/// never confused with a plain number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Days(NonZeroU32);
+
+impl serde::Serialize for Days {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
 
 impl Days {
     /// The number of days, guaranteed positive. Returned as a plain `u32` so call
@@ -356,7 +407,11 @@ fn parse_day_count(raw: &str) -> std::result::Result<NonZeroU32, String> {
 /// resolve is meant to make the claim go loud, not to fail parsing. Validation
 /// here is only that the target is non-empty, since an empty edge is a certain
 /// authoring mistake.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Serializes transparently as its string, so a `--json` consumer sees the target
+/// exactly as written in the claim's `supports` list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(transparent)]
 pub struct SupportTarget(String);
 
 impl SupportTarget {
@@ -1921,5 +1976,114 @@ See [[libfoo-cjk-repro]] for the reproduction.
         let text = "\u{feff}---\nid: a\nchecks:\n  - kind: cmd\n    run: x\n---\nS.\n";
         let claim = parse_claim_file("f.md", text).unwrap();
         assert_eq!(claim.id.as_str(), "a");
+    }
+
+    // The `Serialize` impls the CLI's `claim show --json` reuses. These pin the
+    // exact wire shape directly (not transitively through the CLI), so a change to a
+    // rename, a tag, a `skip_serializing_if`, or `Days`' custom impl is a visible,
+    // deliberate diff here.
+    use serde_json::json;
+
+    #[test]
+    fn days_serializes_as_its_canonical_string() {
+        // Not a bare integer: the `<N>d` spelling round-trips and cannot be confused
+        // with a plain number.
+        assert_eq!(serde_json::to_value(Days(nz(30))).unwrap(), json!("30d"));
+    }
+
+    #[test]
+    fn support_target_serializes_transparently_as_its_string() {
+        let target = SupportTarget("requirements.txt#libfoo".to_owned());
+        assert_eq!(
+            serde_json::to_value(&target).unwrap(),
+            json!("requirements.txt#libfoo")
+        );
+    }
+
+    #[test]
+    fn hub_uses_kebab_case_max_age_and_omits_absent_hints() {
+        // Both present: `max-age` is kebab-cased and every hint is its `<N>d` string.
+        let full = Hub {
+            recheck: Some(Days(nz(30))),
+            max_age: Some(Days(nz(120))),
+        };
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            json!({"recheck": "30d", "max-age": "120d"})
+        );
+        // Absent hints are omitted, not null — a hint-free block is an empty object,
+        // so the CLI never invents a cadence a hub would read as a real default.
+        assert_eq!(serde_json::to_value(Hub::default()).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn check_kind_is_internally_tagged_by_kind() {
+        // A cmd check: `{kind: "cmd", run, negate}` — the file's own discriminator.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Cmd {
+                run: "true".to_owned(),
+                negate: true,
+            })
+            .unwrap(),
+            json!({"kind": "cmd", "run": "true", "negate": true})
+        );
+        // An agent check: `{kind: "agent", instruction}`.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Agent {
+                instruction: "look".to_owned(),
+            })
+            .unwrap(),
+            json!({"kind": "agent", "instruction": "look"})
+        );
+        // A human check with no prompt omits the `prompt` key entirely.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Human { prompt: None }).unwrap(),
+            json!({"kind": "human"})
+        );
+    }
+
+    #[test]
+    fn check_flattens_its_kind_and_omits_an_absent_skip() {
+        // The kind is flattened onto the check object (a top-level `kind` beside its
+        // fields), and a check with no skip carries no `skip` key.
+        let check = Check {
+            kind: CheckKind::Cmd {
+                run: "true".to_owned(),
+                negate: false,
+            },
+            skip: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            json!({"kind": "cmd", "run": "true", "negate": false})
+        );
+    }
+
+    #[test]
+    fn skip_serializes_its_guards_and_omits_absent_ones() {
+        // A full skip: reason, unless, and an RFC 3339 `until` (jiff's default form).
+        let full = Skip {
+            reason: "windows CI has no grep".to_owned(),
+            unless: Some("test -x /usr/bin/grep".to_owned()),
+            until: Some("2027-01-01T00:00:00Z".parse().unwrap()),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({
+                "reason": "windows CI has no grep",
+                "unless": "test -x /usr/bin/grep",
+                "until": "2027-01-01T00:00:00Z",
+            })
+        );
+        // A reason-only skip omits both guards rather than emitting nulls.
+        let bare = Skip {
+            reason: "flaky in CI".to_owned(),
+            unless: None,
+            until: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"reason": "flaky in CI"})
+        );
     }
 }
