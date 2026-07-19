@@ -118,7 +118,11 @@ boot_hub() {
   local bin="$1" db="$2" port="$3" logf="$4"
   local cfg
   cfg="$(dirname "$db")/hub.toml"
-  printf 'listen = "127.0.0.1:%s"\ndatabase = "%s"\n' "$port" "$db" > "$cfg"
+  # `open_reads = true` is this local exercise's read-auth decision: the hub is secure by
+  # default and will not boot without one, and this script reads /api/claims over loopback.
+  # A real deployment configures an IdP or a minted token instead (docs/hub.md).
+  printf 'listen = "127.0.0.1:%s"\ndatabase = "%s"\n[read_auth]\nopen_reads = true\n' \
+    "$port" "$db" > "$cfg"
   "$bin" --config "$cfg" >"$logf" 2>&1 &
   local pid=$!
   for _ in $(seq 1 100); do

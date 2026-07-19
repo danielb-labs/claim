@@ -78,6 +78,12 @@ EXPOSE 8080
 # empty config so these CLAIM_HUB_* env overrides alone drive the boot — which is what lets
 # an EMPTY data volume with no config file boot on the right address and database path. (A
 # malformed hub.toml, or a --config path that is missing, is still a loud failure.) A
-# self-hoster who wants richer config (stores, [oidc]) drops a hub.toml into the mounted
-# volume; env overrides still win.
+# self-hoster who wants richer config (stores, [oidc], [read_auth]) drops a hub.toml into the
+# mounted volume; env overrides still win.
+#
+# The image deliberately does NOT set CLAIM_HUB_OPEN_READS: read auth is secure by default,
+# so an unconfigured hub refuses to boot rather than serve open reads. The operator makes the
+# read-auth decision explicitly — a [read_auth.issuer] or [[read_auth.tokens]] in a mounted
+# hub.toml, or `CLAIM_HUB_OPEN_READS=true` for a trusted private network. Baking open reads
+# into the image would be exactly the "open by accident" regression secure-by-default prevents.
 ENTRYPOINT ["claim-hub"]

@@ -6,6 +6,7 @@
 //! exact rot this product exists to kill. A client (human or agent) reads the reason the
 //! same way regardless of which route refused it.
 
+use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,6 +26,28 @@ pub fn problem(status: StatusCode, reason: &str) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Build a problem response carrying extra headers — the read-auth `401`'s RFC 9728
+/// `WWW-Authenticate` pointer being the one caller.
+///
+/// The same `{ "error": … }` body as [`problem`], plus each `(name, value)` header. A
+/// header value that is not a valid HTTP header string is dropped rather than panicking:
+/// the pointer is a best-effort discovery aid, and a malformed one must not turn a `401`
+/// into a `500` (the client still gets the loud `401`).
+#[must_use]
+pub fn problem_with_headers(
+    status: StatusCode,
+    reason: &str,
+    headers: &[(HeaderName, String)],
+) -> Response {
+    let mut response = problem(status, reason);
+    for (name, value) in headers {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            response.headers_mut().insert(name.clone(), value);
+        }
+    }
+    response
 }
 
 /// The body of any hub error: a single machine-readable reason.

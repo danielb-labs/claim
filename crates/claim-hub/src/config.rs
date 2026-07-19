@@ -147,17 +147,57 @@ pub struct HubOverrides(pub std::collections::BTreeMap<String, String>);
 ///
 /// The v1 default is secure-by-default: authed-everything, with the scoped-token
 /// floor for IdP-less self-hosters (HUB-IMPLEMENTATION.md §4.5, decision 5). Open
-/// reads are an explicit opt-in for a trusted private network. The shell serves only
-/// unauthenticated `/status`, so this is carried but not yet enforced. The derived
-/// `Default` gives `open_reads = false` — authed-everything — which is exactly the
-/// secure default, so the safe policy is the one an absent `[read_auth]` section gets.
+/// reads are an explicit opt-in for a trusted private network.
+///
+/// **Secure by default is not enforced by this struct's `Default`** — the derived default
+/// (`open_reads = false`, no issuer, no tokens) is *authed-everything with no
+/// authenticator*, which cannot serve anyone. That is deliberate: the boot path
+/// ([`crate::serve`]) resolves this config into a [`ReadAuthPolicy`](crate::readauth::ReadAuthPolicy),
+/// and resolution **fails loudly** on that state rather than silently opening reads. So a
+/// hub with a bare `[read_auth]` (or none) does not boot until the operator either
+/// configures an authenticator or explicitly opts into open reads — the "open by accident"
+/// regression is impossible.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadAuthConfig {
     /// When `true`, read surfaces are open (no bearer required) — the private-network
-    /// opt-in. Defaults to `false`: authed-everything.
+    /// opt-in. Defaults to `false`: authed-everything. This is the *only* way to serve
+    /// reads with no authentication.
     #[serde(default)]
     pub open_reads: bool,
+
+    /// The OAuth 2.1 IdP the hub validates read bearer JWTs against. `None` when the hub
+    /// runs on the scoped-token floor alone (or open reads).
+    #[serde(default)]
+    pub issuer: Option<ReadIssuerConfig>,
+
+    /// The hub-minted scoped tokens (the IdP-less floor), each stored as a hash. Empty when
+    /// the hub relies on an IdP or serves open reads. A present entry with no scopes or a
+    /// malformed hash is a loud boot error (invariant #6), never a silent dead token.
+    #[serde(default)]
+    pub tokens: Vec<crate::token::ScopedToken>,
+}
+
+/// The OAuth 2.1 read IdP trust anchor: the issuer whose JWKS signs read bearer tokens.
+///
+/// Distinct from the ingest `[oidc]` anchor (which trusts GitHub Actions to attest a
+/// *producer*): this is the customer's own IdP acting as the authorization server for
+/// *reads*. The hub validates a read token's `iss` against `issuer`, its `aud` against
+/// `audience` (the hub's own identifier — the RFC 9728 `resource`), and its signature
+/// against the JWKS at `jwks_url`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadIssuerConfig {
+    /// The IdP issuer URL a read token's `iss` claim must equal, and the value published as
+    /// the RFC 9728 `authorization_servers` entry so a client discovers where to get a token.
+    pub issuer: String,
+    /// The hub's own identifier a read token's `aud` claim must equal — the RFC 9728
+    /// `resource`. This is what stops a token minted for another service from being replayed
+    /// against the hub's reads.
+    pub audience: String,
+    /// The JWKS endpoint the hub fetches the issuer's signing keys from (cached, refreshed
+    /// on an unknown key id, rate-limited — the same machinery as the ingest gate).
+    pub jwks_url: String,
 }
 
 /// The deriver's freshness knobs, as the TOML file spells them.
@@ -269,6 +309,9 @@ impl Config {
     /// Recognized overrides:
     /// - `CLAIM_HUB_LISTEN` — the listen [`SocketAddr`], e.g. `0.0.0.0:8080`.
     /// - `CLAIM_HUB_DATABASE` — the database file path.
+    /// - `CLAIM_HUB_OPEN_READS` — the explicit open-reads opt-in (`true`/`false`), so an
+    ///   empty-volume container can serve open reads on a trusted private network with no
+    ///   config file; unset leaves the file's value (default authed-everything).
     pub fn load_with_env(source: ConfigSource<'_>) -> anyhow::Result<Self> {
         let mut config = Self::load_source(source)?;
         config.apply_env(&EnvVars::from_process())?;
@@ -336,7 +379,32 @@ impl Config {
         if let Some(database) = &env.database {
             self.database = PathBuf::from(database);
         }
+        if let Some(open_reads) = &env.open_reads {
+            // The explicit open-reads opt-in as an env var, so an empty-volume container
+            // (no config file) can serve open reads on a trusted private network without a
+            // TOML file — but still only by *explicitly* setting this, never by default. A
+            // value other than a clear boolean is a loud error, not a silent "false": a
+            // typo must not quietly leave the hub authed-everything with no authenticator
+            // (which then fails the read-auth boot check) OR quietly open it.
+            self.read_auth.open_reads = parse_bool_env("CLAIM_HUB_OPEN_READS", open_reads)?;
+        }
         Ok(())
+    }
+}
+
+/// Parse a boolean environment override, accepting only unambiguous spellings.
+///
+/// `true`/`1` → `true`, `false`/`0` → `false` (case-insensitive). Anything else is a loud
+/// error naming the variable, so a typo like `CLAIM_HUB_OPEN_READS=yes` fails the boot
+/// rather than being read as `false` (silently authed) or `true` (silently open) — the
+/// value is security-load-bearing, so it must be exact.
+fn parse_bool_env(var: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(anyhow::anyhow!(
+            "{var}=`{other}`: expected `true` or `false`"
+        )),
     }
 }
 
@@ -350,6 +418,7 @@ impl Config {
 struct EnvVars {
     listen: Option<String>,
     database: Option<String>,
+    open_reads: Option<String>,
 }
 
 impl EnvVars {
@@ -359,6 +428,7 @@ impl EnvVars {
         Self {
             listen: std::env::var("CLAIM_HUB_LISTEN").ok(),
             database: std::env::var("CLAIM_HUB_DATABASE").ok(),
+            open_reads: std::env::var("CLAIM_HUB_OPEN_READS").ok(),
         }
     }
 }
@@ -485,6 +555,7 @@ mod tests {
         let env = EnvVars {
             listen: Some("0.0.0.0:9999".to_owned()),
             database: Some("/data/hub.db".to_owned()),
+            ..EnvVars::default()
         };
         config.apply_env(&env).unwrap();
         assert_eq!(config.listen, "0.0.0.0:9999".parse().unwrap());
@@ -505,11 +576,52 @@ mod tests {
         let mut config = Config::from_toml("").unwrap();
         let env = EnvVars {
             listen: Some("not-an-address".to_owned()),
-            database: None,
+            ..EnvVars::default()
         };
         let err = config.apply_env(&env).unwrap_err();
         assert!(
             err.to_string().contains("CLAIM_HUB_LISTEN"),
+            "names the variable: {err}"
+        );
+    }
+
+    #[test]
+    fn the_open_reads_env_override_sets_the_policy() {
+        // The explicit env opt-in flips the policy to open, so an empty-volume container
+        // can serve open reads with no config file — but only by setting it.
+        let mut config = Config::from_toml("").unwrap();
+        assert!(!config.read_auth.open_reads);
+        let env = EnvVars {
+            open_reads: Some("true".to_owned()),
+            ..EnvVars::default()
+        };
+        config.apply_env(&env).unwrap();
+        assert!(config.read_auth.open_reads);
+    }
+
+    #[test]
+    fn a_false_open_reads_env_override_keeps_reads_authed() {
+        let mut config = Config::from_toml("[read_auth]\nopen_reads = true\n").unwrap();
+        let env = EnvVars {
+            open_reads: Some("false".to_owned()),
+            ..EnvVars::default()
+        };
+        config.apply_env(&env).unwrap();
+        assert!(!config.read_auth.open_reads);
+    }
+
+    #[test]
+    fn a_malformed_open_reads_env_override_names_the_variable() {
+        // The value is security-load-bearing, so a typo fails loudly rather than being read
+        // as `false` (silently authed) or `true` (silently open).
+        let mut config = Config::from_toml("").unwrap();
+        let env = EnvVars {
+            open_reads: Some("yes".to_owned()),
+            ..EnvVars::default()
+        };
+        let err = config.apply_env(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("CLAIM_HUB_OPEN_READS"),
             "names the variable: {err}"
         );
     }
@@ -548,6 +660,45 @@ mod tests {
                 .get("payments/libfoo-pin")
                 .map(String::as_str),
             Some("max-age: 30d")
+        );
+    }
+
+    #[test]
+    fn a_full_read_auth_section_parses_the_issuer_and_tokens() {
+        // The hub-13 read-auth config: an IdP issuer and one or more hashed scoped tokens.
+        let config = Config::from_toml(
+            r#"
+            [read_auth]
+            open_reads = false
+
+            [read_auth.issuer]
+            issuer = "https://idp.acme.example"
+            audience = "https://hub.acme.example"
+            jwks_url = "https://idp.acme.example/.well-known/jwks.json"
+
+            [[read_auth.tokens]]
+            name = "ci-dashboard"
+            scopes = ["read"]
+            hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.read_auth.open_reads);
+        let issuer = config.read_auth.issuer.expect("issuer present");
+        assert_eq!(issuer.issuer, "https://idp.acme.example");
+        assert_eq!(issuer.audience, "https://hub.acme.example");
+        assert_eq!(config.read_auth.tokens.len(), 1);
+        assert_eq!(config.read_auth.tokens[0].name, "ci-dashboard");
+    }
+
+    #[test]
+    fn an_unknown_read_auth_key_is_rejected() {
+        // `deny_unknown_fields` on the read-auth sections: a typo'd or stray key is a loud
+        // parse error, not a silently ignored line that could weaken auth.
+        let err = Config::from_toml("[read_auth]\nopen_read = true\n").unwrap_err();
+        assert!(
+            err.to_string().contains("open_read"),
+            "names the key: {err}"
         );
     }
 

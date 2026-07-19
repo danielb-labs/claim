@@ -16,10 +16,11 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
 > over the deriver), the **web UI** (server-rendered pages over the same read model, each
 > with a machine-readable **markdown twin**), **`/llms.txt`** (the agent-facing index of every
-> surface), and the **hub MCP** (the agent binding — five read-only tools over the same read
-> model, mounted at `/mcp`). A freshly booted hub reports a truthful *empty* position — head 0,
-> version 0 — until a sync populates the registry and a CI lane starts pushing verdicts through
-> the ingest gate.
+> surface), the **hub MCP** (the agent binding — five read-only tools over the same read
+> model, mounted at `/mcp`), and **read authentication** (a bearer-token layer over every read
+> surface — an IdP or hub-minted scoped tokens, secure by default). A freshly booted hub reports
+> a truthful *empty* position — head 0, version 0 — until a sync populates the registry and a CI
+> lane starts pushing verdicts through the ingest gate.
 
 ## Running the binary
 
@@ -103,16 +104,22 @@ absent a window, the hub does not invent one. `max_age_override` is the operator
 word on cadence for this environment; `default_max_age` is the fallback for claims that
 declare none of their own.
 
-Other sections a later item consumes are already accepted so an operator's file
-keeps working as the hub grows: `[[stores]]` (connected git stores, syncing),
-`[hub_overrides]` (per-hub `hub:` cadence overrides), and `[read_auth]` (read-auth
-policy, secure-by-default).
+The `[read_auth]` section configures **read authentication** for the API, UI, and MCP
+surfaces — see [Read authentication](#read-authentication) below. It is **secure by
+default**: with no read-auth decision the hub refuses to boot rather than serve open reads.
 
-Two environment variables override the file's fields per instance, so a shared
+Other sections a later item consumes are already accepted so an operator's file
+keeps working as the hub grows: `[[stores]]` (connected git stores, syncing) and
+`[hub_overrides]` (per-hub `hub:` cadence overrides).
+
+A few environment variables override the file's fields per instance, so a shared
 config can be pointed at different addresses or database paths without editing it:
 
 - `CLAIM_HUB_LISTEN` — overrides `listen` (e.g. `0.0.0.0:8080`).
 - `CLAIM_HUB_DATABASE` — overrides `database`.
+- `CLAIM_HUB_OPEN_READS` — the explicit open-reads opt-in (`true`/`false`), so an
+  empty-volume container can serve open reads on a trusted private network with no config
+  file. Unset leaves the file's value (default: authed).
 
 A malformed override is as loud as a malformed file field, naming the variable.
 
@@ -204,6 +211,103 @@ A rejected push **writes no event** and returns a JSON body naming the reason
 telemetry away is visible rather than silently aging claims into stale. An
 *unavailable* identity provider is a `503`, not a rejection: the hub could not judge
 the token, so it never calls a possibly-valid push forged — the producer retries.
+
+## Read authentication
+
+The hub's read surfaces — the JSON API (`/api/*`), the web UI and its markdown twins
+(`/ui/*`, `/llms.txt`), and the hub MCP (`/mcp`) — sit behind one **read-auth layer**, so
+every read route is gated the same way. Only `/status` (health) and the discovery document
+(below) are served unauthenticated, deliberately.
+
+**Secure by default.** A hub with no read-auth decision does **not** boot: with authed
+reads in force and no way to authenticate anyone, it fails loudly at startup and names the
+fix, rather than silently serving open reads. There are three ways to make the decision —
+configure an IdP, mint a scoped token, or explicitly open reads:
+
+### Option A — an OAuth 2.1 identity provider
+
+Point the hub at your IdP; it validates a read's `Authorization: Bearer <jwt>` against the
+issuer's JWKS (RS256 pinned, `iss`/`aud`/`exp` required, the signature checked — the same
+machinery the ingest gate uses, with the JWKS refresh rate-limited the same way). A token's
+`scope` claim must include `read`:
+
+```toml
+[read_auth.issuer]
+issuer = "https://idp.acme.example"                      # a read token's `iss` must equal this
+audience = "https://hub.acme.example"                     # a read token's `aud` must equal this (the hub's identifier)
+jwks_url = "https://idp.acme.example/.well-known/jwks.json"
+```
+
+An empty `issuer`, `audience`, or `jwks_url` is refused at boot (empty pinning would accept
+any token).
+
+### Option B — hub-minted scoped tokens (no IdP needed)
+
+For a self-hoster with no IdP, the hub mints its own scoped bearer tokens. Run:
+
+```sh
+claim-hub mint-token --name ci-dashboard --scope read
+```
+
+It prints the **raw token once** (give it to the client) and a config snippet holding only
+its **hash** (paste it into the config). The hub stores only the hash — a leaked config (or
+backup) yields no usable token:
+
+```toml
+[[read_auth.tokens]]
+name = "ci-dashboard"
+scopes = ["read"]
+hash = "sha256:…"          # the hash of the token; the raw token is never stored
+```
+
+The client then reads with `Authorization: Bearer <raw-token>`. To revoke a token, delete
+its entry. `--scope` may repeat (`read`, and `act` for a future write surface); it defaults
+to `read`.
+
+### Option C — open reads (trusted private network only)
+
+To serve reads with no credential — appropriate only behind a trusted private network —
+opt in **explicitly**:
+
+```toml
+[read_auth]
+open_reads = true
+```
+
+or set `CLAIM_HUB_OPEN_READS=true` (handy for an empty-volume container with no config
+file). This is the **only** way to open reads; it is never the default.
+
+### What a client sees
+
+| Situation | Status |
+|---|---|
+| No credential (and reads not opened) | `401` with a `WWW-Authenticate: Bearer resource_metadata="…"` pointer |
+| Bad signature / expired / wrong `aud` / wrong `iss` / unknown key | `401` |
+| Unrecognized hub token | `401` |
+| Authenticated, but the token lacks the `read` scope | `403` |
+| Identity provider unreachable (cannot verify *now*) | `503` (never a silent allow) |
+| Valid IdP token or hub token with `read` | `200` |
+
+A `401` points at the **RFC 9728 protected-resource metadata** document, served
+unauthenticated so a client can discover how to authenticate:
+
+```sh
+curl -s http://127.0.0.1:8080/.well-known/oauth-protected-resource
+```
+
+```json
+{
+  "resource": "https://hub.acme.example",
+  "authorization_servers": ["https://idp.acme.example"],
+  "bearer_methods_supported": ["header"],
+  "scopes_supported": ["read"]
+}
+```
+
+`authorization_servers` is omitted when the hub runs on the scoped-token floor with no IdP
+(a hub token is provisioned out of band, by `mint-token`). The scope model is **read
+broadly, act narrowly**: v1 has no act endpoints, so `read` is the only scope any route
+requires, but a future act surface will require `act` — a `read` token can never reach it.
 
 ## Pushing verdicts from CI (the ingest Action)
 

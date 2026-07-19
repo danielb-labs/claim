@@ -115,14 +115,35 @@ fn a_database_env_override_reaches_the_config() {
 }
 
 #[test]
-fn boots_config_less_from_env_and_status_reports_truthful_zeros() {
+fn a_config_less_boot_without_a_read_auth_decision_fails_loudly() {
+    // Secure-by-default (§4.5 decision 5): a hub with no config and no read-auth env opt-in
+    // is authed-everything with no authenticator, which cannot serve anyone — so it must
+    // FAIL the boot loudly, never silently serve open reads. This is the dangerous
+    // regression the item warns about, guarded end-to-end through the real binary.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hub.db");
+    let port = free_loopback_port();
+    hub()
+        .current_dir(dir.path())
+        .env("CLAIM_HUB_LISTEN", format!("127.0.0.1:{port}"))
+        .env("CLAIM_HUB_DATABASE", &db_path)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("read auth"))
+        .stderr(contains("open_reads"));
+}
+
+#[test]
+fn boots_config_less_with_open_reads_optin_and_status_reports_truthful_zeros() {
     // The empty-volume contract (HUB-IMPLEMENTATION.md §1.13): no `hub.toml`, no
     // `--config`, only `CLAIM_HUB_*` env overrides — so the binary must fall back to an
-    // empty config and serve. This is the exact command `docker run` against a fresh
-    // volume issues; before the missing-default fallback it died with `config hub.toml:
-    // No such file or directory`. The child's working directory is an empty temp dir, so
-    // there is provably no default `hub.toml` to read, and the port is a fresh loopback
-    // bind released just before spawn.
+    // empty config and serve. `CLAIM_HUB_OPEN_READS=true` is the explicit, secure opt-in
+    // that lets an empty-volume hub serve reads with no authenticator on a trusted private
+    // network — the ONLY way to that state (without it the boot fails loudly, proven above).
+    // This is the exact command `docker run` against a fresh volume issues once the operator
+    // has made the read-auth decision. The child's working directory is an empty temp dir, so
+    // there is provably no default `hub.toml` to read, and the port is a fresh loopback bind.
     let dir = tempfile::tempdir().unwrap();
     assert!(
         !dir.path().join("hub.toml").exists(),
@@ -137,6 +158,7 @@ fn boots_config_less_from_env_and_status_reports_truthful_zeros() {
         .env_clear()
         .env("CLAIM_HUB_LISTEN", format!("127.0.0.1:{port}"))
         .env("CLAIM_HUB_DATABASE", &db_path)
+        .env("CLAIM_HUB_OPEN_READS", "true")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()

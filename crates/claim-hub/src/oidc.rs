@@ -215,7 +215,11 @@ impl<S: JwksSource> JwksCache<S> {
     /// [`OidcError::UnknownKey`] if `kid` is not in the issuer's set (after any allowed
     /// refresh); [`OidcError::Fetch`] if a fetch was attempted and failed;
     /// [`OidcError::Key`] if the matched JWK cannot be turned into a decoding key.
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, OidcError> {
+    ///
+    /// `pub(crate)` so the read-auth verifier ([`crate::readauth`]) shares the identical
+    /// cached, debounced key resolution instead of duplicating it — one JWKS-cache
+    /// implementation behind both auth surfaces.
+    pub(crate) async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, OidcError> {
         // Populate the cache on first use. The initial fetch is not debounced against
         // "never" — a cold cache must fetch — but it does record the fetch time, so an
         // immediately-following unknown-kid miss is debounced.
