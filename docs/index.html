@@ -648,7 +648,11 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     composes. Pass <code>--open</code> to also hand the page to the platform opener (<code>open</code>,
     <code>xdg-open</code>, or <code>start</code>); a box with no opener still just prints the path and exits
     <code>0</code> rather than failing. <code>claim docs &lt;topic&gt;</code> selects a deeper page:
-    <code>ci</code>, <code>agent-checks</code>, or <code>dogfooding</code>.</p>
+    <code>ci</code>, <code>agent-checks</code>, or <code>dogfooding</code>. Set
+    <code>CLAIM_DOCS_CACHE_DIR</code> to write the site under a directory of your choosing instead of the
+    platform cache location (<code>$XDG_CACHE_HOME</code> or <code>~/.cache</code>,
+    <code>~/Library/Caches</code>, <code>%LOCALAPPDATA%</code>); the content is reproducible from the
+    binary, so relocating that cache costs only a rewrite.</p>
   </section>
 
   <section id="docs">
