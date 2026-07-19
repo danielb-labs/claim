@@ -1,0 +1,36 @@
+[package]
+name = "claim-hub-core"
+description = "The hub's pure domain: the event envelope, wire-format parsing of the CLI's --json report, the canonical check-digest, and evidence capping. No IO, no async, no network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Reuse the CLI's domain types verbatim: the envelope's `verdict` is
+# `claim_core::Verdict` and its `reported_at` is `claim_core::Timestamp`, and the
+# check-digest hashes a `claim_core::Check`. Naming one set of types is what keeps
+# the hub and the CLI from disagreeing about a verdict's meaning.
+claim-core = { path = "../claim-core" }
+# The envelope and the CLI-report wire types (de)serialize as JSON: the hub ingests
+# the CLI's `--json` as a wire format and stores the envelope on its ledger.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The check-digest is a cryptographic hash of a check's canonical definition, so a
+# check's identity is collision-resistant and stable across CLI versions and
+# machines. `sha2` (RustCrypto) is the audited, pure-Rust, dependency-light SHA-256
+# — the natural fit for a stable content digest, chosen over a non-cryptographic
+# hash (`ahash`/`fxhash`, whose outputs are unstable across versions and platforms
+# and offer no collision resistance) and over pulling a broader crypto suite. The
+# 0.10 line is the long-stable, widely-audited RustCrypto release.
+sha2 = "0.10"
+
+[dev-dependencies]
+# The contract test builds and drives the real `claim` binary against a temp store
+# and parses its actual `--json`, keeping the two ends of the wire honest. It shells
+# out to the binary directly (the cross-crate test cannot use `assert_cmd`'s
+# `cargo_bin`, which relies on a `CARGO_BIN_EXE_*` var cargo sets only for the
+# `claim` crate's own tests), so only `tempfile` for the throwaway store is needed —
+# `tempfile` is part of the approved CLI integration-test stack (CLAUDE.md).
+tempfile = "3"
