@@ -1,0 +1,262 @@
+# Deliver the hub's rendered nags to the forge — the delivery half of the nag loop.
+#
+# The hub RENDERS nag content (it derives standing over the ledger, groups a breaking
+# commit's claims into one item, resolves each owner from CODEOWNERS in its git mirror) and
+# serves it at `GET /api/nags`. This Action DELIVERS that content to the forge: it pulls the
+# nag view, renders it to markdown in ONE place (ci/nag-deliver.mjs), and upserts the standing
+# issue (find-or-update by a stable marker, so a hundred scheduled runs leave one issue, not a
+# hundred). The forge write credential lives HERE, in the CI lane — never in the hub, which
+# holds no forge write token in v1 (HUB-IMPLEMENTATION.md §4.5 decision 4).
+#
+# The pull is authenticated: the hub's `/api` is behind read auth, so the lane presents a
+# hub-minted read-scoped token (`claim-hub mint-token --scope read`) as `Authorization:
+# Bearer`. Provision it once as a CI secret and pass it in `read-token` — see docs/hub.md,
+# "Delivering the nag from CI." This is separate from the forge write token (`GITHUB_TOKEN`,
+# used only by the upsert step): the read token reads the hub, the forge token writes the
+# issue, and neither is the other.
+#
+# Fail-loud, never a stale green (CLAUDE.md invariant #6): the pull core (ci/hub-nags.sh)
+# fails the step on any non-2xx from the hub, on an unreachable hub, and on a timeout, and it
+# writes NOTHING to its --out on failure — so the upsert step is skipped and the previous
+# standing issue is left intact rather than blanked over a broken pull. A hub outage is a red
+# lane and a human looking, never a green issue over stale data.
+#
+# The pull-and-render core lives in `ci/hub-nags.sh` + `ci/nag-deliver.mjs` so it is testable
+# outside a real runner (crates/claim-hub/tests/nag_delivery.rs runs it against a locally
+# served hub). This YAML is the thin wrapper: it runs that core, then upserts the issue
+# through the forge API (the one part that genuinely needs a runner's `GITHUB_TOKEN`).
+
+name: Deliver claim-hub nags
+description: >
+  Pull the hub's rendered nag view from `GET /api/nags` with a read-scoped token and upsert it
+  to the forge: the standing "claim: due & drifted" issue (mode issue), or the one advisory PR
+  comment (mode comment). Fails loudly on any hub-pull failure and leaves the previous surface
+  intact rather than blanking it.
+
+inputs:
+  hub-url:
+    description: The hub's base URL (e.g. https://hub.acme.example). `/api/nags` is appended.
+    required: true
+  read-token:
+    description: >
+      A hub-minted read-scoped token (`claim-hub mint-token --scope read`), presented as
+      `Authorization: Bearer` to the hub's read-authed `/api/nags`. Provision it as a CI
+      secret; it reads the hub only and is distinct from the forge write token.
+    required: true
+  mode:
+    description: >
+      Which forge surface to deliver to: `issue` maintains the one standing "claim: due &
+      drifted" issue (for a scheduled lane); `comment` maintains the one advisory bot comment
+      on a PR (needs `pr-number`). Both render the SAME hub view — one source of truth.
+    required: false
+    default: issue
+  pr-number:
+    description: >
+      The pull-request number to upsert the advisory comment on. Required (and only used) when
+      `mode` is `comment`; ignored for `mode: issue`.
+    required: false
+    default: ""
+  claim-repo:
+    description: The owner/name of the claim tool repository to source the CI glue from.
+    required: false
+    default: your-org/claim
+  claim-ref:
+    description: The git ref of the claim tool repo to source the CI glue from.
+    required: false
+    default: main
+  issue-title:
+    description: The title of the standing issue this lane maintains (mode issue).
+    required: false
+    default: "claim: due & drifted"
+  issue-label:
+    description: The label applied to the standing issue (mode issue; narrows the find, the marker is authority).
+    required: false
+    default: claim
+  github-token:
+    description: >
+      The forge write token used to upsert the issue or comment (needs `issues: write` for an
+      issue, `pull-requests: write` for a comment). Defaults to the job's `GITHUB_TOKEN`. This
+      is the ONLY forge write credential the lane holds; it never leaves the upsert step.
+    required: false
+    default: ${{ github.token }}
+  max-time:
+    description: >
+      Seconds bounding the hub pull's HTTP request. A hub that accepts the connection then
+      never answers times out into a loud failure rather than hanging the lane.
+    required: false
+    default: "60"
+
+runs:
+  using: composite
+  steps:
+    # Source the CI glue (the pull script and the renderer) from the claim tool repo, so the
+    # delivered content is rendered by the same one place the tool ships — not re-derived in
+    # this YAML. Checked out into a side directory so it never collides with the caller's tree.
+    - name: Check out the claim tool
+      # Pinned to a major tag, matching the sibling lanes (claim-clock, hub-ingest): GitHub's
+      # own first-party actions track a mutable major tag here; only third-party actions
+      # (Swatinem/rust-cache) are SHA-pinned. Keep this consistent with the other lanes.
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.claim-repo }}
+        ref: ${{ inputs.claim-ref }}
+        path: _claim_tool
+
+    # Pull the hub's rendered nag view and render it to the delivery body (issue or comment).
+    # On ANY pull failure this step fails the lane loudly and leaves the body file unset, so the
+    # upsert steps below are skipped and the previous surface is untouched (invariant #6).
+    - name: Pull and render the hub nags
+      id: render
+      shell: bash
+      env:
+        # The read-scoped token, handed to the pull script's injection seam. A leaked read
+        # token discloses the nag queue but cannot forge a verdict; it is still a secret.
+        HUB_NAGS_TOKEN: ${{ inputs.read-token }}
+        HUB_URL: ${{ inputs.hub-url }}
+        HUB_MAX_TIME: ${{ inputs.max-time }}
+        HUB_NAG_MODE: ${{ inputs.mode }}
+        # The action's own directory, so the glue is found regardless of the caller's layout.
+        ACTION_PATH: ${{ github.action_path }}
+      # Inputs are passed via env, never interpolated into the command line, to keep untrusted
+      # input off the shell (the Actions injection footgun). The glue lives under the checked-
+      # out tool repo (_claim_tool/ci); this action directory is three levels below the caller
+      # root (.github/actions/hub-nag-deliver), so GITHUB_WORKSPACE holds _claim_tool.
+      run: |
+        case "$HUB_NAG_MODE" in
+          issue|comment) ;;
+          *) echo "hub-nag-deliver: mode must be 'issue' or 'comment', got '$HUB_NAG_MODE'" >&2; exit 1 ;;
+        esac
+        nags_file="$RUNNER_TEMP/nags.json"
+        body_file="$RUNNER_TEMP/nag-body.md"
+        glue="$GITHUB_WORKSPACE/_claim_tool/ci"
+
+        # Pull the nag view. hub-nags.sh fails loudly on a non-2xx, an unreachable hub, or a
+        # timeout, and writes nothing to --out on failure — so a broken pull aborts the step
+        # here, before any render or upsert, leaving the previous surface intact.
+        "$glue/hub-nags.sh" \
+          --hub-url "$HUB_URL" \
+          --out "$nags_file" \
+          --max-time "$HUB_MAX_TIME"
+
+        # Render the pulled view to the delivery body, in the same one place regardless of the
+        # forge surface. The renderer exits 0 when the hub reports nothing to nag and 1 when
+        # there is a queue; that decision drives open-vs-close below. A render crash (exit 2) is
+        # treated as "not clean", erring toward keeping the nag open rather than silently
+        # closing it (invariant #6).
+        set +e
+        node "$glue/nag-deliver.mjs" --mode "$HUB_NAG_MODE" --nags "$nags_file" > "$body_file"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ]; then
+          echo "hub-nag-deliver: the renderer could not parse the hub response; failing loud" >&2
+          exit 1
+        fi
+        echo "clean=$rc" >> "$GITHUB_OUTPUT"
+        echo "body_file=$body_file" >> "$GITHUB_OUTPUT"
+
+    # Upsert the single standing issue (mode issue), found by its marker (in the body) and its
+    # label. Open or update when the hub is nagging; close when it reports nothing. Idempotent:
+    # at most one open standing issue exists at any time, so two runs leave one issue. Reached
+    # ONLY when the pull succeeded (the render step exits non-zero on a hub outage), so this
+    # never blanks or closes the issue over stale data.
+    - name: Upsert the standing issue
+      if: inputs.mode == 'issue' && steps.render.outputs.body_file != ''
+      # Pinned to a major tag, matching the sibling lanes (claim-clock, hub-ingest).
+      uses: actions/github-script@v7
+      env:
+        BODY_FILE: ${{ steps.render.outputs.body_file }}
+        CLEAN: ${{ steps.render.outputs.clean }}
+        ISSUE_TITLE: ${{ inputs.issue-title }}
+        ISSUE_LABEL: ${{ inputs.issue-label }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const body = fs.readFileSync(process.env.BODY_FILE, 'utf8');
+          const clean = process.env.CLEAN === '0';
+          // The marker ci/nag-deliver.mjs stamps on every hub-nag issue body. Must match
+          // NAG_ISSUE_MARKER exactly, or the find-or-update never matches and the lane spams.
+          const marker = '<!-- claim-bot:hub-nag -->';
+          const title = process.env.ISSUE_TITLE;
+          const label = process.env.ISSUE_LABEL;
+          const { owner, repo } = context.repo;
+
+          // Find our one issue by the marker across open issues carrying the label (the label
+          // narrows the search; the marker is the authority).
+          const open = await github.paginate(github.rest.issues.listForRepo, {
+            owner, repo, state: 'open', labels: label, per_page: 100,
+          });
+          const existing = open.find((i) => i.body && i.body.includes(marker));
+
+          if (clean) {
+            // The hub is nagging about nothing: close the issue if open, else do nothing.
+            // Never open an issue just to say "all clear."
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: 'The hub reports nothing due or drifted; closing.',
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, state: 'closed',
+              });
+            }
+            return;
+          }
+
+          if (existing) {
+            await github.rest.issues.update({
+              owner, repo, issue_number: existing.number, body, state: 'open',
+            });
+          } else {
+            // Ensure the label exists before applying it (createIssue with a missing label
+            // 422s otherwise).
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'b60205',
+                description: "Tracks the hub's due & drifted nag queue, delivered by the CI glue.",
+              });
+            }
+            await github.rest.issues.create({ owner, repo, title, body, labels: [label] });
+          }
+
+    # Upsert the single advisory PR comment (mode comment), found by its own marker AND a Bot
+    # author, so a same-repo actor cannot pre-seed a marker-bearing comment and redirect the
+    # upsert into editing arbitrary content. One comment per PR, edited in place across runs —
+    # never a pile of new comments. Reached ONLY when the pull succeeded.
+    - name: Upsert the advisory PR comment
+      if: inputs.mode == 'comment' && steps.render.outputs.body_file != ''
+      # Pinned to a major tag, matching the sibling lanes (claim-clock, hub-ingest).
+      uses: actions/github-script@v7
+      env:
+        BODY_FILE: ${{ steps.render.outputs.body_file }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const prNumber = Number(process.env.PR_NUMBER);
+          if (!Number.isInteger(prNumber) || prNumber <= 0) {
+            core.setFailed(
+              "mode 'comment' needs a valid `pr-number`; got '" + process.env.PR_NUMBER + "'",
+            );
+            return;
+          }
+          const body = fs.readFileSync(process.env.BODY_FILE, 'utf8');
+          // The marker ci/nag-deliver.mjs stamps on every hub-nag PR comment. Must match
+          // NAG_COMMENT_MARKER exactly. Distinct from the issue marker so a repo running both
+          // an issue lane and a comment lane never edits one surface from the other.
+          const marker = '<!-- claim-bot:hub-nag-pr -->';
+          const { owner, repo } = context.repo;
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number: prNumber,
+          });
+          const existing = comments.find(
+            (c) => c.body && c.body.includes(marker) && c.user && c.user.type === 'Bot',
+          );
+          if (existing) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+          }

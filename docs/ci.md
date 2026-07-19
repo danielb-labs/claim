@@ -164,6 +164,41 @@ adoption workflow and the `id-token: write` / audience configuration.
 For a human-facing surface without a full hub, the same `--json` feeds the renderer
 below, which posts a PR comment or maintains one standing issue.
 
+## Delivering the hub's nag from CI
+
+There are two ways a repo turns findings into a standing issue, and they differ in *who
+derives the nag*:
+
+- **Hub-less** — the CLI-side renderer (`ci/render.mjs`, described below) turns a local
+  `claim check --json` run into an issue/comment body. The lane re-derives everything itself:
+  grouping, owners, clean-vs-dirty. This is the drop-in for a repo with no hub.
+- **Hub-sourced** — once a hub is in place, the **hub** derives the nag (standing over the
+  ledger, staleness by the clock, owner resolution from CODEOWNERS in its mirror, grouping by
+  breaking commit) and serves it at `GET /api/nags`. A scheduled lane pulls that view and
+  **delivers** it. The hub renders; the glue delivers. This is the delivery half of the loop
+  whose write half is the ingest Action above.
+
+The hub-sourced lane ships as the **`hub-nag-deliver`** Action
+(`.github/actions/hub-nag-deliver`). It pulls `GET /api/nags`, renders the view to markdown in
+one place (`ci/nag-deliver.mjs`), and upserts the one standing "claim: due & drifted" issue.
+Three properties are load-bearing:
+
+- **The pull authenticates.** `/api/nags` is behind the hub's read auth, so the lane presents
+  a **hub-minted read-scoped token** (`claim-hub mint-token --scope read`) as `Authorization:
+  Bearer`, supplied as a CI secret. The read token reads the hub; the forge `GITHUB_TOKEN`
+  writes the issue — two distinct credentials on two distinct steps.
+- **The delivered content matches the hub exactly.** The issue body is the hub's rendered nag
+  view, posted verbatim — the owners, the grouping, the statements, and the dead-letter queue
+  all come from the hub's response, never re-derived in the lane (golden invariant #4: the
+  glue delivers, it does not invent a verdict).
+- **A hub outage is loud, never a false green.** The pull (`ci/hub-nags.sh`) fails the step on
+  any non-2xx, an unreachable hub, or a timeout, and writes nothing on failure — so a broken
+  pull aborts before any upsert and the **previous standing issue is left intact**, never
+  blanked over stale data (golden invariant #6).
+
+The hub doc's [Delivering the nag from CI](hub.md#delivering-the-nag-from-ci-the-nag-delivery-action)
+covers the read-token provisioning and the render-vs-deliver split in full.
+
 ## Idempotency — one comment, one issue
 
 The rendered surfaces are strictly idempotent, so a hundred pushes or a hundred nights
@@ -194,9 +229,19 @@ one store, grouped by severity), and `load-error.json` (an unloadable claim file
 workflow only runs `claim`, calls the renderer, and hands its output to the GitHub API
 — so the part a reviewer might get wrong is the part covered by tests.
 
+The hub-sourced lane has its own renderer, `ci/nag-deliver.mjs`, unit-tested in
+`ci/nag-deliver.test.mjs` against `GET /api/nags` fixtures (`nags-mixed.json`,
+`nags-clean.json`, `nags-dead-letter-only.json`). It renders the hub's *already-derived*
+view — the hub resolved the owners and grouping, so this renderer honors them rather than
+recomputing — into the standing-issue/PR-comment markdown. Its markers
+(`<!-- claim-bot:hub-nag -->` for the issue, `<!-- claim-bot:hub-nag-pr -->` for the comment)
+are distinct from `render.mjs`'s, so a repo running both a hub-less lane and a hub-sourced
+lane never edits one surface from the other. The whole pull → render path is additionally
+exercised end-to-end against a locally-served hub in `crates/claim-hub/tests/nag_delivery.rs`.
+
 The tests run in the repo's own gate (`scripts/check.sh`), so a change to the CLI's
-JSON shape or the renderer breaks the build rather than silently mis-rendering in
-production.
+JSON shape, the hub's `/api/nags` shape, or either renderer breaks the build rather than
+silently mis-rendering in production.
 
 ### The `claim check --json` shape
 

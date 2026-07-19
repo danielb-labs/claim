@@ -1,0 +1,77 @@
+{
+  "nags": [
+    {
+      "transition": "drifted",
+      "store": "github.com/acme/app",
+      "commit": "9f2c1ab",
+      "claims": [
+        {
+          "id": "payments/checkout-flow",
+          "commit": "9f2c1ab",
+          "statement": "Checkout retries idempotently on a 5xx.",
+          "supports": ["docs/decisions/idempotent-checkout.md", "src/checkout/retry.rs"]
+        },
+        {
+          "id": "payments/libfoo-pin",
+          "commit": "9f2c1ab",
+          "statement": "We pin libfoo at 4.2; 5.x corrupts CJK PDF export.",
+          "supports": ["requirements.txt#libfoo"]
+        }
+      ],
+      "owners": ["@acme/payments"],
+      "fire_key": "aaaa1111",
+      "fired_this_pass": false
+    },
+    {
+      "transition": "stale",
+      "store": "github.com/acme/app",
+      "commit": "1c0ffee",
+      "claims": [
+        {
+          "id": "builds/ci-node",
+          "commit": "1c0ffee",
+          "statement": "CI runs on Node 20.",
+          "supports": []
+        }
+      ],
+      "owners": ["@acme/platform"],
+      "fire_key": "bbbb2222",
+      "fired_this_pass": false
+    },
+    {
+      "transition": "lapsed-skip",
+      "store": "github.com/acme/app",
+      "commit": "d15ea5e",
+      "claims": [
+        {
+          "id": "infra/nightly-audit",
+          "commit": "d15ea5e",
+          "statement": "The nightly security audit finds no criticals.",
+          "supports": ["docs/decisions/audit-cadence.md"]
+        }
+      ],
+      "owners": ["@acme/platform", "@acme/security"],
+      "fire_key": "cccc3333",
+      "fired_this_pass": false
+    }
+  ],
+  "dead_letters": [
+    {
+      "transition": "drifted",
+      "store": "github.com/acme/app",
+      "commit": "b4dc0de",
+      "claims": [
+        {
+          "id": "orphan/no-owner",
+          "commit": "b4dc0de",
+          "statement": "This fact has no CODEOWNERS entry, so the hub could not route it.",
+          "supports": []
+        }
+      ],
+      "owners": [],
+      "fire_key": "dddd4444",
+      "fired_this_pass": false
+    }
+  ],
+  "fired_this_pass": 0
+}

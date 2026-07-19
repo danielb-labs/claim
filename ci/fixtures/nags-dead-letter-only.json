@@ -1,0 +1,22 @@
+{
+  "nags": [],
+  "dead_letters": [
+    {
+      "transition": "drifted",
+      "store": "github.com/acme/app",
+      "commit": "b4dc0de",
+      "claims": [
+        {
+          "id": "orphan/no-owner",
+          "commit": "b4dc0de",
+          "statement": "This fact has no CODEOWNERS entry, so the hub could not route it.",
+          "supports": []
+        }
+      ],
+      "owners": [],
+      "fire_key": "dddd4444",
+      "fired_this_pass": false
+    }
+  ],
+  "fired_this_pass": 0
+}
