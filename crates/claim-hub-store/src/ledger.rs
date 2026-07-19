@@ -81,14 +81,23 @@ impl Appended {
 pub trait Ledger {
     /// Append one attested observation, returning where it landed.
     ///
-    /// Idempotent on the dedup key (producer run, claim, check identity, HUB.md
-    /// §2): appending an observation already on the ledger returns
-    /// [`Appended::Duplicate`] with the original's position and adds no row, so a
-    /// retried CI push cannot double-count. Appending a genuinely new observation
-    /// returns [`Appended::New`] with its freshly assigned, strictly-greater
-    /// position. The event is stored verbatim — the producer block and evidence are
-    /// not reshaped — so the standing derived from it rests on exactly what was
-    /// attested.
+    /// Idempotent on the dedup key **(store, producer run, claim, check identity)**:
+    /// appending an observation already on the ledger returns [`Appended::Duplicate`]
+    /// with the original's position and adds no row, so a retried CI push cannot
+    /// double-count. Appending a genuinely new observation returns [`Appended::New`]
+    /// with its freshly assigned, strictly-greater position. The event is stored
+    /// verbatim — the producer block and evidence are not reshaped — so the standing
+    /// derived from it rests on exactly what was attested.
+    ///
+    /// The event's producer block **must carry a non-empty `run`**: it is the run
+    /// component of the dedup key and the identity a verdict is attributed to (HUB.md
+    /// §4). A verdict event with an absent or empty run is rejected, not stored —
+    /// admitting it would make an unattributable observation and collapse every
+    /// run-less report for one (store, claim, check) into one bucket regardless of
+    /// verdict (invariant #6). The SQLite implementation returns
+    /// [`StoreError::MissingProducerRun`] in that case.
+    ///
+    /// [`StoreError::MissingProducerRun`]: crate::StoreError::MissingProducerRun
     fn append(&self, event: &Event) -> impl std::future::Future<Output = Result<Appended>> + Send;
 
     /// Return every event strictly after `cursor`, in increasing position order.
@@ -97,6 +106,13 @@ pub trait Ledger {
     /// nothing. The exclusive lower bound is what makes the cursor resumable: a
     /// consumer stores the position of the last event it processed and passes it
     /// back to receive only what is new, with no overlap and no gap.
+    ///
+    /// A cold-cursor scan (`Position(0)`) returns an unbounded `Vec`, and the ledger
+    /// only ever grows, so the result set grows with history. That is acceptable at
+    /// v1 volumes (a hub ingests tens of events per push and derives over thousands),
+    /// and it keeps the trait honest as the Postgres-seam contract: a `limit`- or
+    /// streaming-shaped scan is a later concern, added behind the same trait when a
+    /// profile asks for it, not something v1 needs.
     fn scan_from(
         &self,
         cursor: Position,

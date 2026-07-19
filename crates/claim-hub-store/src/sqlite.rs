@@ -26,6 +26,22 @@ use std::str::FromStr;
 /// creates its own database on first boot with no external tooling
 /// (HUB-IMPLEMENTATION.md §1.4). Exposed so a caller can also run migrations against
 /// a pool it built itself, though [`SqliteStore::open`] runs them for the common case.
+///
+/// # Offline query cache (`.sqlx/`)
+///
+/// The `query!`/`query_as!` macros in this module are checked at compile time against
+/// the schema. The committed `.sqlx/` directory is what lets `cargo build`/`clippy`/
+/// `test` succeed with **no** `DATABASE_URL` — the gate and CI have no database.
+/// After changing any query, the schema, or a migration, regenerate it:
+///
+/// ```text
+/// # from crates/claim-hub-store, against a throwaway migrated db:
+/// DATABASE_URL="sqlite:///tmp/prepare.db?mode=rwc" sqlx migrate run --source ./migrations
+/// DATABASE_URL="sqlite:///tmp/prepare.db?mode=rwc" cargo sqlx prepare
+/// ```
+///
+/// and commit the updated `.sqlx/`. Skipping this makes the offline build fail with a
+/// confusing "no cached data for this query" error rather than a schema mismatch.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The SQLite-backed store, implementing both [`Ledger`] and [`Registry`] over one
@@ -41,8 +57,9 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open (creating if absent) the database at `path`, enable WAL and foreign
-    /// keys, and run the embedded migrations, so the returned store is ready to use.
+    /// Open (creating if absent) the database at `path`, enable WAL, foreign keys,
+    /// and recursive triggers, and run the embedded migrations, so the returned
+    /// store is ready to use.
     ///
     /// Creating the file if it does not exist and migrating it is the self-host
     /// first-boot story: point the hub at an empty directory and it stands up its
@@ -54,11 +71,8 @@ impl SqliteStore {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            // The append-only triggers and the registry's cascading retirements both
-            // depend on foreign-key enforcement, which SQLite leaves off by default.
-            .foreign_keys(true);
-        Self::from_options(options).await
+            .journal_mode(SqliteJournalMode::Wal);
+        Self::from_options(hardened(options)).await
     }
 
     /// Open an in-memory database, for tests that want no file at all.
@@ -68,9 +82,8 @@ impl SqliteStore {
     /// in-memory database is not customer-owned durable storage — but it keeps the
     /// trait tests free of even a temp file where they do not need one.
     pub async fn open_in_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")
-            .map_err(StoreError::Sql)?
-            .foreign_keys(true);
+        let options =
+            hardened(SqliteConnectOptions::from_str("sqlite::memory:").map_err(StoreError::Sql)?);
         // One connection: distinct connections to `:memory:` are distinct databases,
         // so the pool must not hand out a second, empty one.
         let pool = SqlitePoolOptions::new()
@@ -88,6 +101,26 @@ impl SqliteStore {
         MIGRATOR.run(&store.pool).await?;
         Ok(store)
     }
+}
+
+/// Apply the connection-level hardening every `SqliteStore` connection needs.
+///
+/// Two pragmas are load-bearing for the honesty invariants and cannot be pinned in a
+/// migration (they are per-connection):
+///
+/// - `foreign_keys = ON` so the registry's `ON DELETE CASCADE` retirements actually
+///   cascade (SQLite defaults foreign-key enforcement off).
+/// - `recursive_triggers = ON` so the append-only `BEFORE DELETE` trigger *also*
+///   fires for the implicit delete that `INSERT OR REPLACE` / `REPLACE INTO` perform
+///   on a conflict. Without it those statements silently delete-and-reinsert a
+///   conflicting row — rewriting history and changing its `seq` with no error — the
+///   exact silent rewrite invariants #4 and #6 forbid. It is set on the pool's
+///   connect options so *every* connection the pool hands out enforces it, not just
+///   the first.
+fn hardened(options: SqliteConnectOptions) -> SqliteConnectOptions {
+    options
+        .foreign_keys(true)
+        .pragma("recursive_triggers", "ON")
 }
 
 /// The wire-string form of a [`Verdict`], matching its kebab-case JSON, for the
@@ -142,20 +175,32 @@ fn json_string_into<T: serde::de::DeserializeOwned>(s: &str, context: &str) -> R
 }
 
 /// The producer's run identifier, extracted from the producer block for the dedup
-/// key, or the empty string if the block carries no `run` (the same default the
-/// column holds), so an unusual producer still stores and dedups deterministically.
+/// key, or `None` when the block carries no usable run.
 ///
-/// The run is one key inside the producer JSON object (HUB.md §2's `producer.run`);
+/// The run is one value inside the producer JSON object (HUB.md §4's `producer.run`);
 /// pulling it into its own indexed column is what lets the UNIQUE dedup index key on
-/// it without SQLite JSON-path indexing.
-fn producer_run(producer: &Producer) -> String {
-    match producer.0.get("run") {
+/// it without SQLite JSON-path indexing. Returns `None` for an absent run and for an
+/// empty-string run: both are unattributable, and [`SqliteStore::append`] rejects a
+/// verdict event with no run rather than bucketing it into an empty-string collision
+/// class where every run-less observation for one (store, claim, digest) would
+/// collapse regardless of verdict (invariant #6 — make it loud).
+///
+/// Forward note for hub-11: internal event kinds like `nag` are appended by the hub's
+/// own principal, which must supply a non-empty run of its own (e.g. the router tick's
+/// identity) so those events dedup and attribute the same way; this function reads the
+/// same `run` value, so the hub's principal block carries one.
+fn producer_run(producer: &Producer) -> Option<String> {
+    let run = match producer.0.get("run") {
         Some(serde_json::Value::String(s)) => s.clone(),
-        // A non-string run (a JSON number, say) still dedups by its canonical text
-        // so redelivery is caught regardless of the producer's JSON typing.
+        // A non-string run (a JSON number, say) still keys the index by its canonical
+        // text, so redelivery is caught regardless of the producer's JSON typing.
         Some(other) => other.to_string(),
-        None => String::new(),
+        None => return None,
+    };
+    if run.is_empty() {
+        return None;
     }
+    Some(run)
 }
 
 impl Ledger for SqliteStore {
@@ -167,7 +212,10 @@ impl Ledger for SqliteStore {
                 context: "producer".to_owned(),
                 source,
             })?;
-        let dedup_run = producer_run(&event.producer);
+        // A verdict with no usable producer run is unattributable and cannot dedup
+        // safely; reject it loudly rather than bucket it into an empty-run collision
+        // class (invariant #6). The run is also the run component of the dedup key.
+        let dedup_run = producer_run(&event.producer).ok_or(StoreError::MissingProducerRun)?;
         let reported_at = event.reported_at.to_string();
         let check_index = i64::try_from(event.check.index).map_err(|_| StoreError::Corrupt {
             context: "check.index too large for the ledger".to_owned(),
@@ -177,14 +225,15 @@ impl Ledger for SqliteStore {
         // A dedup collision is not an error: it is the idempotent-redelivery success
         // of HUB.md §2. `ON CONFLICT DO NOTHING` leaves the original row untouched;
         // the follow-up read reports whether this call inserted or was absorbed, and
-        // returns the position either way.
+        // returns the position either way. The conflict target lists the dedup key's
+        // columns (store, run, claim, digest) in the order the UNIQUE index declares.
         let inserted = sqlx::query!(
             r#"
             INSERT INTO events
                 (kind, claim_id, check_index, check_digest, verdict,
                  evidence, "commit", store, producer, reported_at, dedup_run)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (dedup_run, claim_id, check_digest) DO NOTHING
+            ON CONFLICT (store, dedup_run, claim_id, check_digest) DO NOTHING
             RETURNING seq AS "seq!: i64"
             "#,
             kind,
@@ -211,8 +260,9 @@ impl Ledger for SqliteStore {
         let existing = sqlx::query!(
             r#"
             SELECT seq AS "seq!: i64" FROM events
-            WHERE dedup_run = ? AND claim_id = ? AND check_digest = ?
+            WHERE store = ? AND dedup_run = ? AND claim_id = ? AND check_digest = ?
             "#,
+            event.store,
             dedup_run,
             event.claim,
             event.check.digest,
@@ -492,15 +542,24 @@ mod tests {
     fn producer_run_reads_a_string_run() {
         let mut p = serde_json::Map::new();
         p.insert("run".into(), serde_json::json!("1234567890"));
-        assert_eq!(producer_run(&Producer(p)), "1234567890");
+        assert_eq!(producer_run(&Producer(p)), Some("1234567890".to_owned()));
     }
 
     #[test]
-    fn producer_run_is_empty_when_absent() {
-        // A producer with no run still dedups deterministically on the empty string,
-        // the same default the column holds.
+    fn producer_run_is_none_when_absent() {
+        // No run is unattributable: append rejects it rather than bucketing it into
+        // the empty-run collision class.
         let p = serde_json::Map::new();
-        assert_eq!(producer_run(&Producer(p)), "");
+        assert_eq!(producer_run(&Producer(p)), None);
+    }
+
+    #[test]
+    fn producer_run_is_none_when_empty() {
+        // An empty-string run is as unattributable as an absent one, and must not
+        // become a shared dedup bucket.
+        let mut p = serde_json::Map::new();
+        p.insert("run".into(), serde_json::json!(""));
+        assert_eq!(producer_run(&Producer(p)), None);
     }
 
     #[test]
@@ -509,6 +568,6 @@ mod tests {
         // stable dedup key, so redelivery is caught regardless of JSON typing.
         let mut p = serde_json::Map::new();
         p.insert("run".into(), serde_json::json!(42));
-        assert_eq!(producer_run(&Producer(p)), "42");
+        assert_eq!(producer_run(&Producer(p)), Some("42".to_owned()));
     }
 }

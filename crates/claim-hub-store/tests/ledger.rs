@@ -7,7 +7,7 @@
 
 use claim_core::Verdict;
 use claim_hub_core::{CheckRef, Event, EventKind, Producer};
-use claim_hub_store::{Appended, Ledger, Position, SqliteStore};
+use claim_hub_store::{Appended, Ledger, Position, SqliteStore, StoreError};
 use tempfile::TempDir;
 
 /// A store over a fresh migrated database file in a returned temp dir (kept alive
@@ -19,9 +19,15 @@ async fn fresh_store() -> (SqliteStore, TempDir) {
     (store, dir)
 }
 
-/// An event with a caller-chosen run id, claim, and digest, so tests control the
-/// dedup key (run, claim, digest) directly.
+/// An event with a caller-chosen run id, claim, and digest in the default store, so
+/// most tests control the dedup key's (run, claim, digest) directly.
 fn event(run: &str, claim: &str, digest: &str, verdict: Verdict) -> Event {
+    event_in_store("github.com/acme/payments", run, claim, digest, verdict)
+}
+
+/// An event with a caller-chosen store *and* (run, claim, digest), so the cross-store
+/// dedup test can hold (run, claim, digest) fixed while varying the store.
+fn event_in_store(store: &str, run: &str, claim: &str, digest: &str, verdict: Verdict) -> Event {
     let mut producer = serde_json::Map::new();
     producer.insert(
         "iss".into(),
@@ -39,7 +45,7 @@ fn event(run: &str, claim: &str, digest: &str, verdict: Verdict) -> Event {
         verdict,
         evidence: Some("libfoo==4.2".into()),
         commit: "8f2c0a1".into(),
-        store: "github.com/acme/payments".into(),
+        store: store.into(),
         producer: Producer(producer),
         reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
     }
@@ -188,6 +194,146 @@ async fn a_raw_delete_against_events_is_rejected_by_the_trigger() {
 
     // The row survives.
     assert_eq!(store.scan_from(Position(0)).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_raw_insert_or_replace_against_events_is_rejected_by_the_trigger() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use std::str::FromStr;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("hub.db");
+    let store = SqliteStore::open(&path).await.unwrap();
+    let e = event("run-1", "payments/pin", &"a".repeat(64), Verdict::Held);
+    store.append(&e).await.unwrap();
+
+    // INSERT OR REPLACE runs as an implicit DELETE-then-INSERT on a conflict, and a
+    // BEFORE DELETE trigger fires for that implicit delete *only* when
+    // recursive_triggers is ON — which `SqliteStore` sets on every connection. Open a
+    // raw connection with the same hardening the app applies, and prove REPLACE on the
+    // live dedup key is rejected, so it cannot silently rewrite the row or its seq.
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+        .unwrap()
+        .foreign_keys(true)
+        .pragma("recursive_triggers", "ON");
+    let raw = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+
+    // A REPLACE that conflicts on the UNIQUE dedup key (store, run, claim, digest)
+    // would delete the Held row and insert a Drifted one with a new seq.
+    let err = sqlx::query(
+        r#"INSERT OR REPLACE INTO events
+               (kind, claim_id, check_index, check_digest, verdict,
+                "commit", store, producer, reported_at, dedup_run)
+           VALUES ('verdict', 'payments/pin', 0, ?, 'drifted',
+                   'deadbeef', 'github.com/acme/payments', '{}', '2026-07-18T07:00:00Z', 'run-1')"#,
+    )
+    .bind("a".repeat(64))
+    .execute(&raw)
+    .await
+    .expect_err("INSERT OR REPLACE against a live events row must fail");
+    assert!(
+        err.to_string().contains("append-only"),
+        "the append-only trigger fires for REPLACE's implicit delete: {err}"
+    );
+
+    // The original row is untouched — same verdict, same seq.
+    let all = store.scan_from(Position(0)).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].event.verdict, Verdict::Held, "history not rewritten");
+    assert_eq!(all[0].position, Position(1), "seq unchanged");
+}
+
+#[tokio::test]
+async fn recursive_triggers_is_off_by_default_but_on_when_hardened() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use std::str::FromStr;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("hub.db");
+    let _store = SqliteStore::open(&path).await.unwrap();
+    let url = format!("sqlite://{}", path.display());
+
+    // A bare connection defaults recursive_triggers OFF — which is exactly why the
+    // REPLACE bypass exists and why the app must set the pragma itself.
+    let bare = sqlx::SqlitePool::connect(&url).await.unwrap();
+    let (off,): (i64,) = sqlx::query_as("PRAGMA recursive_triggers")
+        .fetch_one(&bare)
+        .await
+        .unwrap();
+    assert_eq!(off, 0, "a bare connection defaults the pragma off");
+
+    // A connection hardened the way `SqliteStore` hardens its own reads it back ON, so
+    // the pragma string the app uses genuinely enables the trigger-firing REPLACE
+    // guards. The REPLACE test above proves the guard fires under exactly this pragma.
+    let opts = SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .foreign_keys(true)
+        .pragma("recursive_triggers", "ON");
+    let hardened = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    let (on,): (i64,) = sqlx::query_as("PRAGMA recursive_triggers")
+        .fetch_one(&hardened)
+        .await
+        .unwrap();
+    assert_eq!(on, 1, "the app's pragma turns recursive_triggers on");
+}
+
+#[tokio::test]
+async fn the_same_observation_from_two_stores_is_two_rows_not_a_dedup() {
+    // A run id is unique per repository, not globally, and the check digest is
+    // content-based and stable across repos. Two stores sharing (run, claim, digest)
+    // are genuinely distinct observations; `store` in the dedup key keeps both.
+    let (store, _dir) = fresh_store().await;
+    let digest = "e".repeat(64);
+    let a = event_in_store(
+        "github.com/acme/payments",
+        "run-1",
+        "shared/pin",
+        &digest,
+        Verdict::Held,
+    );
+    let b = event_in_store(
+        "github.com/acme/web",
+        "run-1",
+        "shared/pin",
+        &digest,
+        Verdict::Held,
+    );
+
+    assert!(matches!(store.append(&a).await.unwrap(), Appended::New(_)));
+    assert!(
+        matches!(store.append(&b).await.unwrap(), Appended::New(_)),
+        "a different store is not a duplicate, even with the same run/claim/digest"
+    );
+    assert_eq!(store.scan_from(Position(0)).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_verdict_with_no_producer_run_is_rejected_loudly() {
+    let (store, _dir) = fresh_store().await;
+
+    // A producer with no `run` at all.
+    let mut no_run = event("run-1", "payments/pin", &"a".repeat(64), Verdict::Held);
+    no_run.producer.0.remove("run");
+    let err = store
+        .append(&no_run)
+        .await
+        .expect_err("run-less is rejected");
+    assert!(matches!(err, StoreError::MissingProducerRun), "{err}");
+
+    // An empty-string `run` is as unattributable as an absent one.
+    let mut empty_run = event("", "payments/pin", &"b".repeat(64), Verdict::Held);
+    empty_run
+        .producer
+        .0
+        .insert("run".into(), serde_json::json!(""));
+    let err = store
+        .append(&empty_run)
+        .await
+        .expect_err("empty run is rejected");
+    assert!(matches!(err, StoreError::MissingProducerRun), "{err}");
+
+    // Neither was stored: a rejected verdict adds nothing.
+    assert!(store.scan_from(Position(0)).await.unwrap().is_empty());
 }
 
 #[tokio::test]

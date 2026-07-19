@@ -82,8 +82,13 @@ envelope from day one, because a shallow check's pass must never clear a deep
 check's drift (the multi-check finding in `CLI-HUB-BOUNDARY.md`, issue #18).
 The producer block is the verified pipeline identity, recorded verbatim so the
 trust judgment can be re-derived later, not just made once at the door.
-Redelivery is deduplicated on (producer run, check identity), so a retried
-push cannot double-count an observation.
+Redelivery is deduplicated on (store, producer run, claim, check identity), so a
+retried push cannot double-count an observation. Each component is load-bearing:
+`store` because a run id is unique per repository, not globally (§4's identity is
+(repository, run)) and the check digest is content-based and stable across repos;
+`claim` because the digest is a property of the check's definition alone, so two
+claims with identical checks must not collide; and a non-empty run is required —
+a run-less verdict is unattributable and rejected, not bucketed.
 
 **The derived read model** is everything else the hub appears to hold:
 standing (verified / stale / drifted / suspect / retired), freshness, due-ness,

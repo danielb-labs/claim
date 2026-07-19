@@ -12,8 +12,8 @@ repository.workspace = true
 # `claim_core::{Verdict, Timestamp}` those carry — one set of honesty types across
 # every hub crate, so the store cannot disagree with core about what `held` means.
 claim-hub-core = { path = "../claim-hub-core" }
-# The registry stores parsed claim definitions: `ClaimId`, `SupportTarget`, and the
-# `Verdict`/`Timestamp` re-exports the ledger columns are typed against.
+# The registry keys on `ClaimId` and the ledger columns are typed against the
+# `Verdict`/`Timestamp` re-exports; one set of domain types across the workspace.
 claim-core = { path = "../claim-core" }
 # Async SQL with compile-time-checked queries against the actual schema and
 # migrations embedded in the binary via `sqlx::migrate!`, so the hub creates and
@@ -21,12 +21,12 @@ claim-core = { path = "../claim-core" }
 # covers SQLite now and Postgres at the later trait swap (HUB-IMPLEMENTATION.md §1.4).
 # `sqlite` is the v1 driver; `runtime-tokio` puts sqlx on the runtime axum and rmcp
 # share; `macros` enables the checked `query!`/`query_as!` macros; `migrate` embeds
-# the migrations. `tls-rustls-ring` avoids linking system OpenSSL (no C TLS
-# dependency). The feature set is deliberately minimal: no Postgres/MySQL driver,
-# no chrono/uuid type integrations.
+# the migrations. No TLS feature: a SQLite-only build opens a local file and links no
+# network backend, so no TLS (and no OpenSSL) is pulled in. The Postgres trait impl
+# will add its own TLS feature when it lands. The feature set is deliberately minimal:
+# no Postgres/MySQL driver, no chrono/uuid type integrations.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
-    "tls-rustls-ring",
     "sqlite",
     "macros",
     "migrate",

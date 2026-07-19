@@ -24,6 +24,18 @@ pub enum StoreError {
     #[error("failed to apply migrations: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
+    /// A verdict event was appended with no usable producer run — the `run` value in
+    /// its producer block is absent or empty. A run-less verdict is unattributable
+    /// (HUB.md §4's identity is (repository, run)), and admitting it would collapse
+    /// every run-less observation for one (store, claim, check) into a single dedup
+    /// bucket regardless of verdict. It is rejected loudly (invariant #6), never
+    /// silently absorbed.
+    #[error(
+        "the producer block has no usable `run` (absent or empty); a verdict event \
+         must carry the producer's run id to be attributable and deduplicated"
+    )]
+    MissingProducerRun,
+
     /// A value read from or written to a JSON column could not be (de)serialized —
     /// a producer block or a supports list. A corruption or version-skew signal,
     /// never a normal outcome.

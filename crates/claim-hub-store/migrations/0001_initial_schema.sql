@@ -3,9 +3,14 @@
 --
 -- Two disciplines are enforced *in the schema*, below the Rust traits, so a bug
 -- reaching around the trait still cannot break them:
---   * the events table is append-only — triggers RAISE on any UPDATE or DELETE;
+--   * the events table is append-only — triggers RAISE on any UPDATE or DELETE.
+--     For the triggers to also catch the implicit DELETE that
+--     INSERT OR REPLACE / REPLACE INTO perform on a conflict, connections open
+--     with PRAGMA recursive_triggers = ON (set in `SqliteStore::open`, since a
+--     migration cannot pin per-connection pragmas); without it a BEFORE DELETE
+--     trigger does not fire for that implicit delete and history could be rewritten.
 --   * redelivery of the same observation is deduplicated by a UNIQUE index on
---     (producer run, claim, check identity), per HUB.md §2.
+--     (store, producer run, claim, check identity) — see the index comment below.
 
 -- The append-only event ledger: the hub's one piece of primary state.
 --
@@ -35,14 +40,27 @@ CREATE TABLE events (
     dedup_run    TEXT    NOT NULL
 );
 
--- The dedup key of HUB.md §2: a retried push carrying the same observation —
--- same producer *run*, same claim, same check *identity* (digest) — hits this
--- index and is absorbed, so an observation is never double-counted. Store, check
--- index, and verdict are deliberately *not* part of the key: the same run
--- re-reporting the same check is the same observation regardless of a
--- re-serialized producer block or a changed verdict, and letting a changed
--- verdict slip past the index would be a silent double-count.
-CREATE UNIQUE INDEX events_dedup ON events (dedup_run, claim_id, check_digest);
+-- The dedup key: a retried push carrying the same observation hits this index and
+-- is absorbed, so an observation is never double-counted (HUB.md §2). The key is
+-- (store, producer run, claim, check identity), and every component earns its place:
+--   * `store` — a GitHub Actions run id is unique per repository, not globally
+--     (HUB.md §4's identity is (repository, run)), and `check_digest` is
+--     content-based and deliberately stable across repos, so without `store` two
+--     genuinely distinct observations from two stores sharing a run id + claim id +
+--     digest would collapse, silently dropping one.
+--   * `dedup_run` — the producer's run distinguishes one CI run's report from the
+--     next; a non-empty run is required at append (a run-less verdict is
+--     unattributable and rejected, not bucketed).
+--   * `claim_id` — the digest is a property of the check's definition alone and is
+--     claim-independent, so two distinct claims with identical checks would collide
+--     without it.
+--   * `check_digest` — the check's content identity, so a shallow check's pass never
+--     lands on a deep check's ledger slot (#18).
+-- Deliberately *not* in the key: `check_index` and `verdict`. The same run
+-- re-reporting the same check is the same observation regardless of a re-serialized
+-- producer block or a changed verdict, and letting a changed verdict slip past the
+-- index would be a silent double-count.
+CREATE UNIQUE INDEX events_dedup ON events (store, dedup_run, claim_id, check_digest);
 
 -- Scans by claim are the deriver's common read (a claim's verdict history), so
 -- index the claim id; `seq` order within a claim falls out of the primary key.
@@ -101,3 +119,8 @@ CREATE TABLE supports_edges (
     PRIMARY KEY (store, claim_id, target),
     FOREIGN KEY (store, claim_id) REFERENCES claims_at_tip (store, claim_id) ON DELETE CASCADE
 );
+
+-- The reverse-routing query `claims_supporting(target)` (the #10 substrate) filters
+-- on `target`, which is the *last* column of the primary key and so cannot use it as
+-- a prefix — an index on `target` turns that table scan into a seek.
+CREATE INDEX supports_edges_by_target ON supports_edges (target);

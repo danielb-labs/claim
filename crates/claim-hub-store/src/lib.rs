@@ -12,9 +12,11 @@
 //!   is [`Ledger::append`], so append-only discipline is unrepresentable to break
 //!   from Rust. The SQLite schema backs that with triggers that RAISE on any raw
 //!   `UPDATE` or `DELETE` against the events table, so even a foreign SQL path fails.
-//! - **Dedup on redelivery.** Appending the same observation — (producer run, claim,
-//!   check identity) — twice yields one row and an idempotent success (HUB.md §2), a
-//!   UNIQUE index the append absorbs a conflict against.
+//! - **Dedup on redelivery.** Appending the same observation — keyed on
+//!   (store, producer run, claim, check identity) — twice yields one row and an
+//!   idempotent success (HUB.md §2), a UNIQUE index the append absorbs a conflict
+//!   against. A verdict with no usable producer run is rejected, not bucketed, since
+//!   a run-less observation is unattributable (invariant #6).
 //!
 //! The [`Registry`] is derived data: [`Registry::replace_store`] wipes a store's
 //! snapshot and re-inserts it (a claim absent at the new tip is retired), and a

@@ -13,6 +13,13 @@ if ! command -v cargo >/dev/null 2>&1; then
   . "$HOME/.cargo/env"
 fi
 
+# Build sqlx's compile-time-checked queries against the committed `.sqlx/` cache, not
+# a live database. Forced on so the gate is deterministic regardless of the dev's
+# environment: without it, a shell that happens to export DATABASE_URL would make sqlx
+# try that database instead of the cache — a confusing machine-dependent failure. CI
+# has no database; the cache is the contract.
+export SQLX_OFFLINE=true
+
 echo "==> formatting"
 cargo fmt --all --check
 
