@@ -1,0 +1,22 @@
+---
+source: crates/claim-hub/src/api/tests.rs
+expression: json
+---
+{
+  "as_of": {
+    "clock": "2026-07-20T00:00:00Z",
+    "ledger_head": 1,
+    "registry_version": 1
+  },
+  "claims": [
+    {
+      "due_at": null,
+      "id": "payments/pin",
+      "skips": [],
+      "stale_at": "2026-08-17T00:00:00Z",
+      "standing": "verified",
+      "store": "github.com/acme/payments",
+      "verified_as_of": "2026-07-18T00:00:00Z"
+    }
+  ]
+}

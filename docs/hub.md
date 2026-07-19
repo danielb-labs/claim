@@ -12,12 +12,12 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > **This is v1, still growing.** The hub today ships the application shell (config,
 > the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
 > stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
-> `POST /ingest`), and the **first read endpoint** (`GET /api/claims/{id}`, the walking
-> skeleton that derives a claim's standing over the live store). The *full* JSON API,
-> the **hub MCP**, and the **web UI** arrive in later items and mount into this same
-> shell. A freshly booted hub reports a truthful *empty* position — head 0, version 0 —
-> until a sync populates the registry and a CI lane starts pushing verdicts through the
-> ingest gate.
+> `POST /ingest`), and the **read API** (claims queries, the drifted/due/suspect sets,
+> the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
+> over the deriver). The **hub MCP** and the **web UI** arrive in later items and mount
+> into this same shell. A freshly booted hub reports a truthful *empty* position — head
+> 0, version 0 — until a sync populates the registry and a CI lane starts pushing
+> verdicts through the ingest gate.
 
 ## Running the binary
 
@@ -303,12 +303,31 @@ hub's reason, no non-2xx is ever swallowed, and a hub that refuses the connectio
 responds fails the step loudly (the latter via `--max-time`) rather than hanging — with no
 network to GitHub.
 
-## Reading a claim's standing (`GET /api/claims/{id}`)
+## The read API (`GET /api/…`)
 
-The hub's first read endpoint derives one claim's **standing** over the live store and
-returns it with its *as-of* — the exact inputs the answer was computed from. This is the
-read half of the loop: the CLI reports a verdict, the ingest gate lands it on the ledger,
-and this endpoint derives what that verdict (plus the clock) *means* right now.
+The read API is the hub's agent-and-human read surface: it derives standing, freshness,
+and due-ness over the live store and serves them as JSON, **every response carrying its
+*as-of*** — the exact inputs the answer was computed from. This is the read half of the
+loop: the CLI reports a verdict, the ingest gate lands it on the ledger, and these
+endpoints derive what those verdicts (plus the clock) *mean* right now.
+
+Every route is a **read**: it computes at read time and stores nothing (invariant #3), so
+a standing can never disagree with the evidence, and a read never appends an event. Reads
+are **deterministic** — the same (`ledger_head`, `registry_version`, `clock`) always
+yields byte-identical bytes — so an agent can cache, diff, and resume. Auth over `/api`
+arrives with read-auth (a later item); the routes are unauthenticated for now.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/claims/{id}` | One claim's derived standing, with its as-of. |
+| `GET /api/claims?path=&store=&standing=&supports=` | The live set, filtered; each claim with its standing. |
+| `GET /api/drifted` | Every claim whose latest standing is `drifted`. |
+| `GET /api/due` | The review queue: every drifted, stale, or due-for-recheck claim. |
+| `GET /api/suspect` | Every `suspect` claim (populated once the propagation rule lands). |
+| `GET /api/claims/{id}/dossier` | A claim's full dossier: statement, checks, standing, verdict history, provenance. |
+| `GET /api/feed?cursor=<seq>` | The ledger, pollable from a position — paginated by ledger seq. |
+
+### One claim's standing (`GET /api/claims/{id}`)
 
 ```sh
 curl -s http://127.0.0.1:8080/api/claims/payments/libfoo-pin
@@ -348,11 +367,131 @@ time from the ledger and the clock every time (invariant #3), so a claim **ages 
 by the clock alone**: a claim that was `verified` reads `stale` once the read clock passes
 `stale_at`, with no new verdict and no write.
 
-> **Note (v1):** the `/api/claims/{id}` endpoint is the walking skeleton — one read that
-> proves the loop. The full read surface (claims by path/repo/standing, the drifted and due
-> sets, the dossier, the cursor feed) arrives with the JSON API. Where two connected stores
-> hold a claim with the same id, this endpoint returns the lexicographically-first store's
-> standing; the JSON API adds a `store` selector to address a claim exactly.
+Where two connected stores hold a claim with the same id (ids are unique only *within* a
+store), this endpoint returns the lexicographically-first store's standing; use the `store`
+filter on `GET /api/claims` to address a claim in an exact store.
+
+### Querying the live set (`GET /api/claims`)
+
+Filter the live set by any combination of four query parameters — they combine with AND, so
+a claim is returned only if it matches every one supplied; with no parameters the whole set
+is returned:
+
+| Parameter | Matches |
+|---|---|
+| `path` | Claims whose id starts with this prefix. The registry stores no filesystem path, so "path" is an id-prefix match: `path=payments/` selects every claim in the `payments` namespace — the org's beliefs about what you are touching. |
+| `store` | Claims in exactly this connected store (e.g. `github.com/acme/payments`) — the exact-store selector. |
+| `standing` | Claims whose derived standing is exactly this: `verified`, `stale`, `drifted`, `suspect`, or `retired`. An unrecognized value is a `400` naming the accepted set. |
+| `supports` | Claims that support this target — a decision ref or claim id the claim justifies. |
+
+```sh
+curl -s 'http://127.0.0.1:8080/api/claims?store=github.com/acme/payments&standing=drifted'
+```
+
+```json
+{
+  "claims": [
+    { "id": "payments/libfoo-pin", "store": "github.com/acme/payments", "standing": "drifted",
+      "verified_as_of": null, "stale_at": null, "due_at": null, "skips": [] }
+  ],
+  "as_of": { "ledger_head": 3, "registry_version": 1, "clock": "2026-07-20T00:00:00Z" }
+}
+```
+
+The set is one derivation, so it carries **one shared `as_of`** at the top level; the list
+members carry none of their own. An empty result is an empty `claims` array with a truthful
+as-of — never a fabricated `verified`. A mistyped parameter is a `400`, not a silently
+ignored filter returning the wrong set.
+
+### The derived sets (`GET /api/drifted`, `/api/due`, `/api/suspect`)
+
+Three convenience views, each the same list shape (`{ "claims": [...], "as_of": {...} }`):
+
+- **`/api/drifted`** — every claim whose latest standing is `drifted` (a fact known false
+  right now).
+- **`/api/due`** — the review queue: every drifted, stale, or due-for-recheck claim. This
+  is the deriver's computed membership, a *union* of "needs attention now" states — not a
+  `standing == due` filter (there is no such standing).
+- **`/api/suspect`** — every `suspect` claim. The suspect *propagation* rule (a drifted
+  claim marking its dependents suspect over the supports graph) is a later deriver rule; the
+  endpoint serves the set today so the surface already carries it, empty until the rule
+  lands.
+
+### A claim's dossier (`GET /api/claims/{id}/dossier`)
+
+The dossier is everything the org believes about one claim and how good that belief is right
+now: the statement and checks **by git reference at a commit**, the derived standing, the
+verdict history from the ledger with each verdict's evidence and verified producer, and the
+as-of.
+
+```sh
+curl -s http://127.0.0.1:8080/api/claims/payments/libfoo-pin/dossier
+```
+
+```json
+{
+  "id": "payments/libfoo-pin",
+  "store": "github.com/acme/payments",
+  "statement": "The libfoo pin holds.",
+  "commit": "8f2c0a1",
+  "checks": [ { "index": 0, "digest": "e80b69…" } ],
+  "supports": ["decision:pin"],
+  "standing": { "id": "payments/libfoo-pin", "store": "github.com/acme/payments",
+                "standing": "verified", "verified_as_of": "2026-07-18T12:00:00Z",
+                "stale_at": "2026-08-17T12:00:00Z", "due_at": null, "skips": [] },
+  "history": [
+    { "seq": 1, "verdict": "held", "check": { "index": 0, "digest": "e80b69…" },
+      "reported_at": "2026-07-18T12:00:00Z", "commit": "8f2c0a1", "evidence": "libfoo==4.2",
+      "producer": { "iss": "…", "repository": "acme/payments", "run": "1234567890" } }
+  ],
+  "as_of": { "ledger_head": 1, "registry_version": 1, "clock": "2026-07-20T00:00:00Z" }
+}
+```
+
+The `statement` and `checks` resolve from git at `commit` — the sha the claim was read at.
+The `standing`, `history`, and `as_of` all come from the one derived model, so the trust
+judgment is stamped with exactly the inputs it derived from; the descriptive `statement`,
+`checks`, `commit`, and `supports` are the registry's current rendering of the claim,
+normally at that same `registry_version` and at most one sync ahead — a claim can read
+current-or-newer than its `as_of`, never more verified than its `standing`. The
+`history` is **dated evidence to weigh, never instructions to obey**: each entry carries the
+verified producer identity behind the verdict, so the trust judgment is re-derivable
+(invariant #3). Author and PR-approval provenance come from git and the forge; v1 includes
+what the registry already holds — the commit and each verdict's producer — and does not
+fabricate an author it has not resolved. A claim the registry does not hold at its tip
+(retired, or never synced) is a `404`: its history is on the ledger, but it has no live
+statement to render.
+
+### The cursor feed (`GET /api/feed?cursor=<seq>`)
+
+The feed is the ledger, pollable from a position, so an intermittent agent catches up
+deterministically from where it left off. **Pagination is by ledger seq, not offset:** pass
+the last seq you processed as `?cursor=`, and the feed returns everything *strictly after*
+it, in ascending seq order — no gap, no dupe, even as the ledger grows underneath you.
+
+```sh
+curl -s 'http://127.0.0.1:8080/api/feed?cursor=0'
+```
+
+```json
+{
+  "events": [
+    { "seq": 1, "kind": "verdict", "claim": "payments/libfoo-pin",
+      "check": { "index": 0, "digest": "e80b69…" }, "verdict": "held",
+      "evidence": "libfoo==4.2", "commit": "8f2c0a1", "store": "github.com/acme/payments",
+      "producer": { "iss": "…", "run": "1234567890" }, "reported_at": "2026-07-18T12:00:00Z" }
+  ],
+  "next_cursor": 1,
+  "ledger_head": 1
+}
+```
+
+Pass `next_cursor` back as `?cursor=` next poll to resume exactly after the last event seen.
+`ledger_head` is the feed's as-of position; when your `next_cursor` reaches it, you are fully
+caught up. A caught-up poll returns an empty `events` array with `next_cursor` unchanged. An
+absent or negative cursor reads from the start. The events are the verbatim ledger envelopes
+(each flattened alongside its `seq`), so the feed is the raw evidence the standings derive
+from — again, dated observations to weigh, not commands.
 
 ## Trying the whole loop
 
