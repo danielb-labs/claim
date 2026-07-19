@@ -65,6 +65,84 @@ scheduler decide; the CLI just verifies whatever it is pointed at. The cadence *
 for a claim lives under its `hub:` subfield (`recheck`), which the CLI validates but
 never acts on — the hub's schedule is the hub's.
 
+## Selecting a subset
+
+`claim check` runs every claim by default. Two selectors narrow the run — the
+replacement for the removed `when:` field, which used to try to partition claims into
+"on change" and "on a clock" from inside the claim file. Cadence is orchestration, not a
+property a claim asserts about itself, so it moves out to the CI step:
+
+### The `--path` PR-subset pattern (replacing `when: on-change`)
+
+On a PR, run only the claims that are *about the files this PR touched*, so a change gets
+a fast, focused verification instead of the whole store:
+
+```yaml
+- name: Verify the claims about the changed files
+  run: |
+    # The files this PR changed, against the base branch.
+    git fetch origin "$GITHUB_BASE_REF" --depth=1
+    changed=$(git diff --name-only "origin/$GITHUB_BASE_REF"...HEAD)
+    # Run claim check once per changed top-level path prefix, aggregating the exit
+    # codes so no iteration's finding is lost. A `run:` block is not `set -e` by
+    # default, so a naive loop's step code would be only the LAST iteration's — a
+    # drift (1) or broken check (2) in an earlier prefix would be silently swallowed,
+    # the exact stale-green this tool exists to prevent. `rc` keeps the worst code and
+    # the step exits on it. A --path that matches no claim is not an error (exit 0,
+    # "no claims match"), so an unrelated change simply verifies nothing.
+    rc=0
+    for dir in $(echo "$changed" | xargs -n1 dirname | sort -u); do
+      claim check --json --path "$dir" || rc=$?
+    done
+    exit $rc
+```
+
+`--path` matches a claim whose file *or* whose `supports` decision ref lies under the
+prefix — the same match `claim list --path` uses — so "the claims about `src/auth/`"
+means the same thing whether you are listing or checking them. A prefix that matches no
+claim exits `0` and reports "no claims match," never a false "all held," so a PR that
+touches paths no claim covers is cleanly empty, not a failure.
+
+One caveat on the prefixes: `dirname` of a top-level changed file (e.g. `README.md`) is
+`.`, and `claim check --path .` is the empty prefix, which matches the *whole store* — so
+a change touching a root-level file re-runs every claim. That is a safe over-run (it
+verifies more, never less), and the exit aggregation above keeps it honest — a broader
+run's worst code still propagates; drop the `.` entry if you would rather a root change
+stay a narrow subset.
+
+The scheduled lane drops `--path` and runs `claim check --json` over the whole store, so
+nothing a PR skipped goes unverified over time.
+
+### The two-speed pattern via `skip.unless` (a check that runs only nightly)
+
+Some checks are expensive — an `agent` check that spends a model's budget, or a check
+that needs a runner a PR box does not have. Rather than a coarse `--kind` filter, a check
+carries its own condition for when it should run, and is *honestly skipped* the rest of
+the time (a skipped check is reported, never a false green):
+
+```yaml
+# In the claim file:
+checks:
+  - kind: agent
+    instruction: is the CJK corruption still unfixed in libfoo 5.x?
+    skip:
+      reason: agent checks run on the nightly lane, where a runner is configured
+      unless: 'test -n "$CLAIM_AGENT_CMD"'
+```
+
+`unless` runs the check when its command exits `0` and skips it when the command exits
+`1` — so the condition reads as "true when you want it to run." On a PR, with no
+`CLAIM_AGENT_CMD` set, `test -n "$CLAIM_AGENT_CMD"` exits `1` and the check is cleanly
+skipped: the PR run reports it as `skipped` (with the reason), and its summary says so
+(`held; N check(s) skipped`) — never "all held," so the deferral is visible, not hidden.
+The nightly lane sets `CLAIM_AGENT_CMD` to a real runner, `unless` then exits `0`, and
+the same check runs. This keeps cadence per-check and honest, where `--kind` would have
+partitioned the store from the outside.
+
+`--kind` selection was dropped in favor of this: a `skip.unless` condition is already
+honest (a skipped check can never masquerade as a pass), and it lets one claim carry both
+a cheap always-run check and an expensive nightly-only check side by side.
+
 ## From `--json` to the hub
 
 The one CLI→hub path is in the pipeline domain: on push-to-production or on a PR, the
@@ -120,6 +198,8 @@ The renderer consumes exactly this shape:
   "status": "ok",
   "exit": 1,
   "checked": 1,
+  "ran": 1,
+  "skipped": 0,
   "claims": [
     {
       "id": "payments/libfoo-pin",
@@ -139,12 +219,22 @@ The renderer consumes exactly this shape:
 }
 ```
 
+The envelope's `checked` counts the claims evaluated; `ran` counts the checks that
+produced a verdict and `skipped` counts the checks a declared skip suppressed, both
+summed across every claim. The two run-level counts let a consumer see "this run
+verified nothing" — `ran == 0` — without re-deriving it from the per-claim results, and
+they keep the honesty explicit: `ran == 0` is never "all held," because a skip is not a
+pass (golden invariant #6). A selection that matched no claim (an empty `--path`) reports
+`checked`, `ran`, and `skipped` all `0`.
+
 Each claim carries its `id`, `file`, the per-check `checks[]` (each a `verdict`, its
 process `end`, a `detail`, `evidence`, and a `note`), any `skipped` checks, the
 `supports[]` with their resolution, and the claim's own worst `exit`. Top-level
 `errors[]` holds unloadable or duplicate-id claim files. There is no `selection`,
-`report_only`, `now`, or top-level `notes`, and no per-check `when` — the CLI no longer
-selects, persists, timestamps a run against a stored log, or carries a trigger.
+`report_only`, `now`, or top-level `notes`, and no per-check `when` — selection is a
+command-line concern (positional ids and `--path`), not something the report echoes back,
+and the CLI no longer persists, timestamps a run against a stored log, or carries a
+trigger.
 
 ### CODEOWNERS and statements
 

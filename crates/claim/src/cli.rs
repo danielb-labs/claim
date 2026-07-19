@@ -193,12 +193,33 @@ ENVIRONMENT:
 /// Arguments to `claim check`: the runtime verifier.
 ///
 /// `check` runs every claim's checks and reports the current verdict — it stores
-/// nothing. There are no selection flags in this MR: the CLI runs the whole store
-/// and emits `--json` a hub or CI lane consumes; running a cheap subset on a PR is
-/// the CI step's job (real selectors are issue #19).
+/// nothing. Two selectors narrow which claims run, so a CI step can verify a cheap
+/// subset on a PR and leave the rest to a scheduled run: positional [`ids`](CheckArgs::ids)
+/// name claims exactly, and [`path`](CheckArgs::path) selects by repo path. Given
+/// neither, `check` runs the whole store (unchanged). Given both, the selected set is
+/// their **union** — a claim runs if its id was named *or* it matches the path.
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = CHECK_EXIT_HELP)]
-pub struct CheckArgs {}
+pub struct CheckArgs {
+    /// Claim ids to check, e.g. `claim check auth/no-cycles billing/tax`. Repeatable.
+    ///
+    /// Each id must resolve to a real claim in the store: a named id asserts "this
+    /// claim exists," so an unknown id is a usage error (exit 2) naming the
+    /// unresolved id(s), never a silent no-op. Combined with `--path`, the selected
+    /// set is the union of the two. Given no ids and no `--path`, every claim runs.
+    #[arg(value_name = "ID")]
+    pub ids: Vec<String>,
+
+    /// Check only claims whose file, or one of whose `supports` paths, is under this
+    /// repo path prefix (the same match `claim list --path` uses).
+    ///
+    /// Unlike a named id, a path is a filter, not an existence assertion: a prefix
+    /// that matches no claim is not an error — it exits 0 and the report says plainly
+    /// that no claims matched (never "all held"). Combined with positional ids, the
+    /// selected set is the union of the two.
+    #[arg(long, value_name = "PREFIX")]
+    pub path: Option<String>,
+}
 
 /// Arguments to `claim list`: the store inventory.
 ///

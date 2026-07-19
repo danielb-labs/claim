@@ -3,9 +3,9 @@
 //! A store is a `.claims/` directory holding claim files (`.claims/**/*.md`).
 //! There is no committed verdict log: a verdict is telemetry the hub stores, not
 //! source (see `docs/design/CLI-HUB-BOUNDARY.md`), so the store holds only the
-//! claims themselves. This module owns the questions every consumer — the CLI's
-//! read/verify verbs and the MCP server — shares, so they are answered in exactly
-//! one place and the two binaries cannot drift apart:
+//! claims themselves. This module owns the questions the CLI's read/verify verbs
+//! share — where the store is, what its claims are — so they are answered in exactly
+//! one place and no verb can drift from another:
 //!
 //! - **Where is the store?** [`discover`] walks up from a starting directory to
 //!   the nearest ancestor containing a `.claims/`, the same way git finds `.git/`.
@@ -94,8 +94,8 @@ impl Store {
     /// Parse every claim in the store: `.claims/**/*.md`.
     ///
     /// The one place every consumer agrees on what "the store's claims" are, so
-    /// the CLI's `check`, `list`, and `drift` and the MCP server's `query` cannot
-    /// disagree about which files count. Returns them sorted by id for a stable,
+    /// the CLI's `check`, `list`, and `drift` cannot disagree about which files
+    /// count. Returns them sorted by id for a stable,
     /// deterministic order (a directory listing is order-unspecified across
     /// platforms), so a JSON array or a human table reads the same on every run.
     ///
@@ -216,7 +216,7 @@ impl Store {
 ///
 /// Returns [`StoreError::NoStore`] when no `.claims/` is found within the
 /// boundary. That variant is the single, machine-recognizable "run `claim init`"
-/// signal both binaries branch on — the classification lives here, at the one
+/// signal the CLI branches on — the classification lives here, at the one
 /// discovery point, not re-derived per consumer.
 pub fn discover(start: &Path) -> Result<Store, StoreError> {
     for dir in start.ancestors() {
@@ -245,8 +245,7 @@ pub fn discover(start: &Path) -> Result<Store, StoreError> {
 /// loudly (and exit non-zero, or surface them as error entries), yet still act on
 /// the good ones. A store is never silenced by a single bad file. The CLI treats a
 /// non-empty `errors` as an exit-2 condition — loud — while listing/checking
-/// `claims` as usual — useful; the MCP server surfaces the errors alongside the
-/// good matches.
+/// `claims` as usual — useful.
 #[derive(Debug, Clone)]
 pub struct StoreLoad {
     /// The well-formed, unique claims, sorted by id.

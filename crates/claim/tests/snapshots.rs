@@ -78,6 +78,20 @@ fn check_human_snapshot() {
 }
 
 #[test]
+fn check_all_skipped_human_snapshot() {
+    // A claim whose only check is skipped: the run verified nothing, so the summary must
+    // say "no checks ran (all skipped)" and never read as "all held". Captured as a
+    // snapshot so the honest wording is a deliberate, reviewable diff.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "parked",
+        "---\nid: parked\nchecks:\n  - kind: cmd\n    run: \"false\"\n    skip:\n      reason: no runner in this environment\n---\nWould drift, but is skipped.\n",
+    );
+    insta::assert_snapshot!(stdout(&repo, &["check"], 0));
+}
+
+#[test]
 fn drift_clean_human_snapshot() {
     // Every check holds, so the drift queue is clean (exit 0).
     let repo = simple_store();

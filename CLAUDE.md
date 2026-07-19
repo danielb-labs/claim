@@ -89,10 +89,11 @@ Layout is a Cargo workspace:
   is a check result the CLI reports, never a stored history.
 - `crates/claim-store` — the shared infrastructure over core: store discovery,
   loading a store's claims, git provenance (commit author, HEAD sha), and the
-  authoring gate. Both front doors depend on it so they read one store and
-  attribute authored claims identically.
-- `crates/claim` — the `claim` CLI, a thin shell over core and store.
-- `crates/claim-mcp` — the MCP server, a thin shell over core and store.
+  authoring gate. The CLI depends on it to read one store and attribute authored
+  claims consistently; it is kept a separate crate so this store-and-git logic
+  stays free of CLI concerns and a future front door could reuse it unchanged.
+- `crates/claim` — the `claim` CLI, a thin shell over core and store. It is the
+  sole front door in v1.
 
 **Approved dependencies.** `serde`/`serde_json` (models and `--json` output),
 `thiserror` (library errors), `anyhow` (binary errors), `clap` (CLI, derive
@@ -114,18 +115,10 @@ instead of hanging the tool, and **`libc`** for the one syscall std does not exp
 `killpg` — killing a timed-out check's whole process group so `sleep 100 | foo`
 leaves no orphaned grandchild (std's `process_group(0)` creates the group but gives
 no way to signal it); both unix-only and rationale in `crates/claim-core/Cargo.toml`.
-For the MCP server (item 07), **`rmcp`** — the official Model Context Protocol Rust
-SDK (github.com/modelcontextprotocol/rust-sdk) — which owns the protocol so the
-server stays a thin shell over core: it provides the JSON-RPC framing, the tool
-request/response shapes, and the stdio transport agents connect over, and its
-`macros` feature turns a plain method into a registered tool with a generated schema
-(`server` + `transport-io` + `macros` only; no client, no HTTP); **`tokio`**, the
-async runtime rmcp serves on; and **`schemars`**, which rmcp uses to derive each
-tool's input schema from its request type — rationale in
-`crates/claim-mcp/Cargo.toml`. (The store and git-provenance logic the CLI and the
-server both need lives in the shared **`claim-store`** workspace crate, extracted in
-item 07 so the two front doors read one store and attribute authored claims
-identically.)
+(The store and git-provenance logic the CLI needs lives in the shared
+**`claim-store`** workspace crate, extracted in item 07 so store discovery, claim
+loading, and the authoring gate live in one place, layered over core and kept free
+of CLI concerns.)
 Adding any other dependency requires a one-line justification in the crate's
 `Cargo.toml` and a note in the review — every dependency is attack surface and
 maintenance.
@@ -210,28 +203,27 @@ docs and design files that describe it in the same commit.
 
 ### Docs ship with the behavior they describe
 
-A branch that changes user-facing behavior — a verb, a flag, an exit code, an MCP
-tool, an output shape — MUST update, add, or remove the docs it affects **in the
-same branch**, as part of the definition of done: the `docs/index.html` site, the
-topic docs under `docs/`, and the `--help` text. This is checked in review (see step
-4 of "How we work"): an unaccompanied behavior change is not mergeable, however
-correct the code is.
+A branch that changes user-facing behavior — a verb, a flag, an exit code, an
+output shape — MUST update, add, or remove the docs it affects **in the same
+branch**, as part of the definition of done: the `docs/index.html` site, the topic
+docs under `docs/`, and the `--help` text. This is checked in review (see step 4 of
+"How we work"): an unaccompanied behavior change is not mergeable, however correct
+the code is.
 
 Docs are **never** a separate batch item. Batching documentation into its own later
-item is exactly what let item 14's MCP `create` tool ship while the site still said
+item is exactly what once let the MCP `create` tool ship while the site still said
 the server "exposes two tools" — the drift was structural, not an oversight, because
-the item that added the tool had no obligation to touch the docs. Removing that
+the item that added the tool had no obligation to touch the docs. (That local MCP
+server has since been removed entirely, but the lesson stands.) Removing that
 structure removes the drift: the item that changes the behavior owns its docs.
 
 The mechanical backstop is the self-checking docs claim in this repo's own store
-(`docs/index-covers-cli-and-mcp`): its check (`scripts/docs-cover-cli.sh`) reads the
-shipped verb list from `claim --help` and the MCP tool list from the server source,
-and **drifts** when either names something `docs/index.html` does not, so `claim
-check`/CI catches an undocumented verb or tool even if a reviewer misses it. Had that
-claim existed at item 14, it would have failed the moment `create` landed. It is a
-backstop, not a substitute for writing the docs with the change — it proves *coverage*
-(every verb and tool is mentioned), not *accuracy* (that what is written is true),
-which stays a human obligation.
+(`docs/index-covers-cli`): its check (`scripts/docs-cover-cli.sh`) reads the shipped
+verb list from `claim --help` and **drifts** when it names a verb `docs/index.html`
+does not, so `claim check`/CI catches an undocumented verb even if a reviewer misses
+it. It is a backstop, not a substitute for writing the docs with the change — it
+proves *coverage* (every verb is mentioned), not *accuracy* (that what is written is
+true), which stays a human obligation.
 
 ## Commits
 

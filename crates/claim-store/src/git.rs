@@ -1,11 +1,10 @@
-//! Git provenance resolution: the `commit` and `actor` a verdict-log entry needs.
+//! Git provenance resolution: the `commit` and `actor` the authoring gate needs.
 //!
 //! The trust model derives provenance from git rather than from fields a claim
-//! file asserts about itself (invariant #3). When a verdict is written, that entry
-//! must carry the commit the check was observed against and the identity of
-//! whoever observed it — both looked up here from the repository, not typed by the
-//! author. Shared so the CLI's write verbs and the MCP server's `report` resolve
-//! the same `commit`/`actor` and cannot disagree.
+//! file asserts about itself (invariant #3). When a claim is authored, it must be
+//! attributable to the commit it was established against and the identity that
+//! established it — both looked up here from the repository, not typed by the
+//! author — so an unattributable claim fails loudly before the tree is touched.
 //!
 //! Git is treated as the database (invariant #4), so this shells out to the `git`
 //! binary through [`std::process`] rather than linking a library: the repository

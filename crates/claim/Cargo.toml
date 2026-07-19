@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 claim-core = { path = "../claim-core" }
-# Store discovery, claim loading, and git provenance, shared with claim-mcp so the
-# two front doors read one store and attribute verdicts identically.
+# Store discovery, claim loading, and git provenance: the shared store-and-git
+# layer over core, kept a separate crate so it stays free of CLI concerns.
 claim-store = { path = "../claim-store" }
 anyhow = { workspace = true }
 # CLI argument parsing (derive API), per CLAUDE.md's approved dependency list.

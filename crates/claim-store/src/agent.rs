@@ -1,12 +1,13 @@
 //! Resolving the opt-in agent-check runner from the environment.
 //!
 //! An `agent` check runs only when an operator supplies a runner — a shell command
-//! fed the verdict prompt on stdin, emitting the verdict JSON on stdout. Both front
-//! doors read it from the same `CLAIM_AGENT_CMD` variable, and the blank-value error
-//! is a user-facing contract, so the reader lives here once rather than being copied
-//! (and allowed to drift) between the CLI's `check` and the MCP server. With the
-//! variable unset — the default — no runner is attached, so agent checks are
-//! `Unverifiable` and nothing is spawned: a default run never reaches a model.
+//! fed the verdict prompt on stdin, emitting the verdict JSON on stdout. The runner
+//! is read from the `CLAIM_AGENT_CMD` variable, and the blank-value error is a
+//! user-facing contract, so the reader lives here once — in `claim-store` — rather
+//! than inline in `claim check`, ready to back another consumer with the same
+//! contract. With the variable unset — the default — no runner is attached, so agent
+//! checks are `Unverifiable` and nothing is spawned: a default run never reaches a
+//! model.
 
 use claim_core::AgentRunner;
 
@@ -15,9 +16,9 @@ use claim_core::AgentRunner;
 /// stdout. Unset leaves agent checks unverifiable and spawns nothing.
 pub const CLAIM_AGENT_CMD_ENV: &str = "CLAIM_AGENT_CMD";
 
-/// Why the agent runner could not be resolved from the environment. A misconfiguration
-/// each front door maps to its own surface (the CLI's `anyhow`, the server's protocol
-/// error); the wording is shared so the contract reads the same either way.
+/// Why the agent runner could not be resolved from the environment. A
+/// misconfiguration the CLI maps to its own surface (its `anyhow`); the wording lives
+/// here so the contract reads the same for any consumer.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentCmdError {
     /// `CLAIM_AGENT_CMD` is set but blank. Rejected loudly rather than silently

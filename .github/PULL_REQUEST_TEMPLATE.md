@@ -8,9 +8,9 @@ in the sections below and delete any that don't apply.
 
 <!--
 What changed, and the motivation a reviewer needs to judge it. If this changes anything
-a user or agent can observe — a CLI verb, a flag, an exit code, an MCP tool, an output
-shape, or the `.claims/` file format — say so explicitly; that triggers the docs
-obligation in the checklist and means the change is potentially breaking for existing
+a user or agent can observe — a CLI verb, a flag, an exit code, an output shape, or the
+`.claims/` file format — say so explicitly; that triggers the docs obligation in the
+checklist and means the change is potentially breaking for existing
 users and agents.
 -->
 
@@ -40,7 +40,7 @@ test that would fail if it broke. If it touches none, write "None affected."
 - [ ] `./scripts/check.sh` passes locally — formatting, clippy with warnings denied, all tests, docs, the CI renderer tests, and this repo's own dogfood claims.
 - [ ] The diff is scoped to one item; no drive-by refactors of unrelated code.
 - [ ] Tests cover the change, including the negative paths — a check that can't run or was never written ages the claim toward review, never toward a pass.
-- [ ] Docs ship with the behavior: if a verb, flag, exit code, MCP tool, output shape, or `.claims/` file-format field changed, `docs/index.html`, the affected topic docs under `docs/`, and `--help` are updated in this same branch.
+- [ ] Docs ship with the behavior: if a verb, flag, exit code, output shape, or `.claims/` file-format field changed, `docs/index.html`, the affected topic docs under `docs/`, and `--help` are updated in this same branch.
 - [ ] Any new dependency carries a one-line justification in the crate's `Cargo.toml` and is called out below — every dependency is attack surface and maintenance.
 - [ ] Commit subjects are imperative and under ~70 characters; co-authored commits carry the trailer.
 

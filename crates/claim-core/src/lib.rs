@@ -2,8 +2,7 @@
 //!
 //! This crate holds the parts of the system that must be correct above all
 //! else, kept free of process, network, and terminal concerns so they can be
-//! tested in isolation. The two binaries — the `claim` CLI and the MCP server —
-//! are thin shells over this crate.
+//! tested in isolation. The `claim` CLI is a thin shell over this crate.
 //!
 //! The invariants that define the product live here as types. See
 //! [`verdict::Verdict`] for the one that matters most: a check can report that a
@@ -45,8 +44,8 @@ pub use claim::{
 pub use error::{Error, Result};
 pub use verdict::Verdict;
 
-/// The UTC instant type the tool records and reasons about, re-exported so both
-/// binaries and the store crate name one `Timestamp` and cannot disagree about
-/// its semantics. From `jiff`, for correctness-first instant arithmetic and
+/// The UTC instant type the tool records and reasons about, re-exported so the
+/// CLI and the store crate name one `Timestamp` and cannot disagree about its
+/// semantics. From `jiff`, for correctness-first instant arithmetic and
 /// lossless RFC 3339 round-trips.
 pub use jiff::Timestamp;

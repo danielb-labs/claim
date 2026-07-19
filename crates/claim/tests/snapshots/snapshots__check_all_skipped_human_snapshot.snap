@@ -1,0 +1,9 @@
+---
+source: crates/claim/tests/snapshots.rs
+expression: "stdout(&repo, &[\"check\"], 0)"
+---
+parked  (.claims/parked.md)
+  skipped      (no expiry)
+      | no runner in this environment
+
+Checked 1 claim(s). Exit 0: no checks ran (all skipped).
