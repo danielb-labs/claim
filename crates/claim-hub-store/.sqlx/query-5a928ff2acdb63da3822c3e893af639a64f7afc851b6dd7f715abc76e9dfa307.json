@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                    INSERT OR IGNORE INTO supports_edges (store, claim_id, target)\n                    VALUES (?, ?, ?)\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "5a928ff2acdb63da3822c3e893af639a64f7afc851b6dd7f715abc76e9dfa307"
+}

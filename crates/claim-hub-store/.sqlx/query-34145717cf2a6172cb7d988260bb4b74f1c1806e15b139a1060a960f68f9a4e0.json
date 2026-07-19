@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT seq AS \"seq!: i64\", kind, claim_id, check_index, check_digest, verdict,\n                   evidence, \"commit\" AS commit_sha, store, producer, reported_at\n            FROM events\n            WHERE seq > ?\n            ORDER BY seq ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "kind",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "claim_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "check_index",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "check_digest",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "verdict",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "evidence",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_sha",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "store",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "producer",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "reported_at",
+        "ordinal": 10,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "34145717cf2a6172cb7d988260bb4b74f1c1806e15b139a1060a960f68f9a4e0"
+}

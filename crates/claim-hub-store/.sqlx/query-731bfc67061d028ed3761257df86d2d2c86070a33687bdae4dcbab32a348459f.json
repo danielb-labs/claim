@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT store, claim_id FROM supports_edges\n            WHERE target = ?\n            ORDER BY store ASC, claim_id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "store",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "claim_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "731bfc67061d028ed3761257df86d2d2c86070a33687bdae4dcbab32a348459f"
+}

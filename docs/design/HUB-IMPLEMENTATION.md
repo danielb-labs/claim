@@ -135,9 +135,12 @@ Schema shape, v1:
 - `events` — append-only: monotonic `seq` (the ledger cursor), `kind`,
   `claim_id`, `check_index`, `check_digest`, `verdict`, `evidence`, `commit`,
   `store`, `producer` (the verified identity block, JSON, verbatim),
-  `reported_at`. Unique index on (producer run, claim, check identity) — the
-  dedup rule of HUB.md §2; a redelivered push hits the index and returns the
-  original success.
+  `reported_at`. Unique index on (store, producer run, claim, check identity) —
+  the dedup rule of HUB.md §2; a redelivered push hits the index and returns the
+  original success. `store` and `claim` are in the key because a run id is unique
+  per repository (not globally) and the check digest is claim-independent, so
+  neither alone distinguishes two genuinely distinct observations; a non-empty
+  producer run is required, since a run-less verdict is unattributable and rejected.
 - `stores`, `claims_at_tip`, `supports_edges` — the registry: each claim at
   the default-branch tip with the commit it was read at, plus the cross-store
   supports index (#10's substrate). The registry is derived data: a version
@@ -486,8 +489,8 @@ one. Needs before start: envelope field sign-off (§4.5).
 **hub-02 — storage.** Creates `claim-hub-store`: the `Ledger` and `Registry`
 traits, the SQLite implementation via sqlx, embedded migrations, the events
 dedup index, the append-only triggers. Done when: append/scan/head round-trip;
-appending the same (producer run, check identity) twice yields one row and an
-idempotent success; a raw `UPDATE`/`DELETE` against events fails (trigger
+appending the same (store, producer run, claim, check identity) twice yields one
+row and an idempotent success; a raw `UPDATE`/`DELETE` against events fails (trigger
 test); registry wipe-plus-resnapshot rebuilds identically; migrations run from
 an empty file at first boot.
 
