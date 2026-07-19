@@ -288,6 +288,11 @@ file). This is the **only** way to open reads; it is never the default.
 | Identity provider unreachable (cannot verify *now*) | `503` (never a silent allow) |
 | Valid IdP token or hub token with `read` | `200` |
 
+The hub reads a JWT's `scope` claim as the OAuth 2.1 space-delimited **string**. An IdP
+that emits `scope` as a JSON *array* (nonstandard) fails closed — the token is rejected
+`401`, never admitted with no scopes — matching how the ingest gate reads its own producer
+claim.
+
 A `401` points at the **RFC 9728 protected-resource metadata** document, served
 unauthenticated so a client can discover how to authenticate:
 
@@ -427,8 +432,11 @@ endpoints derive what those verdicts (plus the clock) *mean* right now.
 Every route is a **read**: it computes at read time and stores nothing (invariant #3), so
 a standing can never disagree with the evidence, and a read never appends an event. Reads
 are **deterministic** — the same (`ledger_head`, `registry_version`, `clock`) always
-yields byte-identical bytes — so an agent can cache, diff, and resume. Auth over `/api`
-arrives with read-auth (a later item); the routes are unauthenticated for now.
+yields byte-identical bytes — so an agent can cache, diff, and resume. Every `/api` route
+requires a `read`-scoped bearer token unless the hub explicitly opens reads (`open_reads`);
+see [Read authentication](#read-authentication). The `curl` examples below assume the
+`open_reads` demo (or an equivalent trusted-network setup); against an authed hub, add
+`-H "Authorization: Bearer <token>"` and a missing or unscoped token is a `401`/`403`.
 
 | Endpoint | Returns |
 |---|---|
@@ -672,8 +680,9 @@ transport in stateless JSON mode (a tool call is one POST with a plain-JSON resp
 a load balancer). `/mcp` accepts any `Host`, the same as `/api`: rmcp's default `Host`
 allow-list (a DNS-rebinding guard for browsers reaching a *localhost* app) is disabled on the
 mount, so a hub behind a load balancer reached at its own hostname works with no extra config
-— a real deployment needs nothing set here. Read auth (a later item) will gate `/mcp` and
-`/api` uniformly.
+— a real deployment needs nothing set here. `/mcp` sits behind the hub's **read-auth
+layer** now, gated the same as `/api`: a `read`-scoped bearer is required unless the hub
+explicitly opens reads (`open_reads`); see [Read authentication](#read-authentication).
 
 Each tool is a **thin binding that returns the same JSON its API twin serves** — parity by
 construction: the tool and the HTTP endpoint call the one shared function that derives the
@@ -699,7 +708,9 @@ surface an agent obeys blindly is an injection channel with a trust stamp; the s
 the natural one. An **unknown or retired claim** is reported as a tool error carrying the
 reason (mirroring the API's `404`/`400`), **never a fabricated standing** (invariant #6).
 
-A `tools/call` for `dossier` looks like this (JSON-RPC over `POST /mcp`):
+A `tools/call` for `dossier` looks like this (JSON-RPC over `POST /mcp`); it assumes the
+`open_reads` demo, since `/mcp` is read-auth-gated (against an authed hub, add
+`-H "Authorization: Bearer <read-token>"`):
 
 ```sh
 curl -s http://127.0.0.1:8080/mcp \
@@ -714,8 +725,8 @@ imposes no restriction on its value (any hostname is accepted, matching `/api`),
 special is needed here whether you address the hub at `127.0.0.1` or its public hostname.
 
 The tool's `structuredContent` is byte-identical to `GET /api/claims/payments/libfoo-pin/dossier`.
-Read auth over `/mcp` (and `/api`) arrives with read-auth (a later item); the tools are
-unauthenticated for now.
+`/mcp` and `/api` are gated uniformly by the read-auth layer (a `read`-scoped bearer unless
+`open_reads` is set); see [Read authentication](#read-authentication).
 
 ## Trying the whole loop
 
@@ -761,9 +772,16 @@ docker build -t claim-hub:local .
 
 # Run it against a customer-owned volume. The volume starts EMPTY; the hub creates and
 # migrates hub.db in it on first boot. Nothing else is installed.
+#
+# CLAIM_HUB_OPEN_READS=true is the explicit read-auth decision this config-less demo needs:
+# the hub is secure by default and refuses to boot with no way to authenticate a read, so an
+# IdP-less, token-less container must opt in to open reads. That is safe only on a trusted
+# network — the `-p 127.0.0.1` bind keeps it on the loopback. A real deployment configures an
+# IdP or a minted token (see Read authentication) and drops this flag.
 docker run -d --name hub \
   -p 127.0.0.1:8080:8080 \
   -v hub-data:/data \
+  -e CLAIM_HUB_OPEN_READS=true \
   claim-hub:local
 
 curl -s http://127.0.0.1:8080/status   # => {"ledger_head":0,"registry_version":0,"rejection_count":0}
@@ -771,9 +789,11 @@ curl -s http://127.0.0.1:8080/status   # => {"ledger_head":0,"registry_version":
 
 The image sets `CLAIM_HUB_LISTEN=0.0.0.0:8080` and `CLAIM_HUB_DATABASE=/data/hub.db` so it
 binds a reachable address and lands its database on the mounted volume with no config file at
-all. To configure connected stores and the ingest gate's `[oidc]` trust, drop a `hub.toml`
-into the mounted volume (see [Configuration](#configuration) above) — env overrides still
-win, so the address and database path stay correct regardless.
+all. It bakes in **no** read-auth decision, so the operator must make one: `CLAIM_HUB_OPEN_READS`
+above, or a `hub.toml` with an `[read_auth.issuer]` or `[[read_auth.tokens]]` entry. To
+configure connected stores and the ingest gate's `[oidc]` trust, drop a `hub.toml` into the
+mounted volume (see [Configuration](#configuration) above) — env overrides still win, so the
+address and database path stay correct regardless.
 
 `examples/hub/docker-compose.yml` is the same run as a compose file, mounting one named
 volume for the one owned file.

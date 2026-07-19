@@ -55,7 +55,13 @@ jobs:
       - name: Cold start the packaged image from an empty volume
         run: |
           set -euo pipefail
-          docker run -d --name hub-cold -p 127.0.0.1:8080:8080 claim-hub:ci
+          # CLAIM_HUB_OPEN_READS=true is this cold-start's explicit read-auth decision: the
+          # image bakes in no read-auth decision (secure by default), so a config-less,
+          # IdP-less, token-less container refuses to boot without one. Opening reads is safe
+          # here because the `-p 127.0.0.1` bind keeps it on the loopback, mirroring
+          # scripts/hub-cold-start.sh (which sets the same flag for the real binary).
+          docker run -d --name hub-cold -p 127.0.0.1:8080:8080 \
+            -e CLAIM_HUB_OPEN_READS=true claim-hub:ci
           for _ in $(seq 1 60); do
             if curl -fsS -o /dev/null http://127.0.0.1:8080/status; then ready=1; break; fi
             sleep 1

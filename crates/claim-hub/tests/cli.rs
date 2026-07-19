@@ -1,10 +1,13 @@
-//! CLI-level tests over the real `claim-hub` binary: argument parsing and the
-//! environment-override path, driven through a spawned process.
+//! CLI-level tests over the real `claim-hub` binary: argument parsing, the
+//! environment-override path, and the `mint-token` subcommand, driven through a spawned
+//! process.
 //!
 //! These cover the thin input wiring the in-process tests cannot: `parse_args`
-//! (`--config`/`-c`, a missing value, an unrecognized argument) and that a
-//! `CLAIM_HUB_*` variable set on the *spawned* process actually reaches the config
-//! through `from_process` → `apply_env`. The environment is set on the child
+//! (`--config`/`-c`, a missing value, an unrecognized argument), the `mint-token`
+//! subcommand (the raw secret printed once with its hash and config snippet, repeated
+//! `--scope`, an unknown scope rejected), and that a `CLAIM_HUB_*` variable set on the
+//! *spawned* process actually reaches the config through `from_process` → `apply_env`.
+//! The environment is set on the child
 //! (`Command::env`), never on the test process, so nothing leaks between tests and
 //! the runs stay deterministic (CLAUDE.md). Most cases exit 1 with a message naming
 //! what to fix, caught at config/boot time before serving.
@@ -185,6 +188,81 @@ fn boots_config_less_with_open_reads_optin_and_status_reports_truthful_zeros() {
         "the hub created its database on first boot at {}",
         db_path.display()
     );
+}
+
+#[test]
+fn mint_token_prints_the_raw_token_once_with_its_hash_and_config_snippet() {
+    // `mint-token` is a CLI command, so it owes an integration test (CLAUDE.md): the raw
+    // secret is printed exactly once (the operator's one chance to copy it), alongside the
+    // `sha256:` hash and the `[[read_auth.tokens]]` snippet to paste into the config. The
+    // raw token and the stored hash are different values, so the token never leaks into
+    // config — the hashed-at-rest property, asserted at the CLI boundary.
+    let output = hub()
+        .arg("mint-token")
+        .assert()
+        .success()
+        .code(0)
+        .stdout(contains("claimhub_"))
+        .stdout(contains("sha256:"))
+        .stdout(contains("[[read_auth.tokens]]"))
+        .stdout(contains("scopes = [\"read\"]"))
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("mint-token stdout is UTF-8");
+
+    // The raw token appears exactly once — a second copy would be a leak beyond the single
+    // hand-off the command promises.
+    assert_eq!(
+        stdout.matches("claimhub_").count(),
+        1,
+        "the raw token must be printed exactly once:\n{stdout}"
+    );
+
+    // The `sha256:` hash and the raw token are distinct: the config carries the hash, never
+    // the secret. Isolate the raw-token line and confirm it holds no `sha256:` value.
+    let raw_line = stdout
+        .lines()
+        .find(|l| l.contains("claimhub_"))
+        .expect("a line carrying the raw token");
+    assert!(
+        !raw_line.contains("sha256:"),
+        "the raw token line must not carry the stored hash:\n{raw_line}"
+    );
+}
+
+#[test]
+fn mint_token_honors_repeated_scope_and_name() {
+    // `--scope` repeats (`read`, `act`) and `--name` labels the entry; both must reach the
+    // printed `[[read_auth.tokens]]` snippet so the operator's intent lands in the config.
+    hub()
+        .args([
+            "mint-token",
+            "--scope",
+            "read",
+            "--scope",
+            "act",
+            "--name",
+            "ci-dashboard",
+        ])
+        .assert()
+        .success()
+        .code(0)
+        .stdout(contains("name = \"ci-dashboard\""))
+        .stdout(contains("scopes = [\"read\", \"act\"]"));
+}
+
+#[test]
+fn mint_token_rejects_an_unknown_scope_with_a_named_error() {
+    // An unrecognized scope word is a loud, named usage error — never a silently minted
+    // token with an empty or wrong grant (invariant #6: fail loud, not toward a weak secret).
+    hub()
+        .args(["mint-token", "--scope", "write"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("unknown scope `write`"))
+        .stderr(contains("expected `read` or `act`"));
 }
 
 /// Reserve a free loopback TCP port by binding it and reading the assigned number, then
