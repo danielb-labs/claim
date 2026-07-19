@@ -591,6 +591,14 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     the CLI&rsquo;s JSON shape breaks the build rather than mis-rendering in production. The exit-code
     contract and the renderer are documented in full in <a href="ci.md">docs/ci.md</a>; drop-in workflow
     copies are in <code>examples/consumer/</code>.</p>
+    <p>Once a hub is in place, the nag is the hub&rsquo;s to derive, not the lane&rsquo;s. The hub renders the
+    due-and-drifted view and serves it at <code>GET /api/nags</code>; a scheduled <strong>nag-delivery</strong>
+    lane (the <code>hub-nag-deliver</code> Action) pulls that view with a hub-minted read-scoped token and
+    upserts one standing issue &mdash; the hub <em>renders</em>, the glue <em>delivers</em>. The delivered
+    body is the hub&rsquo;s view rendered verbatim by <code>ci/nag-deliver.mjs</code>, and a hub outage fails
+    the lane loudly and leaves the previous issue intact rather than blanking it &mdash; never a green
+    &ldquo;all clear&rdquo; over stale data. The forge write credential lives in the CI lane; the hub holds
+    none.</p>
     <div class="callout">
       <p><strong>The exit-code contract</strong> (highest applicable wins): <code>0</code> &mdash; every
       check held and every support resolved; <code>1</code> &mdash; a drift, an unverifiable, or an

@@ -740,6 +740,81 @@ about the inability to nag). `fired_this_pass` at the top counts marks a *tick* 
 read is always `0`); each item's `fired_this_pass` says whether that item's mark was newly
 appended this pass. `fire_key` is the stable identity a transition is nagged once per.
 
+### Delivering the nag from CI (the nag-delivery Action)
+
+The hub **renders** the nag and serves it; a scheduled CI lane **delivers** it to the forge.
+The hub ships one GitHub Action, **`hub-nag-deliver`**
+(`.github/actions/hub-nag-deliver`), that closes the delivery half of the loop: on a cron it
+pulls `GET /api/nags`, renders that view to markdown in one place (`ci/nag-deliver.mjs`), and
+upserts one standing **"claim: due & drifted"** issue — created when the hub is nagging,
+updated as the queue changes, closed when the hub reports nothing. The **forge write
+credential lives in the CI lane, never in the hub** (the hub holds no forge write token in v1
+— HUB-IMPLEMENTATION.md §4.5 decision 4).
+
+```yaml
+name: claims (hub nag delivery)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # a daily nag pull
+  workflow_dispatch:
+
+permissions:
+  contents: read   # check out the CI glue
+  issues: write    # maintain the standing issue
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: your-org/claim/.github/actions/hub-nag-deliver@v1
+        with:
+          hub-url: https://hub.acme.example
+          read-token: ${{ secrets.CLAIM_HUB_READ_TOKEN }}
+```
+
+**The pull is authenticated.** `/api/nags` is behind read auth (see
+[Read authentication](#read-authentication)), so the lane presents a **hub-minted read-scoped
+token** as `Authorization: Bearer`. Provision it once:
+
+1. On the hub host, mint one: `claim-hub mint-token --name ci-nag --scope read`.
+2. Add the printed `[[read_auth.tokens]]` snippet (the **hash** only) to the hub's config.
+3. Store the printed **raw** token as a repo secret (`CLAIM_HUB_READ_TOKEN`), and pass it as
+   the Action's `read-token`.
+
+The read token *reads* the hub; the forge `GITHUB_TOKEN` *writes* the issue. They are
+distinct credentials on distinct steps — the read token never touches the forge, the forge
+token never touches the hub — so the delivery lane holds the smallest credential of each kind.
+
+**The render is one place; the delivery is verbatim.** The delivered issue body is the hub's
+rendered nag view, rendered to markdown by `ci/nag-deliver.mjs` and posted unchanged — the
+owners, the grouping (one breaking commit's N claims are one item), the statements, and the
+dead-letter queue all come from the hub's response, never re-derived in the lane. A reader of
+the standing issue and a reader of `/api/nags` see one story (invariant #4: the glue delivers,
+it does not invent a verdict).
+
+**Idempotent upsert.** Every rendered body opens with a hidden marker
+(`<!-- claim-bot:hub-nag -->`); the lane finds its one issue by that marker (narrowed by the
+`claim` label) and edits it in place, so a hundred scheduled runs leave one issue, not a
+hundred. A `concurrency` block serializes runs against the same repo so two can never race.
+
+**A hub outage is loud, never a false green.** The pull (`ci/hub-nags.sh`) fails the step on
+any non-2xx (a `401` for a missing or wrong read token, a `403` for a wrong scope, a `500`
+when the hub cannot derive the queue), on an unreachable hub, and on a timeout (bounded by
+`max-time`, default 60s) — and it writes **nothing** to its output on failure. So a broken
+pull aborts before any render or upsert, and the **previous standing issue is left intact** —
+never blanked, never closed, never overwritten with an empty "all clear" over stale data
+(invariant #6). The render step is held to the same discipline: `ci/nag-render.sh` runs the
+renderer and treats only exit `0` (clean) and `1` (dirty) as findings — any other exit (a
+crashed or OOM'd renderer, a spawn failure, or the documented parse-failure `2`), or an empty
+body under any exit, is a loud failure that writes no `body_file`, so the upsert is skipped and
+the prior surface stands rather than being blanked or spammed with an empty issue. The
+pull-and-render core lives in `ci/hub-nags.sh` + `ci/nag-render.sh` + `ci/nag-deliver.mjs`,
+exercised against a locally-served hub in the gate (`crates/claim-hub/tests/nag_delivery.rs`):
+a valid pull renders the hub's view verbatim, two runs render an identical body (one issue), a
+refused / stalled / unauthenticated pull fails loudly and leaves the output empty, and a
+renderer that crashes or returns an empty body fails the step and posts nothing.
+
 ## The web UI, the markdown twins, and `llms.txt`
 
 The hub serves a small **server-rendered web UI** over the same read model the JSON API

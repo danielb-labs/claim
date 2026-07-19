@@ -1,0 +1,57 @@
+# Drop-in nag-delivery lane for a repo whose claims are ingested into a hub.
+#
+# Copy this into your repo's `.github/workflows/`. On a schedule it pulls the hub's rendered
+# nag view (`GET /api/nags`) and maintains one standing "claim: due & drifted" issue —
+# created when the hub is nagging, updated as the queue changes, closed when the hub reports
+# nothing. This is the DELIVERY half of the loop: the hub renders and serves the nag; this
+# lane delivers it to the forge. The hub holds no forge write token; the write credential
+# (the job's GITHUB_TOKEN) lives here.
+#
+# The pull is authenticated. The hub's `/api` is behind read auth, so the lane presents a
+# hub-minted read-scoped token as `Authorization: Bearer`. Provision it once:
+#
+#   1. On the hub host, mint a read token:  claim-hub mint-token --name ci-nag --scope read
+#   2. Add the printed `[[read_auth.tokens]]` snippet (the HASH only) to the hub's config.
+#   3. Store the printed RAW token as a repo secret named CLAIM_HUB_READ_TOKEN.
+#
+# The read token reads the hub; it is distinct from GITHUB_TOKEN, which writes the issue.
+# A hub outage (unreachable, non-2xx, or timeout) fails this lane loudly and leaves the
+# previous standing issue intact — never a green "all clear" over stale data.
+#
+# This lane replaces the CLI-side clock lane (claims-clock.yml) once a hub is in place: the
+# hub, not this lane, derives staleness and grouping and resolves owners, so the delivered
+# nag is one source of truth. Run one or the other, not both against the same issue.
+
+name: claims (hub nag delivery)
+
+on:
+  schedule:
+    # 07:00 UTC daily. Pick a time; the pull is cheap.
+    - cron: "0 7 * * *"
+  # Allow a manual run from the Actions tab.
+  workflow_dispatch:
+
+# Least privilege: read the code (to check out the CI glue), write the standing issue. No
+# `contents: write` — nothing is committed; the hub owns the verdict stream.
+permissions:
+  contents: read
+  issues: write
+
+# Never overlap scheduled runs against the same repo; a second run waits rather than racing
+# the first's issue update.
+concurrency:
+  group: claims-hub-nag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deliver the hub's nags to the standing issue
+        uses: your-org/claim/.github/actions/hub-nag-deliver@v1
+        with:
+          hub-url: https://hub.acme.example
+          # The hub-minted read-scoped token, from the repo secret (see the header).
+          read-token: ${{ secrets.CLAIM_HUB_READ_TOKEN }}
+          claim-repo: your-org/claim
+          claim-ref: v1
