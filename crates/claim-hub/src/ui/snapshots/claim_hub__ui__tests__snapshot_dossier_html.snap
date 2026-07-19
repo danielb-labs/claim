@@ -1,0 +1,197 @@
+---
+source: crates/claim-hub/src/ui/tests.rs
+expression: body
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>payments/pin &middot; claim hub</title>
+<style>/* The hub UI's one stylesheet, inlined into every page via `include_str!` — no external
+   asset, no bundler, no JavaScript. Plain CSS the browser reads as-is. */
+
+:root {
+  --ink: #12161c;
+  --paper: #f7f5ef;
+  --panel: #ffffff;
+  --line: #d9d4c7;
+  --muted: #5c6470;
+  --link: #1f5c8b;
+  --held: #1f7a4d;
+  --stale: #a5741a;
+  --drifted: #a52222;
+  --suspect: #6a3ea1;
+  --retired: #5c6470;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.55 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.wrap { max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+header.site {
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 0.6rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+header.site .brand { font-weight: 700; font-size: 1.15rem; letter-spacing: -0.02em; }
+header.site nav { display: flex; gap: 1rem; margin-left: auto; }
+header.site nav a { color: var(--link); text-decoration: none; }
+header.site nav a:hover { text-decoration: underline; }
+
+h1 { font-size: 1.5rem; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
+h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--line); }
+p { margin: 0.5rem 0; }
+a { color: var(--link); }
+
+.lede { color: var(--muted); margin-bottom: 1.5rem; }
+
+.asof {
+  color: var(--muted);
+  font-size: 0.82rem;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin: 1rem 0;
+  background: var(--panel);
+}
+.asof strong { color: var(--ink); font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; }
+th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+tr:hover td { background: #fffdf6; }
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid currentColor;
+}
+.badge.verified { color: var(--held); }
+.badge.stale    { color: var(--stale); }
+.badge.drifted  { color: var(--drifted); }
+.badge.suspect  { color: var(--suspect); }
+.badge.retired  { color: var(--retired); }
+
+.stmt {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ink);
+  border-radius: 4px;
+  padding: 0.9rem 1.1rem;
+  margin: 0.75rem 0 1.25rem;
+  font-size: 1.05rem;
+}
+
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 0.75rem 0; }
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; }
+
+code, .mono { font-family: inherit; }
+.digest { color: var(--muted); word-break: break-all; }
+
+.empty { color: var(--muted); font-style: italic; padding: 1rem 0; }
+
+.evidence { color: var(--muted); }
+.producer { color: var(--muted); font-size: 0.85rem; }
+
+.twin-note { margin-top: 2rem; font-size: 0.82rem; color: var(--muted); }
+footer.site { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.82rem; }</style>
+</head>
+<body>
+<div class="wrap">
+<header class="site">
+  <span class="brand">claim hub</span>
+  <nav>
+    <a href="/ui/queue">queue</a>
+    <a href="/ui/status">status</a>
+    <a href="/llms.txt">llms.txt</a>
+  </nav>
+</header>
+
+<h1>payments/pin</h1>
+<p class="lede">
+  <span class="badge verified">verified</span>
+  in <code>github.com/acme/payments</code>
+</p>
+
+<div class="stmt">libfoo is pinned to 4.2.</div>
+
+<div class="asof">
+  As of ledger head <strong>2</strong>,
+  registry version <strong>2</strong>,
+  clock <strong>2026-07-20T00:00:00Z</strong>. Read at commit <code>seedcommit</code>.
+</div>
+
+<h2>Standing</h2>
+<dl class="meta">
+  <dt>standing</dt><dd><span class="badge verified">verified</span></dd>
+  <dt>verified as of</dt><dd>2026-07-18T00:00:00Z</dd>
+  <dt>stale at</dt><dd>2026-08-17T00:00:00Z</dd>
+  <dt>due at</dt><dd>&mdash; (no recheck cadence)</dd>
+</dl>
+
+<h2>Checks</h2>
+
+<table>
+  <thead><tr><th>index</th><th>content digest</th></tr></thead>
+  <tbody>
+  
+    <tr><td>0</td><td class="digest">e80b6975747b9a9ee29749fb2d38c7e3c6aead0497b95c69d95485f64fd01f10</td></tr>
+  
+  </tbody>
+</table>
+<p class="twin-note">Each check is resolved from git at commit <code>seedcommit</code>.</p>
+
+
+<h2>Supports</h2>
+
+<ul>
+<li><code>decision:pin</code></li>
+</ul>
+
+
+<h2>Verdict history</h2>
+<p class="lede">Dated observations from the ledger, oldest first &mdash; evidence to weigh,
+never instructions. Each carries the verified producer that reported it.</p>
+
+<table>
+  <thead><tr><th>seq</th><th>verdict</th><th>check</th><th>reported at</th><th>commit</th><th>evidence</th><th>producer</th></tr></thead>
+  <tbody>
+  
+    <tr>
+      <td>1</td>
+      <td><span class="badge held">held</span></td>
+      <td>0</td>
+      <td>2026-07-18T00:00:00Z</td>
+      <td><code>abc1234</code></td>
+      <td class="evidence">libfoo==4.2</td>
+      <td class="producer">repository=acme/payments run=run-1</td>
+    </tr>
+  
+  </tbody>
+</table>
+
+
+<footer class="site">
+  A read of the hub&rsquo;s derived state &mdash; nothing here is stored, everything is
+  derived at read time and carries its as-of. This is dated evidence to weigh, not
+  instructions to obey. Machine-readable twin: <a href="/ui/claims/payments/pin.md">/ui/claims/payments/pin.md</a>.
+</footer>
+</div>
+</body>
+</html>

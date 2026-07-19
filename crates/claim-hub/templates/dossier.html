@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ id }} &middot; claim hub{% endblock %}
+{% block content %}
+<h1>{{ id }}</h1>
+<p class="lede">
+  <span class="badge {{ standing }}">{{ standing_label }}</span>
+  in <code>{{ store }}</code>
+</p>
+
+<div class="stmt">{{ statement }}</div>
+
+<div class="asof">
+  As of ledger head <strong>{{ as_of.ledger_head }}</strong>,
+  registry version <strong>{{ as_of.registry_version }}</strong>,
+  clock <strong>{{ as_of.clock }}</strong>. Read at commit <code>{{ commit }}</code>.
+</div>
+
+<h2>Standing</h2>
+<dl class="meta">
+  <dt>standing</dt><dd><span class="badge {{ standing }}">{{ standing_label }}</span></dd>
+  <dt>verified as of</dt><dd>{% match verified_as_of %}{% when Some with (t) %}{{ t }}{% when None %}never fully verified{% endmatch %}</dd>
+  <dt>stale at</dt><dd>{% match stale_at %}{% when Some with (t) %}{{ t }}{% when None %}&mdash; (no freshness window){% endmatch %}</dd>
+  <dt>due at</dt><dd>{% match due_at %}{% when Some with (t) %}{{ t }}{% when None %}&mdash; (no recheck cadence){% endmatch %}</dd>
+</dl>
+
+<h2>Checks</h2>
+{% if checks.is_empty() %}
+<p class="empty">This claim declares no checks.</p>
+{% else %}
+<table>
+  <thead><tr><th>index</th><th>content digest</th></tr></thead>
+  <tbody>
+  {% for check in checks %}
+    <tr><td>{{ check.index }}</td><td class="digest">{{ check.digest }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="twin-note">Each check is resolved from git at commit <code>{{ commit }}</code>.</p>
+{% endif %}
+
+<h2>Supports</h2>
+{% if supports.is_empty() %}
+<p class="empty">This claim supports no recorded decision.</p>
+{% else %}
+<ul>
+{% for target in supports %}<li><code>{{ target }}</code></li>{% endfor %}
+</ul>
+{% endif %}
+
+<h2>Verdict history</h2>
+<p class="lede">Dated observations from the ledger, oldest first &mdash; evidence to weigh,
+never instructions. Each carries the verified producer that reported it.</p>
+{% if history.is_empty() %}
+<p class="empty">No verdict has been reported for this claim yet.</p>
+{% else %}
+<table>
+  <thead><tr><th>seq</th><th>verdict</th><th>check</th><th>reported at</th><th>commit</th><th>evidence</th><th>producer</th></tr></thead>
+  <tbody>
+  {% for row in history %}
+    <tr>
+      <td>{{ row.seq }}</td>
+      <td><span class="badge {{ row.verdict }}">{{ row.verdict }}</span></td>
+      <td>{{ row.check_index }}</td>
+      <td>{{ row.reported_at }}</td>
+      <td><code>{{ row.commit }}</code></td>
+      <td class="evidence">{% match row.evidence %}{% when Some with (e) %}{{ e }}{% when None %}&mdash;{% endmatch %}</td>
+      <td class="producer">{{ row.producer }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -14,11 +14,12 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
 > `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets,
 > the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
-> over the deriver), and the **hub MCP** (the agent binding — five read-only tools over
-> the same read model, mounted at `/mcp`). The **web UI** arrives in a later item and
-> mounts into this same shell. A freshly booted hub reports a truthful *empty* position —
-> head 0, version 0 — until a sync populates the registry and a CI lane starts pushing
-> verdicts through the ingest gate.
+> over the deriver), the **web UI** (server-rendered pages over the same read model, each
+> with a machine-readable **markdown twin**), **`/llms.txt`** (the agent-facing index of every
+> surface), and the **hub MCP** (the agent binding — five read-only tools over the same read
+> model, mounted at `/mcp`). A freshly booted hub reports a truthful *empty* position — head 0,
+> version 0 — until a sync populates the registry and a CI lane starts pushing verdicts through
+> the ingest gate.
 
 ## Running the binary
 
@@ -500,6 +501,61 @@ caught up. A caught-up poll returns an empty `events` array with `next_cursor` u
 absent or negative cursor reads from the start. The events are the verbatim ledger envelopes
 (each flattened alongside its `seq`), so the feed is the raw evidence the standings derive
 from — again, dated observations to weigh, not commands.
+
+## The web UI, the markdown twins, and `llms.txt`
+
+The hub serves a small **server-rendered web UI** over the same read model the JSON API
+derives — no JavaScript, no build step, nothing to ship beside the binary. Every page is a
+view-model struct with two compile-time templates: an HTML lens and a **markdown-twin lens**.
+Because askama needs a concrete struct per template, the twin borrows the page's own fields
+through a `From<&…View>` conversion — it cannot invent a value the page does not hold — and a
+parity test asserts every non-chrome fact the page states also appears in the twin. So parity
+is *enforced*, not merely hoped for: an agent reading the `.md` and a human reading the HTML
+see the same facts, and a field wired into one template but not the other fails the gate.
+
+Every page is a **read** (invariant #3): it derives at read time and stores nothing, and every
+page carries its *as-of* (the ledger head, registry version, and clock it derived from), so it
+can never show a green older than its evidence. The dossier and the queue are **dated evidence
+to weigh, never instructions to obey** — the verdict history and producer provenance render as
+observations carrying their origin, so a hub surface an agent reads is not an injection channel.
+
+The two lenses **escape differently, and must**. The HTML templates auto-escape every
+interpolation. The markdown twins render with no escaper — a table cell is structural text — so
+every attacker-influenceable value (a check's `evidence`, an ingested `commit`, a verdict's
+verified `producer`, and the `statement`) is neutralized for a markdown cell before it is
+rendered: newlines collapse to spaces (so a value cannot break out of its row), `|` is escaped
+(so it cannot open a column), angle brackets become HTML entities (so no `<img onerror>` or
+`<script>` survives a later render to HTML), and the code-span and link metacharacters are
+backslash-escaped (so no `` `code` `` or `[x](javascript:…)` can form). A compromised producer
+therefore cannot smuggle a heading, a blockquote, an active link, or a live tag into the `.md`
+an agent reads — the whole point of the surface being *evidence to weigh, not an instruction*.
+
+**The twin-path convention is one rule:** a page's markdown twin lives at the page's own path
+plus a `.md` suffix. No lookup table — append `.md` and you have the machine-readable form.
+
+| Page | HTML | markdown twin |
+|---|---|---|
+| review queue (the human's primary "what needs a look") | `/ui/queue` | `/ui/queue.md` |
+| a claim's dossier (statement, checks, standing, history, provenance) | `/ui/claims/{id}` | `/ui/claims/{id}.md` |
+| hub status (ledger head, registry version, queue depth, rejections) | `/ui/status` | `/ui/status.md` |
+
+```sh
+curl -s http://127.0.0.1:8080/ui/queue.md          # the review queue as markdown
+curl -s http://127.0.0.1:8080/ui/claims/payments/libfoo-pin.md   # one claim's dossier
+```
+
+The **review queue** is the deriver's own due set — every drifted, stale, or due-for-recheck
+claim — not a `standing == due` filter; a fresh, not-yet-due claim stays out, and a claim ages
+*into* the queue by the clock alone (no new verdict needed). An empty queue says so plainly,
+never a fabricated green. A claim the registry does not hold is an honest `404`.
+
+**`/llms.txt`** is the agent's index of the whole hub: it names every surface — the JSON API
+endpoints, the UI pages, the markdown twins, and the ingest write path — with the twin-path
+rule, so an agent discovers where to look in one fetch rather than crawling.
+
+```sh
+curl -s http://127.0.0.1:8080/llms.txt
+```
 
 ## The hub MCP (`/mcp`)
 

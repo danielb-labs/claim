@@ -1,0 +1,103 @@
+/* The hub UI's one stylesheet, inlined into every page via `include_str!` — no external
+   asset, no bundler, no JavaScript. Plain CSS the browser reads as-is. */
+
+:root {
+  --ink: #12161c;
+  --paper: #f7f5ef;
+  --panel: #ffffff;
+  --line: #d9d4c7;
+  --muted: #5c6470;
+  --link: #1f5c8b;
+  --held: #1f7a4d;
+  --stale: #a5741a;
+  --drifted: #a52222;
+  --suspect: #6a3ea1;
+  --retired: #5c6470;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.55 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.wrap { max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+header.site {
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 0.6rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+header.site .brand { font-weight: 700; font-size: 1.15rem; letter-spacing: -0.02em; }
+header.site nav { display: flex; gap: 1rem; margin-left: auto; }
+header.site nav a { color: var(--link); text-decoration: none; }
+header.site nav a:hover { text-decoration: underline; }
+
+h1 { font-size: 1.5rem; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
+h2 { font-size: 1.05rem; margin: 2rem 0 0.6rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--line); }
+p { margin: 0.5rem 0; }
+a { color: var(--link); }
+
+.lede { color: var(--muted); margin-bottom: 1.5rem; }
+
+.asof {
+  color: var(--muted);
+  font-size: 0.82rem;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin: 1rem 0;
+  background: var(--panel);
+}
+.asof strong { color: var(--ink); font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; }
+th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+tr:hover td { background: #fffdf6; }
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid currentColor;
+}
+.badge.verified { color: var(--held); }
+.badge.stale    { color: var(--stale); }
+.badge.drifted  { color: var(--drifted); }
+.badge.suspect  { color: var(--suspect); }
+.badge.retired  { color: var(--retired); }
+
+.stmt {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ink);
+  border-radius: 4px;
+  padding: 0.9rem 1.1rem;
+  margin: 0.75rem 0 1.25rem;
+  font-size: 1.05rem;
+}
+
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 0.75rem 0; }
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; }
+
+code, .mono { font-family: inherit; }
+.digest { color: var(--muted); word-break: break-all; }
+
+.empty { color: var(--muted); font-style: italic; padding: 1rem 0; }
+
+.evidence { color: var(--muted); }
+.producer { color: var(--muted); font-size: 0.85rem; }
+
+.twin-note { margin-top: 2rem; font-size: 0.82rem; color: var(--muted); }
+footer.site { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.82rem; }

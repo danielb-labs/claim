@@ -1,6 +1,6 @@
 [package]
 name = "claim-hub"
-description = "The hub binary: the axum application shell every later component mounts into. v1 ships config, the tower-layered router, /status, tracing, and boot; ingest, the API, MCP, and the UI arrive in later items."
+description = "The hub binary: the axum application shell every component mounts into. v1 ships config, the tower-layered router, boot and tracing, /status, the single ingest write path, the read API, and the web UI with its markdown twins and /llms.txt; the MCP surface arrives in a later item."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -102,6 +102,20 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",
+] }
+# Compile-time, type-checked templates embedded in the binary (HUB-IMPLEMENTATION.md
+# §1.10/§1.14). The UI is server-rendered askama over the same view models the JSON API
+# derives, with NO JavaScript build chain — a second toolchain would be attack surface, a
+# second gate, and a standing invitation for the UI to grow state against the one-substrate
+# rule. Each page is one view-model struct rendered by TWO templates (an HTML lens and a
+# markdown-twin lens), so the twin is structurally incapable of drifting from the page: a
+# renamed view-model field is a compile error, not a blank cell. `default-features = false`
+# with just `std` + `derive` drops the optional `config`/`serde_json`/`urlencode` filters the
+# UI does not use, keeping the dependency minimal; `derive` brings the `Template` proc-macro
+# and `std` its `render()`.
+askama = { version = "0.16", default-features = false, features = [
+    "std",
+    "derive",
 ] }
 # The official MCP Rust SDK (HUB-IMPLEMENTATION.md §1.10/§1.14, hub-09): owns the MCP
 # protocol framing and the streamable-HTTP transport, mounted as a tower service into the

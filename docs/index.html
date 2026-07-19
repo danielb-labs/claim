@@ -370,8 +370,19 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     and <code>due</code> &mdash; mounted in-process on the same app and returning the same JSON their
     API twins serve (parity by construction). Each is a read that stores nothing and carries its as-of,
     and the surface is dated evidence to weigh, never instructions to obey: an unknown or retired claim
-    is reported as an error, never a fabricated standing. The web UI arrives in a later item over the
-    same read model.</p>
+    is reported as an error, never a fabricated standing.</p>
+    <p>Over that same read model the hub serves a small <strong>server-rendered web UI</strong> &mdash;
+    no JavaScript, no build step. Every page (the <a href="hub.md">review queue</a> at
+    <code>/ui/queue</code>, a claim&rsquo;s dossier at <code>/ui/claims/{id}</code>, and hub status at
+    <code>/ui/status</code>) has a machine-readable <strong>markdown twin</strong> at the same path plus
+    a <code>.md</code> suffix &mdash; one predictable rule, no lookup table. The twin borrows the page&rsquo;s
+    own fields through a <code>From</code> conversion and a parity test asserts every fact appears in both,
+    so the two lenses cannot describe different facts. The markdown twin is injection-safe: every
+    attacker-influenceable value (a check&rsquo;s evidence, an ingested commit, a verdict&rsquo;s producer, the
+    statement) is neutralized for its markdown cell, so a compromised producer cannot smuggle a heading,
+    active link, or live HTML tag into the <code>.md</code> an agent reads. <code>/llms.txt</code>
+    indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
+    to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
     no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is

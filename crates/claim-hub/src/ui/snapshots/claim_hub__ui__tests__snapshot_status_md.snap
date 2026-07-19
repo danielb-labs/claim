@@ -1,0 +1,22 @@
+---
+source: crates/claim-hub/src/ui/tests.rs
+expression: body
+---
+# Hub status
+
+Where the hub is: the ledger head, the registry version, the review-queue depth, and
+how many ingests it has rejected. Derived at read time; an empty hub reports truthful
+zeros, never a fabricated "healthy".
+
+| field | value |
+|---|---|
+| ledger head | 2 |
+| registry version | 2 |
+| in review queue | 1 |
+| rejected ingests | 0 |
+
+_As of ledger head 2, registry version 2, clock 2026-07-20T00:00:00Z._
+
+A rising **rejected ingests** count is the hub telling you telemetry is being turned
+away while the claims it would refresh go stale — watch it. The machine-readable JSON
+position is at `/status`; the review queue is at [/ui/queue.md](/ui/queue.md).
