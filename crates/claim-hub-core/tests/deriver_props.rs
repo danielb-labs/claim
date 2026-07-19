@@ -7,16 +7,22 @@
 //! deterministic and dependency-free (no `proptest`), which the workspace's approved
 //! deps require, while still asserting a universally-quantified property.
 //!
-//! The three properties, one per golden concern:
+//! The properties, one per golden concern:
 //!
 //! - **No combination of events manufactures a green** (invariant #1): over every
 //!   assignment of latest verdicts to a claim's checks, [`Standing::Verified`] occurs
-//!   *only* when every check's latest is a pass within its window.
+//!   *only* when every check's latest is a pass. A companion property adds the clock
+//!   dimension — the same verdict-combos crossed with a sweep of clocks around a
+//!   claim's freshness boundary — so an all-held-but-*expired* multi-check claim
+//!   reading `Verified` would fail a test, not just the single-check case.
 //! - **A shallow check's pass never clears a deep check's drift** (issue #18): a
 //!   verdict reported against one check's digest never changes another check's state,
 //!   so a held shallow check cannot rescue a drifted deep check.
 //! - **`broken` counts as never-checked** (invariant #1): a `Broken` (or
 //!   `Unverifiable`) latest yields exactly the standing an absent verdict would.
+//! - **A future-dated pass buys no freshness** (invariant #6): the clock-boundary
+//!   sweep and a targeted unit test pin that a producer-asserted `reported_at` past
+//!   the read clock cannot extend a claim's window past `now`.
 
 use claim_core::{parse_claim_file, Claim, Timestamp, Verdict};
 use claim_hub_core::deriver::{derive, ClaimEntry, DeriverConfig, RegistrySnapshot, Standing};
@@ -151,6 +157,78 @@ fn no_combination_of_events_manufactures_a_green() {
                     Standing::Drifted,
                     "any drift dominates the join: {assignment:?}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_verdict_combo_manufactures_a_green_across_the_freshness_boundary() {
+    // The companion to the join property, adding the clock dimension: for a windowed
+    // multi-check claim, over *every* assignment of latest verdicts *and* a sweep of
+    // clock instants around the freshness boundary, an all-held claim is Verified only
+    // strictly before expiry (Stale at or after), and a non-all-held claim is never
+    // Verified at any clock — the multi-check-combos × lapsed-window interaction is
+    // enumerated, so an all-held-but-expired multi-check claim reading Verified would
+    // fail here. All verdicts are dated at a fixed instant; the 30-day window makes
+    // expiry 2026-07-31T00:00:00Z.
+    let passed_at = "2026-07-01T00:00:00Z";
+    let expiry = ts("2026-07-31T00:00:00Z");
+    // Clocks straddling the boundary: mid-window (fresh), one second before expiry
+    // (fresh), exactly at expiry (stale), and past it (stale).
+    let clocks = [
+        (ts("2026-07-10T00:00:00Z"), true),
+        (ts("2026-07-30T23:59:59Z"), true),
+        (ts("2026-07-31T00:00:00Z"), false),
+        (ts("2026-08-15T00:00:00Z"), false),
+    ];
+
+    for n in 1..=3 {
+        let claim = with_max_age(n_check_claim("t", n), "30d");
+        let reg = single_claim_registry(claim.clone());
+        for assignment in assignments(n) {
+            // All verdicts share `passed_at`, so the freshness baseline (the min
+            // passing instant) is `passed_at` whenever every check passes.
+            let events: Vec<(u64, Event)> = assignment
+                .iter()
+                .enumerate()
+                .filter_map(|(i, choice)| {
+                    choice.map(|v| (i as u64 + 1, event_for_check(&claim, i, v, passed_at)))
+                })
+                .collect();
+
+            let all_held = assignment.iter().all(|c| *c == Some(Verdict::Held));
+            let any_drift = assignment.contains(&Some(Verdict::Drifted));
+
+            for (clock, within_window) in clocks {
+                let model = derive(&reg, &events, clock, &DeriverConfig::default());
+                let s = model.standing("s", "t").unwrap();
+
+                if any_drift {
+                    // A drift dominates at every clock, expired or not.
+                    assert_eq!(
+                        s.standing,
+                        Standing::Drifted,
+                        "drift dominates regardless of clock: {assignment:?} at {clock}"
+                    );
+                } else if all_held && within_window {
+                    assert_eq!(
+                        s.standing,
+                        Standing::Verified,
+                        "all held and within window → verified: {assignment:?} at {clock}"
+                    );
+                    assert_eq!(s.stale_at, Some(expiry));
+                } else {
+                    // Either a non-held check (never verifies at any clock) or an
+                    // all-held claim past its window (stale by the clock alone). In
+                    // neither case may it read Verified.
+                    assert_ne!(
+                        s.standing,
+                        Standing::Verified,
+                        "a non-held check or an expired window must never verify: \
+                         {assignment:?} at {clock}"
+                    );
+                }
             }
         }
     }

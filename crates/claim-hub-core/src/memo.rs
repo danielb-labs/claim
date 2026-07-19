@@ -64,6 +64,18 @@ struct Cached {
 /// recompute takes the write lock only to install a fresh result. There is no
 /// dependency here — std suffices at v1 volume (`moka` is the named alternative if a
 /// profile ever disagrees, adoptable behind this same type without changing callers).
+///
+/// **Safety precondition: one slot suffices only because a hub derives the *entire*
+/// read model under one key.** [`derive()`] takes the whole registry and ledger and
+/// returns every claim's standing at once, so successive reads at the same inputs
+/// vary only in the clock — which the horizon handles — and the slot never contends
+/// between differently-keyed answers. A caller that instead memoized finer-grained
+/// slices through this one slot (per-claim, or per-query subsets of the ledger) would
+/// *thrash* it: each differently-scoped read would evict the last. That is never a
+/// wrong answer — a miss fails safe to a fresh [`derive()`] (the cache holds no truth,
+/// only the last computation) — but it is a latency cliff, and such a caller wants a
+/// keyed multi-entry cache (`moka`) behind the same [`read`](Memo::read) shape, not
+/// this slot.
 #[derive(Default)]
 pub struct Memo {
     slot: RwLock<Option<Cached>>,
@@ -99,6 +111,15 @@ impl Memo {
     /// The result is *identical* to calling [`derive()`] directly — the memo changes
     /// only how often the work runs, never the answer (proven in the property tests).
     /// `events` is the ledger in ascending `seq` order, as [`derive()`] expects.
+    ///
+    /// **Precondition: `max(seq)` must uniquely identify the event prefix.** The key
+    /// summarizes the ledger by its head sequence alone (`events.iter().map(seq).max()`),
+    /// which is sound only because a real ledger is append-only with a monotonic `seq`
+    /// — so the same head means the same prefix, and a new event always raises the
+    /// head. A caller that passed a slice whose `max(seq)` did not determine its
+    /// contents (a mutated or reordered ledger, which the hub's `Ledger` trait makes
+    /// unrepresentable) could get a stale cache hit; against the real append-only
+    /// ledger this cannot happen.
     #[must_use]
     pub fn read(
         &self,

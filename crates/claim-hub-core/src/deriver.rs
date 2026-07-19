@@ -158,14 +158,20 @@ impl DeriverConfig {
             .or(claim.hub.max_age)
             .or(self.default_max_age)
     }
+}
 
-    /// The effective recheck cadence for a claim: its own `hub.recheck`, else the
-    /// configured default freshness window is *not* substituted — recheck and
-    /// max-age are distinct hints (HUB-IMPLEMENTATION.md §4.5). `None` means the
-    /// claim declares no cadence and the deriver computes no due instant for it.
-    fn effective_recheck(&self, claim: &Claim) -> Option<Days> {
-        claim.hub.recheck
-    }
+/// The effective recheck cadence for a claim: its own `hub.recheck`, and nothing
+/// else.
+///
+/// A free function, not a `DeriverConfig` method, because v1 config deliberately
+/// does *not* override the recheck cadence — recheck and max-age are distinct hints
+/// (HUB-IMPLEMENTATION.md §4.5), and the config's `max_age_override`/`default_max_age`
+/// have no recheck counterpart. So this reads only the claim, and taking `&config`
+/// it would ignore would be a false parallel with [`DeriverConfig::effective_max_age`]
+/// (which genuinely needs three sources). `None` means the claim declares no cadence
+/// and the deriver computes no due instant for it.
+fn effective_recheck(claim: &Claim) -> Option<Days> {
+    claim.hub.recheck
 }
 
 /// The derivation's provenance: the exact inputs a read model was computed from.
@@ -444,6 +450,13 @@ pub fn derive(
 /// are skipped here — they do not bear on a claim's standing. Ties in `reported_at`
 /// resolve to the later position in the input slice (ledger order), so a redelivered
 /// event does not flip a result.
+///
+/// Identity is *content*, not count: two byte-identical check definitions on one
+/// claim share a digest ([`crate::check_digest`]), so a single verdict against that
+/// digest verifies both copies, and a drift on either drifts the claim. A reader
+/// expecting N checks to need N observations should note this — it is issue #18's
+/// content-identity model working as designed, not a missed observation: two checks
+/// that verify the *same* thing the same way are one identity to the ledger.
 type LatestMap = BTreeMap<(String, String, String), (Verdict, Timestamp)>;
 
 fn index_latest_verdicts(events: &[(u64, Event)]) -> LatestMap {
@@ -500,13 +513,13 @@ fn derive_claim(
         .collect();
 
     let max_age = config.effective_max_age(claim);
-    let recheck = config.effective_recheck(claim);
+    let recheck = effective_recheck(claim);
 
     // The freshness baseline: the instant every check last passed. A claim is only
     // as fresh as its *stalest* passing check, and only if every check has passed at
     // all — a single never-passed check leaves the baseline absent (never fully
     // verified).
-    let full_pass_baseline = full_pass_baseline(&states);
+    let full_pass_baseline = full_pass_baseline(&states, now);
 
     let standing = join(&states, full_pass_baseline, max_age, now);
 
@@ -549,8 +562,8 @@ fn derive_claim(
     }
 }
 
-/// The instant every check last passed, or `None` if any check has no passing
-/// latest verdict.
+/// The instant every check last passed — clamped to no later than `now` — or `None`
+/// if any check has no passing latest verdict.
 ///
 /// This is the freshness baseline: a claim is fresh from the moment its *stalest*
 /// passing check passed, and only if every check has a passing latest at all. A
@@ -558,12 +571,24 @@ fn derive_claim(
 /// has never been checked yields `None` for the whole claim — there is no baseline
 /// to age from, which is exactly why `broken` and never-checked count identically
 /// against freshness (invariant #1).
-fn full_pass_baseline(states: &[CheckState]) -> Option<Timestamp> {
+///
+/// Each passing instant is clamped to `min(reported_at, now)` before it feeds
+/// freshness. A verdict's `reported_at` is producer-asserted, so a future-dated pass
+/// (clock skew, or a forged timestamp) must never buy freshness a real observation
+/// has not earned: clamping caps `verified_as_of`, `stale_at`, and the horizon at the
+/// read clock, so a green can never be asserted *before* its own evidence timestamp
+/// (invariant #6 — a wrong answer stays loud, never a lie into the future). This is
+/// defense in depth: the deriver is pure and trust is the ingest gate's job, so the
+/// gate (hub-04) should also reject or clamp a future `reported_at` at the door; the
+/// deriver refusing to be fooled by one is the second line.
+fn full_pass_baseline(states: &[CheckState], now: Timestamp) -> Option<Timestamp> {
     // The minimum passing instant across all checks; `None` the moment any check
     // lacks a passing latest.
     let mut baseline: Option<Timestamp> = None;
     for state in states {
-        let pass = state.latest_pass()?;
+        // Clamp before folding: a future-dated pass contributes `now`, not its
+        // asserted instant, so it can never extend the window past the read clock.
+        let pass = state.latest_pass()?.min(now);
         baseline = Some(match baseline {
             Some(current) => current.min(pass),
             None => pass,
@@ -1030,5 +1055,62 @@ mod tests {
         assert_eq!(m1.claims, m2.claims);
         assert_eq!(m1.due, m2.due);
         assert_eq!(m1.as_of.ledger_head, m2.as_of.ledger_head);
+    }
+
+    #[test]
+    fn a_future_dated_pass_does_not_read_fresh_into_the_future() {
+        // A producer asserts `reported_at: 2027-01-01` (clock skew or a forgery), read
+        // at `now: 2026-07-01`. The pass is clamped to `now`, so freshness is measured
+        // from the read clock, not the future timestamp: `verified_as_of`, `stale_at`,
+        // and the horizon are all capped at `now`. A green is never asserted before its
+        // own evidence timestamp.
+        let claim = simple_claim("t", "hub:\n  max-age: 30d\n");
+        let future = verdict_event("s", &claim, 0, Verdict::Held, "2027-01-01T00:00:00Z");
+        let reg = registry(vec![("s", claim)]);
+        let now = ts("2026-07-01T00:00:00Z");
+        let model = derive(&reg, &[(1, future)], now, &DeriverConfig::default());
+        let s = model.standing("s", "t").unwrap();
+        // Still verified (the check does hold), but the good news is dated at the read
+        // clock, not the future — no fresh-into-the-future.
+        assert_eq!(s.standing, Standing::Verified);
+        assert_eq!(
+            s.verified_as_of,
+            Some(now),
+            "verified_as_of is clamped to the read clock, not the future timestamp"
+        );
+        // The window ages from `now`, so stale_at is now + 30d, never now + (future +
+        // 30d): the future timestamp bought no extra freshness.
+        assert_eq!(s.stale_at, Some(ts("2026-07-31T00:00:00Z")));
+        // The horizon is a real future instant relative to the read clock, not one
+        // pushed past it by the forged timestamp.
+        assert_eq!(model.horizon, Some(ts("2026-07-31T00:00:00Z")));
+    }
+
+    #[test]
+    fn an_all_skipped_claim_is_stale_not_an_accidental_green() {
+        // A claim whose only check is skipped records no verdict — a skip is an
+        // acknowledged debt, never a pass (invariant #6). With no passing verdict the
+        // claim has no freshness baseline, so it derives Stale, never a green. The skip
+        // is still surfaced on the standing for the queue.
+        let claim = claim_of(
+            "id: t\nchecks:\n  - kind: cmd\n    run: \"x\"\n    skip:\n      reason: parked",
+        );
+        let reg = registry(vec![("s", claim)]);
+        // No events at all — the skip suppressed the only check, so nothing was
+        // reported.
+        let model = derive(
+            &reg,
+            &[],
+            ts("2026-07-18T00:00:00Z"),
+            &DeriverConfig::default(),
+        );
+        let s = model.standing("s", "t").unwrap();
+        assert_eq!(
+            s.standing,
+            Standing::Stale,
+            "an all-skipped claim is stale, never an accidental green"
+        );
+        assert_eq!(s.verified_as_of, None);
+        assert_eq!(s.skips.len(), 1, "the skip is still surfaced for the queue");
     }
 }
