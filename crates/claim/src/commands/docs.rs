@@ -204,30 +204,102 @@ fn resolve_topic(topic: Option<&str>) -> Result<&'static str> {
 /// rewritten every run (cheap for a handful of small files) so a partially written
 /// or hand-edited cache self-heals — the bundle in the binary is the source of
 /// truth, never whatever happens to be on disk.
+///
+/// Each file is written atomically (see [`atomic_write`]): the cache is a shared,
+/// unsynchronized location, and two `claim docs` runs — or a run and a reader — can
+/// touch the same version-stamped path at once. A plain truncate-then-write would let
+/// one of them observe a zero-byte or half-written file; the whole content of a file
+/// only ever becomes visible at `dest` in a single atomic step, so a torn read is
+/// impossible by construction rather than merely unlikely.
 fn materialize_bundle() -> Result<PathBuf> {
     let dir = cache_root().join(format!("claim-docs/{}", env!("CARGO_PKG_VERSION")));
+    materialize_bundle_into(&dir)?;
+    Ok(dir)
+}
 
+/// Write the whole bundle under `dir`, each file placed atomically.
+///
+/// Split from [`materialize_bundle`] so the directory is a parameter: tests exercise
+/// the write logic against an isolated temp directory without touching the real
+/// per-version cache or mutating process-global environment. The `dir` is the site
+/// root; every entry lands at its `rel` path beneath it.
+fn materialize_bundle_into(dir: &Path) -> Result<()> {
     for file in BUNDLE {
         let dest = dir.join(file.rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
-        fs::write(&dest, file.bytes)
+        atomic_write(&dest, file.bytes)
             .with_context(|| format!("could not write {}", dest.display()))?;
     }
+    Ok(())
+}
 
-    Ok(dir)
+/// Write `bytes` to `dest` so a concurrent reader or writer never sees a partial file.
+///
+/// The bytes are first written in full to a uniquely named temp file *in the same
+/// directory* as `dest` — same filesystem, which is what makes the final `rename`
+/// atomic — and only then renamed onto `dest`. On Unix, `rename(2)` atomically
+/// replaces any existing `dest` with the fully written temp file in one step: another
+/// process either sees the old complete file or the new complete file, never a
+/// truncated one, and never the zero-byte window that a truncate-in-place
+/// (`fs::write`) opens. This is the fix for the docs cache race, where two `claim
+/// docs` runs sharing the version-stamped directory could otherwise leave an asset at
+/// length 0 while one was mid-write.
+///
+/// The temp name carries the process id and a per-process counter, so two writers —
+/// in the same process or different ones — never pick the same temp path and cannot
+/// clobber each other's in-flight file.
+///
+/// On Windows, `rename` does not clobber an existing target. Because the cache is
+/// version-stamped, an existing `dest` already holds the identical bytes for this
+/// binary, so a rename that fails only because `dest` is present is treated as
+/// success and the temp file is removed; any other rename error is propagated.
+fn atomic_write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("docs-file");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
+
+    fs::write(&tmp, bytes)?;
+
+    match fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Best-effort cleanup so a failed rename leaves no stray temp file behind.
+            let _ = fs::remove_file(&tmp);
+            // Windows `rename` refuses to overwrite an existing target; the cache is
+            // version-stamped, so the present `dest` already holds these exact bytes.
+            if cfg!(target_os = "windows") && dest.exists() {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 /// The base directory for the docs cache, per platform.
 ///
-/// Prefers the OS's user cache location — `$XDG_CACHE_HOME` or `~/.cache` on Linux,
-/// `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — and falls back to the
-/// system temp directory when none resolves (an unusual environment with no `HOME`).
-/// A cache directory is the right home: the content is reproducible from the binary,
-/// so losing it to a cache sweep costs nothing but a rewrite on the next run.
+/// An explicit `CLAIM_DOCS_CACHE_DIR` wins over the platform default when set, giving
+/// a caller (notably the test suite) a single, cross-platform way to redirect the
+/// cache to an isolated directory so runs never share the real user cache. Otherwise
+/// this prefers the OS's user cache location — `$XDG_CACHE_HOME` or `~/.cache` on
+/// Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — and falls back
+/// to the system temp directory when none resolves (an unusual environment with no
+/// `HOME`). A cache directory is the right home: the content is reproducible from the
+/// binary, so losing it to a cache sweep costs nothing but a rewrite on the next run.
 fn cache_root() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("CLAIM_DOCS_CACHE_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(explicit);
+    }
     if cfg!(target_os = "macos") {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join("Library/Caches");
@@ -409,8 +481,12 @@ mod tests {
     fn materialize_writes_the_whole_site_with_resolving_links() {
         // The bundle must land on disk as a real site: the overview present, the
         // referenced images present under assets/, and the bytes intact — so the
-        // relative links in the HTML resolve to files that exist.
-        let dir = materialize_bundle().unwrap();
+        // relative links in the HTML resolve to files that exist. Written into an
+        // isolated temp dir so the test neither touches nor depends on the real
+        // per-version user cache.
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path();
+        materialize_bundle_into(dir).unwrap();
         let index = dir.join("index.html");
         assert!(index.is_file(), "index.html was not written");
 
@@ -429,5 +505,119 @@ mod tests {
             let meta = fs::metadata(&path).unwrap_or_else(|_| panic!("{rel} was not written"));
             assert!(meta.len() > 0, "{rel} was written empty");
         }
+    }
+
+    #[test]
+    fn concurrent_materialize_into_one_dir_never_tears_a_file() {
+        // The docs-cache race, in-process and reduced to its mechanism: writers
+        // hammer the shared directory while readers spin, stat, and read each asset.
+        // With the old truncate-in-place `fs::write`, an asset spends a real window at
+        // length 0 (`O_TRUNC` zeroes it before the ~250 KB PNG is written back), and a
+        // reader that stats in that window sees `len == 0` — exactly the
+        // `architecture.png must not be empty` panic. The reader here asserts the same
+        // invariant the original test did — an existing asset is never length 0 — and
+        // additionally that a full read equals the embedded bytes, so a torn (partial)
+        // read is caught too. Atomic rename makes both impossible: the asset appears at
+        // `dest` only as a complete file.
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().to_path_buf();
+
+        // Seed the tree once so a reader that stats an asset is testing its content,
+        // not racing its first appearance.
+        materialize_bundle_into(&dir).unwrap();
+
+        let assets = [
+            "assets/architecture.png",
+            "assets/graph-propagation.png",
+            "assets/lifecycle.png",
+            "index.html",
+        ];
+        let done = std::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            // Writers: keep re-materializing to widen the number of truncate windows a
+            // reader can fall into.
+            for _ in 0..8 {
+                let dir = dir.clone();
+                scope.spawn(move || {
+                    for _ in 0..60 {
+                        materialize_bundle_into(&dir).unwrap();
+                    }
+                });
+            }
+            // Readers: spin until the writers finish, checking each asset every pass.
+            for _ in 0..4 {
+                let dir = dir.clone();
+                let done = &done;
+                scope.spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        for rel in assets {
+                            let want = bundled(rel);
+                            match fs::metadata(dir.join(rel)) {
+                                Ok(meta) => assert_ne!(
+                                    meta.len(),
+                                    0,
+                                    "{rel} observed empty mid-write — the truncate race"
+                                ),
+                                Err(_) => continue,
+                            }
+                            if let Ok(contents) = fs::read(dir.join(rel)) {
+                                if contents.len() == want.len() {
+                                    assert_eq!(
+                                        contents, want,
+                                        "{rel} read at full length but wrong bytes — a torn read"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // One more writer whose end signals the readers to stop; the scope joins
+            // every thread, so the readers exit their spin once the writes are done.
+            {
+                let dir = dir.clone();
+                let done = &done;
+                scope.spawn(move || {
+                    for _ in 0..60 {
+                        materialize_bundle_into(&dir).unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        });
+
+        // After the storm every asset must hold exactly the embedded bytes.
+        for file in BUNDLE {
+            let on_disk = fs::read(dir.join(file.rel))
+                .unwrap_or_else(|_| panic!("{} was not written", file.rel));
+            assert_eq!(
+                on_disk, file.bytes,
+                "{} does not match the embedded source after concurrent writes",
+                file.rel
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_in_place_and_leaves_no_temp() {
+        // A second atomic_write to the same path replaces the contents wholesale and
+        // does not leave its temp file behind, so the cache directory holds only the
+        // materialized files, never stray `.tmp` artifacts.
+        let root = tempfile::TempDir::new().unwrap();
+        let dest = root.path().join("page.html");
+
+        atomic_write(&dest, b"first").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"first");
+
+        atomic_write(&dest, b"second-and-longer").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"second-and-longer");
+
+        let strays: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "atomic_write left a temp file behind");
     }
 }
