@@ -28,12 +28,17 @@
 
 pub mod api;
 pub mod app;
+pub mod authlayer;
 pub mod config;
 pub mod http;
 pub mod ingest;
 pub mod mcp;
+pub mod metadata;
 pub mod oidc;
+pub mod readauth;
+pub mod scope;
 pub mod status;
+pub mod token;
 pub mod ui;
 
 pub use app::{build_app, AppState};
@@ -41,7 +46,9 @@ pub use config::Config;
 pub use status::Status;
 
 use anyhow::Context;
+use authlayer::AuthLayerState;
 use claim_hub_store::SqliteStore;
+use readauth::{ReadAuthPolicy, ReadTokenVerifier};
 use std::sync::Arc;
 
 /// Install the tracing subscriber the binary logs through.
@@ -91,7 +98,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "no [oidc] config: the ingest gate is not mounted; the hub serves reads only"
         );
     }
-    let app = build_app(AppState::new(store, verifier).with_deriver_config(deriver_config));
+    // Resolve the read-auth policy, which enforces secure-by-default: a hub that is not
+    // explicitly opened and has no read authenticator fails here, loudly, rather than
+    // serving open reads by accident (§4.5 decision 5).
+    let read_auth = build_read_auth(&config).context("configuring read authentication")?;
+    let app = build_app(
+        AppState::new(store, verifier)
+            .with_deriver_config(deriver_config)
+            .with_read_auth(read_auth),
+    );
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding the hub listener on `{}`", config.listen))?;
@@ -157,6 +172,86 @@ fn build_verifier(config: &Config) -> anyhow::Result<Option<oidc::SharedVerifier
         source,
     );
     Ok(Some(Arc::new(verifier)))
+}
+
+/// Resolve the read-auth policy from config into the layer state the app enforces.
+///
+/// This is where secure-by-default lives (HUB-IMPLEMENTATION.md §4.5, decision 5): it
+/// resolves the `[read_auth]` section into a [`ReadAuthPolicy`], which **refuses to build**
+/// when authed-everything is in force with no authenticator — so a hub with a bare or
+/// absent `[read_auth]` fails the boot loudly rather than silently serving open reads. The
+/// only way to open reads is `open_reads = true`.
+///
+/// When an `[read_auth.issuer]` is configured it builds the IdP bearer-JWT verifier over an
+/// [`oidc::HttpJwksSource`] against the issuer's JWKS. The metadata pointer is the
+/// root-relative RFC 9728 well-known path, so the hub need not know its own external
+/// hostname (which it typically cannot behind a proxy).
+///
+/// # Errors
+///
+/// Returns an error when the JWKS HTTP client cannot be built, when a configured issuer has
+/// an empty issuer/audience/JWKS URL (which would hollow the pinning), or when the resolved
+/// policy is the insecure no-authenticator default or holds a malformed token — every one a
+/// loud boot failure, never a silent open.
+fn build_read_auth(config: &Config) -> anyhow::Result<Arc<AuthLayerState>> {
+    let read_auth = &config.read_auth;
+    let (verifier, resource) = match &read_auth.issuer {
+        Some(issuer) => {
+            anyhow::ensure!(
+                !issuer.issuer.trim().is_empty(),
+                "config `[read_auth.issuer].issuer` is empty; set it to the IdP's issuer URL \
+                 so read tokens can be pinned to it"
+            );
+            anyhow::ensure!(
+                !issuer.audience.trim().is_empty(),
+                "config `[read_auth.issuer].audience` is empty; set it to the hub's identifier \
+                 so a read token's `aud` can be pinned (an empty audience would accept any \
+                 token's `aud`)"
+            );
+            anyhow::ensure!(
+                !issuer.jwks_url.trim().is_empty(),
+                "config `[read_auth.issuer].jwks_url` is empty; set it to the IdP's JWKS \
+                 endpoint so the hub can verify a read token's signature"
+            );
+            let source = oidc::HttpJwksSource::new(&issuer.jwks_url)
+                .map_err(|e| anyhow::anyhow!("building the read-auth JWKS HTTP client: {e}"))?;
+            let verifier: readauth::SharedReadVerifier = Arc::new(ReadTokenVerifier::new(
+                issuer.issuer.clone(),
+                issuer.audience.clone(),
+                source,
+            ));
+            (Some(verifier), issuer.audience.clone())
+        }
+        // No IdP: the resource identifier for the metadata document falls back to the ingest
+        // audience if set, else the hub's default identifier — a self-describing `resource`
+        // even on the scoped-token floor.
+        None => (None, resource_identifier(config)),
+    };
+    let issuer_url = read_auth.issuer.as_ref().map(|i| i.issuer.clone());
+    let policy = ReadAuthPolicy::resolve(read_auth.open_reads, verifier, read_auth.tokens.clone())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let metadata = metadata::ResourceMetadata::new(resource, issuer_url);
+    Ok(Arc::new(AuthLayerState::new(
+        policy,
+        metadata,
+        metadata::METADATA_PATH.to_owned(),
+    )))
+}
+
+/// The RFC 9728 `resource` identifier for a hub with no read IdP — its own audience if the
+/// ingest gate declares one, else a generic placeholder.
+///
+/// The metadata document's `resource` names the protected resource. With an IdP it is the
+/// read audience; without one there is no token-`aud` to pin, so this is purely descriptive
+/// — the ingest `[oidc].audience` (the hub's identifier) if present, else a literal marker
+/// so the field is never an empty string.
+fn resource_identifier(config: &Config) -> String {
+    config
+        .oidc
+        .as_ref()
+        .map(|o| o.audience.clone())
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| "claim-hub".to_owned())
 }
 
 /// Boot the hub, resolving its config from `config_path`: load config, wire tracing,
@@ -244,5 +339,89 @@ mod tests {
     fn a_whitespace_only_audience_is_also_refused() {
         let config = Config::from_toml("[oidc]\naudience = \"   \"\n").unwrap();
         assert!(build_verifier(&config).is_err());
+    }
+
+    #[test]
+    fn read_auth_default_config_fails_the_boot_loudly() {
+        // Secure-by-default at the boot seam: an empty config is authed-everything with no
+        // authenticator, which `build_read_auth` refuses — naming the fix — rather than
+        // standing up a hub that silently serves open reads (§4.5 decision 5).
+        let config = Config::from_toml("").unwrap();
+        let Err(err) = build_read_auth(&config) else {
+            panic!("a no-authenticator authed config must fail the boot");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("open_reads"),
+            "the error names the open-reads opt-in as one fix: {message}"
+        );
+    }
+
+    #[test]
+    fn read_auth_open_reads_optin_boots() {
+        let config = Config::from_toml("[read_auth]\nopen_reads = true\n").unwrap();
+        assert!(
+            build_read_auth(&config).is_ok(),
+            "the explicit open-reads opt-in resolves"
+        );
+    }
+
+    #[test]
+    fn read_auth_with_a_scoped_token_boots() {
+        let config = Config::from_toml(
+            "[[read_auth.tokens]]\nscopes = [\"read\"]\n\
+             hash = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n",
+        )
+        .unwrap();
+        assert!(
+            build_read_auth(&config).is_ok(),
+            "a scoped-token floor resolves an authed-everything hub"
+        );
+    }
+
+    #[test]
+    fn read_auth_with_an_issuer_boots_and_serves_metadata_with_the_authorization_server() {
+        let config = Config::from_toml(
+            "[read_auth.issuer]\nissuer = \"https://idp.example\"\n\
+             audience = \"https://hub.example\"\n\
+             jwks_url = \"https://idp.example/jwks\"\n",
+        )
+        .unwrap();
+        let auth = build_read_auth(&config).expect("an issuer resolves");
+        // The metadata document points a client at the configured IdP.
+        assert_eq!(auth.metadata().resource, "https://hub.example");
+        assert_eq!(
+            auth.metadata().authorization_servers,
+            vec!["https://idp.example"]
+        );
+    }
+
+    #[test]
+    fn read_auth_with_an_empty_issuer_url_fails_the_boot() {
+        let config = Config::from_toml(
+            "[read_auth.issuer]\nissuer = \"\"\naudience = \"https://hub.example\"\n\
+             jwks_url = \"https://idp.example/jwks\"\n",
+        )
+        .unwrap();
+        let Err(err) = build_read_auth(&config) else {
+            panic!("an empty issuer URL must fail the boot");
+        };
+        assert!(err.to_string().contains("issuer"), "names the field: {err}");
+    }
+
+    #[test]
+    fn read_auth_with_a_malformed_token_fails_the_boot_by_name() {
+        let config = Config::from_toml(
+            "[[read_auth.tokens]]\nname = \"broken\"\nscopes = [\"read\"]\n\
+             hash = \"not-a-hash\"\n",
+        )
+        .unwrap();
+        let Err(err) = build_read_auth(&config) else {
+            panic!("a malformed token must fail the boot");
+        };
+        assert!(
+            err.to_string().contains("broken"),
+            "names the offending token: {err}"
+        );
     }
 }

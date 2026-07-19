@@ -38,8 +38,16 @@ services:
     # on the mounted volume with no config file at all. Repeating CLAIM_HUB_DATABASE here
     # documents where the one owned file lives; binding 0.0.0.0 is safe because only the
     # mapped port below is exposed.
+    #
+    # CLAIM_HUB_OPEN_READS=true is the explicit read-auth decision for this LOCAL DEMO: the
+    # hub is secure by default and will NOT boot without a read-auth decision, so this opts
+    # into open (unauthenticated) reads — appropriate only because this compose file binds to
+    # loopback (127.0.0.1 below). For a real deployment, drop the open-reads flag and mount a
+    # hub.toml with a [read_auth.issuer] (an OAuth 2.1 IdP) or [[read_auth.tokens]] (run
+    # `claim-hub mint-token`) instead. See docs/hub.md → Read authentication.
     environment:
       CLAIM_HUB_DATABASE: "/data/hub.db"
+      CLAIM_HUB_OPEN_READS: "true"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

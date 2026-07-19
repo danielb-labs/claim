@@ -383,9 +383,23 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     active link, or live HTML tag into the <code>.md</code> an agent reads. <code>/llms.txt</code>
     indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
     to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.</p>
+    <p>All of those read surfaces &mdash; the API, the UI and its twins, and the MCP &mdash; sit behind one
+    <strong>read-auth layer</strong>, and the hub is <strong>secure by default</strong>: with no read-auth
+    decision it refuses to boot rather than serve open reads. A read presents an
+    <code>Authorization: Bearer</code> credential, either an <strong>OAuth 2.1 IdP token</strong> (validated
+    against the issuer&rsquo;s JWKS &mdash; RS256 pinned, <code>iss</code>/<code>aud</code>/<code>exp</code>
+    required, the JWKS refresh rate-limited) or a <strong>hub-minted scoped token</strong> for a self-hoster
+    with no IdP (<code>claim-hub mint-token</code> prints the token once and stores only its hash, so a leaked
+    config yields no usable credential). An unauthenticated read is a <code>401</code> pointing at the
+    <strong>RFC 9728 protected-resource metadata</strong> (served unauthenticated so a client discovers how to
+    authenticate); a token lacking the <code>read</code> scope is a <code>403</code>; an unreachable IdP is a
+    <code>503</code>, never a silent allow. Scopes are <em>read broadly, act narrowly</em> &mdash; v1 has no
+    write surface, so <code>read</code> is the only scope any route requires. Open reads for a trusted private
+    network are an explicit opt-in (<code>open_reads = true</code>), never the default.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
-    no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is
+    once you have made the read-auth decision (an IdP, a minted token, or the explicit open-reads opt-in)
+    &mdash; and stands up its own database on first boot. Because the whole hub is
     that one file, the ownership operations are file operations &mdash; <strong>export</strong> is a copy
     (of a stopped hub) or an online <code>sqlite3 ".backup"</code> snapshot (of a running one),
     <strong>delete</strong> is an <code>rm</code>, and you <strong>leave</strong> by taking the file:

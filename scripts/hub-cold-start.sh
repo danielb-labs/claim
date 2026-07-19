@@ -11,6 +11,11 @@
 # boot. This is the exact path `docker run` against an empty volume hits; a regression that
 # made a missing default config fatal would fail here (and in the container step) loudly.
 #
+# CLAIM_HUB_OPEN_READS=true is this demo's explicit read-auth decision: the hub is secure by
+# default and refuses to boot without one, so a cold-start with no IdP and no minted token
+# opts into open reads. That mirrors the compose example, which binds loopback; a real
+# deployment configures an IdP or a minted token instead. (This script binds loopback too.)
+#
 # Truthful means the empty state is reported as empty, never as an error and never as a
 # fabricated "healthy" (invariant #6): a hub that lies about its own position is the first
 # thing a monitor trusts and the last thing it should.
@@ -59,6 +64,7 @@ echo "==> booting config-less from the empty directory (env overrides only)"
 # resolves *there* and provably finds nothing — the env overrides alone drive the boot.
 # `exec` so the hub replaces the subshell and `$!` is the hub's own PID for cleanup.
 ( cd "$data" && exec env CLAIM_HUB_LISTEN="127.0.0.1:$PORT" CLAIM_HUB_DATABASE="$db" \
+  CLAIM_HUB_OPEN_READS="true" \
   "$hub_bin" >"$work/hub.log" 2>&1 ) &
 srv=$!
 

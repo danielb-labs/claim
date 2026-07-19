@@ -110,6 +110,19 @@ impl JwksSource for TestJwksSource {
     }
 }
 
+/// A JWKS source whose every fetch fails — the "IdP unreachable" case.
+///
+/// Verification against it can never complete, so the verifier must surface a transient
+/// *unavailability* (a 503 at the gate), never a rejection or a silent allow (invariant #1).
+#[derive(Clone, Default)]
+pub struct FailingJwksSource;
+
+impl JwksSource for FailingJwksSource {
+    async fn fetch(&self) -> Result<JwkSet, OidcError> {
+        Err(OidcError::Fetch("test: JWKS endpoint unreachable".into()))
+    }
+}
+
 /// The JWKS publishing the signing key under [`TEST_KID`].
 fn signing_key_jwks() -> JwkSet {
     serde_json::from_value(json!({
@@ -143,7 +156,7 @@ impl TestClock {
     }
 
     /// The clock closure the `JwksCache` reads "now" through.
-    fn monotonic(&self) -> claim_hub::oidc::MonotonicMillis {
+    pub fn monotonic(&self) -> claim_hub::oidc::MonotonicMillis {
         let inner = self.0.clone();
         Arc::new(move || inner.load(std::sync::atomic::Ordering::SeqCst))
     }

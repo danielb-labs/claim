@@ -80,6 +80,26 @@ anyhow = { workspace = true }
 # (RSA `n`/`e`), never a PEM, so the PEM/ASN.1 parser is not in the library; the `jwk`
 # module for `JwkSet`/`Jwk` is always available.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# Read-auth (hub-13) token hashing: the hub-minted scoped read tokens are stored as a
+# SHA-256 hash, never in the clear, so a leaked config yields no usable token ("hashed at
+# rest"). A minted token is 256 bits of CSPRNG output — a high-entropy secret, not a weak
+# password — so a single fast cryptographic hash is the correct primitive (a password KDF
+# like argon2/bcrypt buys nothing over a 2^256 space and would add heavy deps); this is the
+# same audited, pure-Rust RustCrypto SHA-256 the check-digest already uses in
+# `claim-hub-core`. Default features only.
+sha2 = "0.10"
+# Read-auth (hub-13) constant-time token comparison: comparing a presented token's hash
+# against a stored hash with `==` short-circuits on the first differing byte, leaking match
+# length through response timing. `subtle`'s `ConstantTimeEq` compares the whole fixed-width
+# hash in constant time, closing that side channel. A tiny, widely-audited RustCrypto crate
+# that exists for exactly this; there is no cheaper way to a correct constant-time compare.
+subtle = "2"
+# Read-auth (hub-13) token minting: reads 32 bytes from the OS CSPRNG to generate a
+# high-entropy read token. `getrandom` is the minimal, audited primitive directly over the
+# platform entropy source (`getrandom(2)`/`BCryptGenRandom`/`arc4random`) — chosen over
+# `rand`, which layers a userspace PRNG (and a larger, dual-versioned surface) that a
+# one-shot secret generator does not need. Default features only.
+getrandom = "0.2"
 # The one HTTP client (HUB-IMPLEMENTATION.md §1.14): fetches the issuer's JWKS. rustls
 # (not the default native-tls) so the binary links no *system* OpenSSL. Two honest
 # caveats to record for a "single static binary, drops into any runner" project:
@@ -187,3 +207,8 @@ predicates = "3"
 # (CLAUDE.md). The `json` feature renders a `serde_json::Value` as a stable snapshot; no
 # redactions are needed because the tests fix every input (clock, digests) to constants.
 insta = { version = "1", features = ["json"] }
+# Read-auth (hub-13) tests only: hand-assemble a malformed `alg: none` JWT (which
+# `jsonwebtoken` refuses to `encode`) to prove the layer rejects an unsigned token. Just
+# base64url encoding of two JSON segments; already in the tree via reqwest/jsonwebtoken, so
+# it adds no new transitive surface. Test-only, never in the shipped binary.
+base64 = "0.22"
