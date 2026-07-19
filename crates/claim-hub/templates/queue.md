@@ -15,3 +15,20 @@ The queue is empty: no claim is drifted, stale, or due right now.
 {% endfor %}
 {{ rows.len() }} claim(s) in the queue.
 {%- endif %}
+
+## Skipped checks
+
+Checks deliberately not run, ranked by age and lapsed `until` — a skip whose `until` has
+passed (the deferred check is due again) leads. A skip is an acknowledged, bounded debt,
+never a pass: it records no verdict, so it never makes a claim verified — it is surfaced
+here for a look.
+
+{% if skips.is_empty() -%}
+No skipped checks: every check is running.
+{%- else -%}
+| claim | store | check | reason | until | status |
+|---|---|---|---|---|---|
+{% for skip in skips %}| [{{ skip.claim }}]({{ skip.dossier_twin_path }}) | {{ skip.store }} | {{ skip.check_digest }} | {{ skip.reason }} | {% match skip.until %}{% when Some with (t) %}{{ t }}{% when None %}— (indefinite){% endmatch %} | {{ skip.lapsed_label }} |
+{% endfor %}
+{{ skips.len() }} skipped check(s).
+{%- endif %}

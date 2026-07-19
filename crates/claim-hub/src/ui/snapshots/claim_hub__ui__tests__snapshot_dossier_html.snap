@@ -133,7 +133,7 @@ footer.site { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--l
 
 <div class="asof">
   As of ledger head <strong>2</strong>,
-  registry version <strong>2</strong>,
+  registry version <strong>3</strong>,
   clock <strong>2026-07-20T00:00:00Z</strong>. Read at commit <code>seedcommit</code>.
 </div>
 

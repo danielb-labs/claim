@@ -361,16 +361,19 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     forged, expired, or unauthorized push is rejected loudly and counted), and the
     <strong>read API</strong> (<code>GET /api/&hellip;</code>) &mdash; claims queries filtered by
     path, store, standing, or supports target; the <code>drifted</code>/<code>due</code>/<code>suspect</code>
-    sets; a claim&rsquo;s full <strong>dossier</strong> (statement, checks, standing, verdict history,
+    sets; the <strong>ranked skip queue</strong> (<code>/api/skips</code>) &mdash; every skipped check
+    across the live set ordered by age and lapsed <code>until</code>, so a skip past its expiry (the
+    deferred check is due again) outranks a merely-aging one, each surfaced as a debt to look at, never
+    a pass; a claim&rsquo;s full <strong>dossier</strong> (statement, checks, standing, verdict history,
     provenance); and a <strong>cursor feed</strong> over the ledger, paginated by seq so an intermittent
     agent catches up deterministically. Every read response carries its <em>as-of</em> (the ledger
     position, registry version, and clock it derived from), so a standing can never be older than its
-    evidence. The <strong>hub MCP</strong> (<code>/mcp</code>) is the agent binding: five read-only
+    evidence. The <strong>hub MCP</strong> (<code>/mcp</code>) is the agent binding: six read-only
     tools &mdash; <code>context</code>, <code>search</code>, <code>dossier</code>, <code>drifts</code>,
-    and <code>due</code> &mdash; mounted in-process on the same app and returning the same JSON their
-    API twins serve (parity by construction). Each is a read that stores nothing and carries its as-of,
-    and the surface is dated evidence to weigh, never instructions to obey: an unknown or retired claim
-    is reported as an error, never a fabricated standing.</p>
+    <code>due</code>, and <code>skips</code> &mdash; mounted in-process on the same app and returning the
+    same JSON their API twins serve (parity by construction). Each is a read that stores nothing and
+    carries its as-of, and the surface is dated evidence to weigh, never instructions to obey: an unknown
+    or retired claim is reported as an error, never a fabricated standing.</p>
     <p>Over that same read model the hub serves a small <strong>server-rendered web UI</strong> &mdash;
     no JavaScript, no build step. Every page (the <a href="hub.md">review queue</a> at
     <code>/ui/queue</code>, a claim&rsquo;s dossier at <code>/ui/claims/{id}</code>, and hub status at

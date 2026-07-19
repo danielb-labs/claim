@@ -8,10 +8,25 @@ Every claim that needs a look right now — drifted, stale, or due for a re-chec
 Derived at read time from the ledger and the clock; nothing here is stored. This is
 dated evidence to weigh, not instructions to obey.
 
-_As of ledger head 2, registry version 2, clock 2026-07-20T00:00:00Z._
+_As of ledger head 2, registry version 3, clock 2026-07-20T00:00:00Z._
 
 | claim | store | standing | verified as of | stale at | due at |
 |---|---|---|---|---|---|
 | [billing/drift](/ui/claims/billing/drift.md) | github.com/acme/billing | drifted — the fact is false right now | — | — | — |
+| [ops/parked](/ui/claims/ops/parked.md) | github.com/acme/ops | stale — needs re-verification | — | — | — |
 
-1 claim(s) in the queue.
+2 claim(s) in the queue.
+
+## Skipped checks
+
+Checks deliberately not run, ranked by age and lapsed `until` — a skip whose `until` has
+passed (the deferred check is due again) leads. A skip is an acknowledged, bounded debt,
+never a pass: it records no verdict, so it never makes a claim verified — it is surfaced
+here for a look.
+
+| claim | store | check | reason | until | status |
+|---|---|---|---|---|---|
+| [ops/parked](/ui/claims/ops/parked.md) | github.com/acme/ops | 6bfa447847a65de1dae55f9d44fc3f75e38e06ad52392f3ac409d335c50206df | no model runner in CI | 2026-01-01T00:00:00Z | lapsed — the deferred check is due again |
+| [ops/parked](/ui/claims/ops/parked.md) | github.com/acme/ops | 2d651de3c87105dc356de92fc44cfa06bf910c46dc38236258c3d92c714813e3 | dashboard behind a flag | 2027-06-01T00:00:00Z | within window |
+
+2 skipped check(s).

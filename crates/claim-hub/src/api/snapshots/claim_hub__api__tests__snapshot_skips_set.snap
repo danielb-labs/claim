@@ -1,0 +1,36 @@
+---
+source: crates/claim-hub/src/api/tests.rs
+expression: json
+---
+{
+  "as_of": {
+    "clock": "2026-07-20T00:00:00Z",
+    "ledger_head": 0,
+    "registry_version": 2
+  },
+  "skips": [
+    {
+      "check_digest": "a1ce2585fdcc7f4f21f83d06219c17465e5ea42a4597c3a4cf02b27196874754",
+      "claim": "payments/parked",
+      "lapsed": true,
+      "reason": "lapsed one",
+      "store": "github.com/acme/payments",
+      "until": "2026-01-01T00:00:00Z"
+    },
+    {
+      "check_digest": "3de4121a97610e0102d12e215937cf8f74400ff8e5bee04d701ab89d32252755",
+      "claim": "payments/parked",
+      "lapsed": false,
+      "reason": "not-yet-lapsed one",
+      "store": "github.com/acme/payments",
+      "until": "2027-06-01T00:00:00Z"
+    },
+    {
+      "check_digest": "142488840cbd14c1105fb1454044569865da58c07ce0764b2da8cc78a455e197",
+      "claim": "billing/muted",
+      "lapsed": false,
+      "reason": "indefinite one",
+      "store": "github.com/acme/billing"
+    }
+  ]
+}

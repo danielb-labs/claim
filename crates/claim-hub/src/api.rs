@@ -19,6 +19,9 @@
 //! - `GET /api/claims` — claims filtered by `path` (id prefix), `store`, `standing`, or
 //!   `supports` (a target a claim justifies), each with its standing.
 //! - `GET /api/drifted`, `/api/due`, `/api/suspect` — the derived sets.
+//! - `GET /api/skips` — the skip-ranking projection (hub-14): every skipped check across the
+//!   live set, ranked into the review queue by age and lapsed `until`, each carrying whether
+//!   it has lapsed as of the read clock. Queue data a human looks at, never a verdict.
 //! - `GET /api/claims/{id}/dossier` — a claim's full dossier: the statement and check by
 //!   git reference at a commit, the standing with its as-of, the verdict history from the
 //!   ledger, evidence, and the derived provenance the registry already holds.
@@ -47,7 +50,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use claim_core::ClaimId;
-use claim_hub_core::{AsOf, ClaimStanding, ReadModel, Standing};
+use claim_hub_core::{rank_skips, AsOf, ClaimStanding, ReadModel, Standing};
 use claim_hub_store::{
     ledger_events, registry_snapshot, Ledger, Position, Registry, StoreError, StoredEvent,
 };
@@ -123,6 +126,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/drifted", get(drifted_set))
         .route("/api/due", get(due_set))
         .route("/api/suspect", get(suspect_set))
+        .route("/api/skips", get(skips_set))
         .route("/api/feed", get(cursor_feed))
         .route("/api/nags", get(nags))
 }
@@ -439,6 +443,28 @@ pub(crate) async fn due_value(state: &AppState) -> ReadResult {
     })
 }
 
+/// `GET /api/skips`: the ranked skip queue — every skipped check across the live set,
+/// ordered by age and lapsed `until`.
+async fn skips_set(State(state): State<AppState>) -> Response {
+    render(skips_value(&state).await)
+}
+
+/// The rendered value of `GET /api/skips`: every skipped check ranked into the review queue.
+///
+/// The order is the deriver's one pure ranking ([`rank_skips`]) — lapsed skips first, then
+/// by `until` (oldest lapse and nearest expiry first, indefinite last) — computed from the
+/// same derived model every read surface shares, so the MCP `skips` tool and the UI queue
+/// render the *identical* ranked set (parity by construction). A skip is queue data, never a
+/// verdict (invariant #4): the response carries no standing, and reading it changes nothing.
+/// Shared with the MCP `skips` tool.
+pub(crate) async fn skips_value(state: &AppState) -> ReadResult {
+    let read = read_state(state).await?;
+    value_of(SkipsResponse {
+        skips: rank_skips(&read.model),
+        as_of: read.model.as_of,
+    })
+}
+
 /// `GET /api/suspect`: every claim whose derived standing is [`Standing::Suspect`].
 ///
 /// The suspect *propagation* rule (which claims become suspect over the supports graph) is
@@ -690,6 +716,20 @@ struct ClaimsListResponse<'a> {
     claims: Vec<StandingResponse<'a>>,
     /// The inputs the whole set derived from — one as-of for every claim in it, because
     /// the set is one derivation.
+    as_of: AsOf,
+}
+
+/// The body of the ranked-skip response (`GET /api/skips`): the skipped checks in ranked
+/// order and the one as-of the whole ranking derived at.
+///
+/// The `skips` are the deriver's one pure ranking ([`rank_skips`]), so this endpoint, the
+/// MCP `skips` tool, and the UI queue all render the same ordered set. A ranked skip is
+/// queue data a human weighs, never a verdict (invariant #4) — the shape carries no standing.
+#[derive(Debug, Serialize)]
+struct SkipsResponse {
+    /// The skipped checks, ranked into the review queue (lapsed first, then by `until`).
+    skips: Vec<claim_hub_core::RankedSkip>,
+    /// The inputs the whole ranking derived from — one as-of for the set, one derivation.
     as_of: AsOf,
 }
 
