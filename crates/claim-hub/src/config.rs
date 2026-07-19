@@ -134,10 +134,11 @@ impl Config {
     /// Parse a config from a TOML string, mapping a syntax or field error to a
     /// message that names the offending field.
     ///
-    /// `toml`'s own error already reports the line, column, and the field that failed
-    /// (e.g. `listen: invalid socket address syntax`), so a malformed `listen` or
-    /// `database` is actionable without the caller re-deriving what went wrong. This
-    /// is the file-independent half of loading; [`Config::load`] adds the filename.
+    /// `toml`'s own error already reports the field name, the source line, and a caret
+    /// under the bad value (`invalid socket address syntax` beneath the offending
+    /// `listen = "..."`), so a malformed `listen` or `database` is actionable without
+    /// the caller re-deriving what went wrong. This is the file-independent half of
+    /// loading; [`Config::load`] adds the filename.
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
@@ -146,9 +147,19 @@ impl Config {
     ///
     /// Both failure modes name the file (CLAUDE.md's error-message rule): an
     /// unreadable or missing file reports the path and the OS reason, and a malformed
-    /// file reports the path *and* the field `toml` faulted on (its message carries
-    /// the field and location). A caller sees "config `/etc/hub.toml`: listen:
-    /// invalid socket address syntax", never a bare "invalid config".
+    /// file reports the path *and* points at the offending line — `toml`'s error
+    /// carries the field name, the source line, and a caret under the bad value. A
+    /// bad `listen` reads, over several lines:
+    ///
+    /// ```text
+    /// config `/etc/hub.toml`: TOML parse error at line 1, column 10
+    ///   |
+    /// 1 | listen = "not-an-address"
+    ///   |          ^^^^^^^^^^^^^^^^
+    /// invalid socket address syntax
+    /// ```
+    ///
+    /// — never a bare "invalid config".
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)

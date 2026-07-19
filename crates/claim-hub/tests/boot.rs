@@ -89,3 +89,56 @@ async fn status_reflects_a_non_empty_store_after_boot() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ledger_head"], 1, "head advances after the append");
 }
+
+#[tokio::test]
+async fn serve_fails_loudly_when_the_database_cannot_be_opened() {
+    // Point `database` at a directory: SQLite cannot open a directory as a database
+    // file, so `serve` errors before it binds or serves. The message names the path
+    // so an operator sees *which* database refused (the `with_context` in `serve`).
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::from_toml(&format!(
+        "database = {:?}\nlisten = \"127.0.0.1:0\"\n",
+        dir.path().to_str().unwrap()
+    ))
+    .unwrap();
+    let err = claim_hub::serve(config)
+        .await
+        .expect_err("opening a directory as a database file must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(dir.path().to_str().unwrap()),
+        "names the database path: {message}"
+    );
+    assert!(
+        message.contains("opening the hub database"),
+        "names the failing operation: {message}"
+    );
+}
+
+#[tokio::test]
+async fn serve_fails_loudly_when_the_listen_address_cannot_be_bound() {
+    // 192.0.2.1 is RFC 5737 TEST-NET-1: reserved for documentation and not assigned
+    // to this host, so binding it fails. The database opens fine (a real temp file),
+    // so the failure is the bind — `serve` errors before it serves, naming the
+    // address (the `with_context` on the listener). A network-free negative: no
+    // socket to any real peer is attempted, only a local bind that the kernel refuses.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hub.db");
+    let config = Config::from_toml(&format!(
+        "database = {:?}\nlisten = \"192.0.2.1:8080\"\n",
+        db_path.to_str().unwrap()
+    ))
+    .unwrap();
+    let err = claim_hub::serve(config)
+        .await
+        .expect_err("binding an unassigned address must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("192.0.2.1:8080"),
+        "names the listen address: {message}"
+    );
+    assert!(
+        message.contains("binding the hub listener"),
+        "names the failing operation: {message}"
+    );
+}

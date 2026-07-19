@@ -86,3 +86,11 @@ http-body-util = "0.1"
 # The head-advance test builds a sample `Event` whose `verdict` is a
 # `claim_core::Verdict`; named directly so the test constructs the shared type.
 claim-core = { path = "../claim-core" }
+# Drive the real `claim-hub` binary to cover argument parsing and the env-override
+# path end-to-end (a bad `--config`/`-c`, an unrecognized arg, and `CLAIM_HUB_*`
+# variables set on the *spawned* process — deterministic, not the test's own env).
+# The approved CLI integration-test stack (CLAUDE.md).
+assert_cmd = "2"
+# Match the binary's stderr against the named-message expectations (which argument,
+# which variable) rather than a brittle full-string compare. Approved stack (CLAUDE.md).
+predicates = "3"

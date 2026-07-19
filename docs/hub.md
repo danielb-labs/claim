@@ -39,8 +39,18 @@ TOML
 
 `--config` (or `-c`) names the file; with no flag the binary reads `hub.toml` in the
 working directory. A missing or invalid config fails loudly before anything binds,
-naming the file and the offending field — a typo'd `listen` address reports
-`config \`hub.toml\`: listen: invalid socket address syntax`, never a silent default.
+naming the file and pointing at the offending line — never a silent default. A typo'd
+`listen` address reports:
+
+```text
+error: config `hub.toml`: TOML parse error at line 1, column 10
+  |
+1 | listen = "not-an-address"
+  |          ^^^^^^^^^^^^^^^^
+invalid socket address syntax
+```
+
+and an unknown key names it and lists the fields it expected.
 
 ### Configuration
 
