@@ -22,10 +22,10 @@
 //!   [`claim_core::Verdict::Unverifiable`] (core does this), which is exit 1 — it
 //!   never fakes a pass.
 //! - **Agent execution is opt-in.** An `agent` check runs only when
-//!   [`claim_store::CLAIM_AGENT_CMD_ENV`] is set to a runner command (resolved by the
-//!   shared [`claim_store::agent_runner_from_env`], so `check` and the MCP `create`
-//!   tool agree on the contract); the runner's structured output maps to a verdict
-//!   under the same broken-never-passes contract as `cmd`. With the variable unset
+//!   [`claim_store::CLAIM_AGENT_CMD_ENV`] is set to a runner command (resolved by
+//!   [`claim_store::agent_runner_from_env`]); the runner's structured output maps to a
+//!   verdict under the same broken-never-passes contract as `cmd`. With the variable
+//!   unset
 //!   (the default) no runner is attached, so agent checks stay `Unverifiable` and no
 //!   subprocess — and no model — is ever invoked.
 //!
@@ -87,9 +87,8 @@ pub fn run(args: &CheckArgs, format: Format) -> Result<i32> {
     let now = claim_core::Timestamp::now();
 
     // Agent execution is strictly opt-in: only a set CLAIM_AGENT_CMD attaches a
-    // runner (resolved by the shared reader, so `check` and the MCP `create` tool
-    // agree on the contract). With it unset, every agent check is Unverifiable and
-    // nothing is spawned, so a default `claim check` never reaches a model.
+    // runner. With it unset, every agent check is Unverifiable and nothing is
+    // spawned, so a default `claim check` never reaches a model.
     let agent_runner = agent_runner_from_env().map_err(anyhow::Error::new)?;
     let run = RunContext {
         store: &store,

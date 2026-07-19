@@ -298,9 +298,9 @@ impl CheckOutcome {
 ///
 /// **Process-global side effect.** Executing a `cmd` check uses `wait-timeout`,
 /// which installs a process-wide `SIGCHLD` handler on first use and reaps child
-/// processes through it. An embedder that also manages child processes in the same
-/// process — notably `claim-mcp` — must be aware that this handler exists
-/// process-wide, not scoped to this call.
+/// processes through it. Any embedder that also manages child processes in the same
+/// process must be aware that this handler exists process-wide, not scoped to this
+/// call.
 ///
 /// A [`CheckKind::Cmd`] check is always executed. A [`CheckKind::Agent`] check is
 /// executed only when the context carries an [`AgentRunner`]

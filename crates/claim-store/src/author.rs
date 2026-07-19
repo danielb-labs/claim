@@ -1,16 +1,14 @@
-//! The shared claim-authoring core: establish a claim's check against reality,
-//! then write the claim file — used identically by the CLI's `claim add` and the
-//! MCP `create` tool.
+//! The claim-authoring core: establish a claim's check against reality, then write
+//! the claim file — the non-interactive engine behind the CLI's `claim add`.
 //!
-//! Both front doors must author a claim the same way, or the two would disagree
-//! about what it takes to record a fact — exactly the drift this tool exists to
-//! prevent. So the non-interactive core lives here, once, over [`crate::Store`] and
-//! [`crate::git`]: given a validated [`Claim`] and the exact bytes to write, it
-//! resolves git provenance, refuses a duplicate id, runs the establishing check
-//! requiring [`Verdict::Held`], and — only then — writes the claim file to the
-//! working tree. It never commits (invariant #4, the truth is the claim and a write
-//! to it is a commit the caller makes) and never touches the tree before the check
-//! passes.
+//! The core lives here, once, over [`crate::Store`] and [`crate::git`], so authoring
+//! is one gate rather than logic a caller could reimplement and get subtly wrong —
+//! exactly the drift this tool exists to prevent. Given a validated [`Claim`] and the
+//! exact bytes to write, it resolves git provenance, refuses a duplicate id, runs the
+//! establishing check requiring [`Verdict::Held`], and — only then — writes the claim
+//! file to the working tree. It never commits (invariant #4, the truth is the claim
+//! and a write to it is a commit the caller makes) and never touches the tree before
+//! the check passes.
 //!
 //! # No establishing verdict is written
 //!
@@ -22,12 +20,11 @@
 //! still resolved up front so a claim authored with no git identity fails loudly
 //! before the tree is touched.
 //!
-//! What stays with each caller is the surface, not the substance: the CLI keeps its
+//! What stays with the caller is the surface, not the substance: the CLI keeps its
 //! interactive prompting, its optional `--witness-cmd` confidence dance, its `--json`
-//! shape, and its unresolved-`supports` warning; the MCP tool keeps its request
-//! parsing and its response shape. Both hand this function the same three things — a
-//! parsed claim, its file text, and a [`CheckContext`] — and get back the same
-//! [`Authored`] outcome or the same typed [`AuthorError`].
+//! shape, and its unresolved-`supports` warning. It hands this function the same three
+//! things — a parsed claim, its file text, and a [`CheckContext`] — and gets back an
+//! [`Authored`] outcome or a typed [`AuthorError`].
 //!
 //! # The honesty gate is here, not in a caller
 //!
@@ -37,8 +34,8 @@
 //! observed evidence, writing nothing — [`AuthorError::NotHeld`]. An agent check with
 //! no runner in the context is [`Verdict::Unverifiable`], which is not `Held`, so it
 //! is refused too: a claim cannot be established by a check that could not be run.
-//! Placing the gate here means neither front door can accidentally record a claim
-//! whose check did not hold.
+//! Placing the gate here means no caller can accidentally record a claim whose check
+//! did not hold.
 
 use claim_core::{run_check, Check, CheckContext, CheckOutcome, Claim, Timestamp, Verdict};
 
@@ -87,8 +84,8 @@ pub struct Authored {
 /// Every variant degrades toward *not creating a claim* rather than creating a
 /// dubious one: a duplicate id, a check that did not hold against reality, an
 /// unattributable claim, or an I/O fault — all refuse before or instead of the
-/// write. A caller maps each to its own surface (the CLI's `--json` `kind`, the MCP
-/// server's `invalid_params` vs `internal_error`) without matching on prose.
+/// write. The caller maps each to its own surface (the CLI's `--json` `kind`)
+/// without matching on prose.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorError {
     /// A claim file already occupies the id's canonical path `.claims/<id>.md`.
@@ -164,8 +161,8 @@ impl AuthorError {
 /// [`Verdict::Held`], then write the claim file to the working tree. Never commits,
 /// and never writes a verdict.
 ///
-/// This is the non-interactive core both `claim add` and the MCP `create` tool call.
-/// The caller supplies a validated `claim` (produced only by
+/// This is the non-interactive core `claim add` calls. The caller supplies a
+/// validated `claim` (produced only by
 /// [`claim_core::parse_claim_file`], so the schema is already enforced), the exact
 /// `file_text` to write (round-tripped through the parser by the caller, so what is
 /// validated is what is written), a [`CheckContext`] carrying the working directory

@@ -77,13 +77,13 @@ claim docs --open     # also opens it in your browser
 
 ## Layout
 
-A Cargo workspace of four crates:
+A Cargo workspace of three crates:
 
 - `crates/claim-core` — the domain: parsing, the verdict enum, and check execution.
 - `crates/claim-store` — shared store discovery, loading, and git provenance.
-- `crates/claim` — the `claim` CLI, a thin shell over core and store.
-- `crates/claim-mcp` — the MCP server (`query`, `create`), how agents touch the
-  store over the Model Context Protocol.
+- `crates/claim` — the `claim` CLI, a thin shell over core and store. It is the
+  sole front door; agents use the same CLI (`claim check --json`, `claim list
+  --json`).
 
 ## Documentation
 

@@ -1,6 +1,6 @@
 [package]
 name = "claim-store"
-description = "Store discovery, claim loading, and git provenance shared by the claim CLI and MCP server."
+description = "Store discovery, claim loading, and git provenance for the claim CLI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,14 +9,13 @@ repository.workspace = true
 
 [dependencies]
 claim-core = { path = "../claim-core" }
-# A store-discovery or git failure is a typed library error the two binaries map
-# to their own surfaces (the CLI's `--json` `kind`, the MCP server's protocol
-# error), so this crate raises `thiserror` enums — the same library-error choice
-# as claim-core — rather than the binary-facing `anyhow`.
+# A store-discovery or git failure is a typed library error the CLI maps to its
+# own surface (the `--json` error `kind`), so this crate raises `thiserror` enums
+# — the same library-error choice as claim-core — rather than the binary-facing
+# `anyhow`.
 thiserror = { workspace = true }
-# The store-load error is serialized into each binary's machine output (the CLI's
-# `--json` errors array, the MCP query response), so a malformed file nags in a
-# shape a consumer can read.
+# The store-load error is serialized into the CLI's machine output (the `--json`
+# errors array), so a malformed file nags in a shape a consumer can read.
 serde = { workspace = true }
 
 [dev-dependencies]
