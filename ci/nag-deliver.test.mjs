@@ -239,6 +239,70 @@ test("claim-authored free-text from the hub is defanged; the resolved owner stay
   assert.match(body, /phish/);
 });
 
+test("a smuggled HTML-comment marker in free-text is defanged, not rendered literally", () => {
+  // A hostile statement could carry the idempotency marker (or any `<!-- -->`) verbatim. The
+  // find-or-update is label+bot-scoped so a smuggled marker cannot redirect it, but the text
+  // must still render inert rather than as a live HTML comment.
+  const hostile = {
+    nags: [
+      {
+        transition: "drifted",
+        store: "s",
+        commit: "c",
+        claims: [
+          {
+            id: "x/y",
+            commit: "c",
+            statement: "sneaky <!-- claim-bot:hub-nag --> marker",
+            supports: [],
+          },
+        ],
+        owners: ["@acme/payments"],
+        fire_key: "k",
+        fired_this_pass: false,
+      },
+    ],
+    dead_letters: [],
+    fired_this_pass: 0,
+  };
+  const body = renderNagIssue(hostile);
+  // Only the ONE marker the renderer itself stamps survives; the smuggled `<!--` is broken.
+  const markerHits = body.split(NAG_ISSUE_MARKER).length - 1;
+  assert.equal(markerHits, 1, "exactly one real marker, the one the renderer stamps");
+  // The smuggled text is still shown, just with its comment-open neutralized.
+  assert.match(body, /sneaky/);
+  assert.match(body, /marker/);
+});
+
+// --- pluralization: "0 claim" would be wrong --------------------------------------
+
+test("nagItemBlock pluralizes on claim count: 0 and 2+ say 'claims', 1 says 'claim'", () => {
+  const withClaims = (n) => ({
+    nags: [
+      {
+        transition: "drifted",
+        store: "s",
+        commit: "abc",
+        claims: Array.from({ length: n }, (_, i) => ({
+          id: `x/y${i}`,
+          commit: "abc",
+          statement: "s",
+          supports: [],
+        })),
+        owners: ["@acme/eng"],
+        fire_key: "k",
+        fired_this_pass: false,
+      },
+    ],
+    dead_letters: [],
+    fired_this_pass: 0,
+  });
+  // An empty group (0 claims) must not render "0 claim" — the plural is keyed on === 1.
+  assert.match(renderNagIssue(withClaims(0)), /- \*\*0 claims \(commit `abc`\)\*\*/);
+  assert.match(renderNagIssue(withClaims(1)), /- \*\*1 claim \(commit `abc`\)\*\*/);
+  assert.match(renderNagIssue(withClaims(2)), /- \*\*2 claims \(commit `abc`\)\*\*/);
+});
+
 // --- an unknown transition is surfaced, never dropped -----------------------------
 
 test("an unknown transition renders under its raw name rather than vanishing", () => {

@@ -114,7 +114,7 @@ function nagItemBlock(item) {
   const lines = [];
   const claims = Array.isArray(item.claims) ? item.claims : [];
   const commit = item.commit ? ` (commit ${code(item.commit)})` : "";
-  const heading = claims.length > 1 ? `${claims.length} claims${commit}` : `${claims.length} claim${commit}`;
+  const heading = claims.length === 1 ? `${claims.length} claim${commit}` : `${claims.length} claims${commit}`;
   lines.push(`- **${heading}**`);
 
   for (const claim of claims) {
@@ -269,14 +269,17 @@ function footer() {
  * statement, a support ref, or an owner string cannot address people or forge-link in the
  * delivered comment or issue. This mirrors `render.mjs`'s defang: break the `@` that starts a
  * mention, the `://` that starts an autolink, and collapse backticks so the text cannot break
- * out of a code span. Display hygiene, not a security boundary — the content is still shown,
- * just inert.
+ * out of a code span. The `<!--` that opens an HTML comment is broken too, so hostile prose
+ * cannot render the idempotency marker literally (the find-or-update is label+bot-scoped, so a
+ * smuggled marker cannot redirect it — this is tidiness, not a security boundary). Display
+ * hygiene throughout: the content is still shown, just inert.
  */
 function defang(text) {
   return String(text)
     .replace(/`/g, "'")
     .replace(/@(?=[A-Za-z0-9])/g, "@​")
-    .replace(/:\/\//g, ":/​/");
+    .replace(/:\/\//g, ":/​/")
+    .replace(/<!--/g, "<!​--");
 }
 
 /** Wrap defanged free-text in a code span, collapsing newlines so it stays one line. */

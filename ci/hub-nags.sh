@@ -152,9 +152,12 @@ case "$http_code" in
     # standing issue. The real hub always answers with the nag-view envelope, whose `nags` is
     # an array; require that before declaring success. `dead_letters` and `fired_this_pass`
     # are validated at render time; `nags` present-and-array is the load-bearing gate here.
-    is_view="$(printf '%s' "$response_body" | jq -r 'if (.nags|type) == "array" then "yes" else empty end' 2>/dev/null || true)"
+    # A 2xx that ALSO carries a top-level `error` is not the real nag view either — the real
+    # hub 500s on a derive error rather than serving a 200 with both — so reject it too, rather
+    # than treating a co-carried error as a clean queue and blanking the issue over it.
+    is_view="$(printf '%s' "$response_body" | jq -r 'if (.nags|type) == "array" and (has("error")|not) then "yes" else empty end' 2>/dev/null || true)"
     [ "$is_view" = "yes" ] \
-      || die "the hub returned $http_code but not the nag-view JSON (a \`nags\` array); body: $response_body; leaving the previous standing issue intact"
+      || die "the hub returned $http_code but not the nag-view JSON (a \`nags\` array with no top-level \`error\`); body: $response_body; leaving the previous standing issue intact"
     if [ -n "$out_file" ]; then
       printf '%s' "$response_body" > "$out_file"
     else

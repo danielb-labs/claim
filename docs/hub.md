@@ -754,10 +754,16 @@ when the hub cannot derive the queue), on an unreachable hub, and on a timeout (
 `max-time`, default 60s) — and it writes **nothing** to its output on failure. So a broken
 pull aborts before any render or upsert, and the **previous standing issue is left intact** —
 never blanked, never closed, never overwritten with an empty "all clear" over stale data
-(invariant #6). The pull-and-render core lives in `ci/hub-nags.sh` + `ci/nag-deliver.mjs`,
+(invariant #6). The render step is held to the same discipline: `ci/nag-render.sh` runs the
+renderer and treats only exit `0` (clean) and `1` (dirty) as findings — any other exit (a
+crashed or OOM'd renderer, a spawn failure, or the documented parse-failure `2`), or an empty
+body under any exit, is a loud failure that writes no `body_file`, so the upsert is skipped and
+the prior surface stands rather than being blanked or spammed with an empty issue. The
+pull-and-render core lives in `ci/hub-nags.sh` + `ci/nag-render.sh` + `ci/nag-deliver.mjs`,
 exercised against a locally-served hub in the gate (`crates/claim-hub/tests/nag_delivery.rs`):
-a valid pull renders the hub's view verbatim, two runs render an identical body (one issue),
-and a refused / stalled / unauthenticated pull fails loudly and leaves the output empty.
+a valid pull renders the hub's view verbatim, two runs render an identical body (one issue), a
+refused / stalled / unauthenticated pull fails loudly and leaves the output empty, and a
+renderer that crashes or returns an empty body fails the step and posts nothing.
 
 ## The web UI, the markdown twins, and `llms.txt`
 

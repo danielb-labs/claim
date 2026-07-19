@@ -42,7 +42,7 @@ echo "==> ci renderer tests"
 if command -v node >/dev/null 2>&1; then
   node --test "ci/*.test.mjs"
 else
-  echo "WARNING: node not found; skipping ci/render.test.mjs (CI runs it)." >&2
+  echo "WARNING: node not found; skipping ci renderer tests (CI runs them)." >&2
 fi
 
 # This repo dogfoods `claim`: its own load-bearing decisions are recorded as claims

@@ -194,7 +194,9 @@ Three properties are load-bearing:
 - **A hub outage is loud, never a false green.** The pull (`ci/hub-nags.sh`) fails the step on
   any non-2xx, an unreachable hub, or a timeout, and writes nothing on failure — so a broken
   pull aborts before any upsert and the **previous standing issue is left intact**, never
-  blanked over stale data (golden invariant #6).
+  blanked over stale data (golden invariant #6). The render step (`ci/nag-render.sh`) is held
+  to the same bar: a renderer that exits anything but `0`/`1`, or returns an empty body, fails
+  loud and posts nothing, so a crashed renderer never blanks or spams the issue either.
 
 The hub doc's [Delivering the nag from CI](hub.md#delivering-the-nag-from-ci-the-nag-delivery-action)
 covers the read-token provisioning and the render-vs-deliver split in full.

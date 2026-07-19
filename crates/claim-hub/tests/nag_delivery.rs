@@ -285,6 +285,66 @@ fn ci_script(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The outcome of running `ci/nag-render.sh`: its exit status, stderr, and the appended
+/// `--output-file` contents (empty on a fault, `clean=`/`body_file=` lines on success).
+struct RenderRun {
+    status: std::process::ExitStatus,
+    stderr: String,
+    output: String,
+}
+
+/// Run `ci/nag-render.sh` against `renderer` (a path to node script or a stub) with `nags_json`
+/// as the pulled view, returning the status, stderr, and the GITHUB_OUTPUT-style file contents.
+///
+/// The output file is created empty first, so "the fault wrote nothing" is distinguishable from
+/// "the file was never touched" — a fault leaves it empty, a success appends the two lines.
+fn run_render(renderer: &Path, nags_json: &str) -> RenderRun {
+    let script = ci_script("nag-render.sh");
+    let dir = TempDir::new().expect("temp dir for the render run");
+    let nags_path = dir.path().join("nags.json");
+    let body_path = dir.path().join("body.md");
+    let output_path = dir.path().join("github-output");
+    std::fs::write(&nags_path, nags_json).expect("write the nags fixture");
+    std::fs::write(&output_path, "").expect("seed an empty output file");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg("--renderer")
+        .arg(renderer)
+        .arg("--mode")
+        .arg("issue")
+        .arg("--nags")
+        .arg(&nags_path)
+        .arg("--body-file")
+        .arg(&body_path)
+        .arg("--output-file")
+        .arg(&output_path)
+        .output()
+        .expect("run nag-render.sh");
+
+    RenderRun {
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        output: std::fs::read_to_string(&output_path).unwrap_or_default(),
+    }
+}
+
+/// Write a stub node "renderer" (a `.mjs` that `nag-render.sh` runs via `node`) which writes
+/// `stdout` and exits `code` — standing in for a crashed/OOM'd renderer so nag-render.sh's
+/// rc-handling is exercised without depending on how a real crash is provoked. Returns the
+/// stub's path, under `dir`.
+fn stub_renderer(dir: &Path, code: i32, stdout: &str) -> PathBuf {
+    let path = dir.join("stub-renderer.mjs");
+    // JSON.stringify so an arbitrary `stdout` (including empty) is embedded safely; an empty
+    // string writes a genuinely empty body.
+    let script = format!(
+        "process.stdout.write({});\nprocess.exit({code});\n",
+        serde_json::json!(stdout)
+    );
+    std::fs::write(&path, script).expect("write the stub renderer");
+    path
+}
+
 /// A tokio task handle that aborts its task when dropped, so a served hub does not outlive
 /// its test.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -541,4 +601,140 @@ async fn a_wrong_read_token_is_a_loud_401() {
         run.stderr,
     );
     assert_eq!(run.out, "", "a rejected pull writes nothing to --out");
+}
+
+// --- the render step's exit contract: a renderer fault fails loud, never posts ----
+//
+// nag-render.sh gates the renderer's exit code between the pull and the upsert. These prove
+// the invariant-#6 fault path without a real runner: only rc 0/1 with a non-empty body writes
+// the `body_file` output the upsert step keys on; a crash, an OOM, a spawn failure, or an empty
+// body fails loud and writes nothing — so the upsert is skipped and the prior surface stands.
+
+#[test]
+fn render_step_writes_the_body_output_for_a_real_dirty_finding() {
+    // The happy path: the real renderer on a dirty view exits 1 and writes a non-empty body, so
+    // nag-render.sh appends `clean=1` and `body_file=` for the upsert step to open/update on.
+    let nags = std::fs::read_to_string(
+        ci_script("nag-deliver.mjs")
+            .parent()
+            .unwrap()
+            .join("fixtures/nags-mixed.json"),
+    )
+    .expect("read the mixed fixture");
+    let run = run_render(&ci_script("nag-deliver.mjs"), &nags);
+    assert!(
+        run.status.success(),
+        "a dirty finding is a success (rc 0/1); stderr=<{}>",
+        run.stderr,
+    );
+    assert!(
+        run.output.contains("clean=1"),
+        "a dirty view records clean=1: {}",
+        run.output,
+    );
+    assert!(
+        run.output.contains("body_file="),
+        "a dirty view emits the body_file the upsert reads: {}",
+        run.output,
+    );
+}
+
+#[test]
+fn render_step_writes_the_body_output_for_a_clean_finding() {
+    // A clean view exits 0 and still renders a non-empty close-me body (opening with the
+    // marker), so nag-render.sh emits `clean=0` and a `body_file` — the upsert closes on it.
+    let nags = std::fs::read_to_string(
+        ci_script("nag-deliver.mjs")
+            .parent()
+            .unwrap()
+            .join("fixtures/nags-clean.json"),
+    )
+    .expect("read the clean fixture");
+    let run = run_render(&ci_script("nag-deliver.mjs"), &nags);
+    assert!(
+        run.status.success(),
+        "clean is a success; stderr=<{}>",
+        run.stderr
+    );
+    assert!(
+        run.output.contains("clean=0"),
+        "a clean view records clean=0: {}",
+        run.output
+    );
+    assert!(
+        run.output.contains("body_file="),
+        "a clean view still emits a body: {}",
+        run.output
+    );
+}
+
+#[test]
+fn render_step_fails_loud_on_a_renderer_crash_and_writes_no_body_output() {
+    // The core invariant-#6 guard: a renderer that exits anything but 0/1 (here 139, a segfault
+    // stand-in — but 134/137/127 travel the same branch) must fail the step and append NOTHING
+    // to the output file, so the upsert's `body_file != ''` gate is never satisfied and the
+    // prior surface is left intact rather than blanked or spammed.
+    let dir = TempDir::new().expect("temp dir");
+    // The stub writes a plausible body, proving the failure is on the rc alone, not emptiness.
+    let stub = stub_renderer(dir.path(), 139, "<!-- claim-bot:hub-nag -->\nlooks fine\n");
+    let run = run_render(&stub, "{\"nags\":[]}");
+    assert!(
+        !run.status.success(),
+        "a crashed renderer fails the step; stderr=<{}>",
+        run.stderr,
+    );
+    assert!(
+        run.stderr.contains("exited 139") && run.stderr.contains("not a clean/dirty finding"),
+        "the failure names the fault rc: {}",
+        run.stderr,
+    );
+    assert_eq!(
+        run.output, "",
+        "a crashed renderer writes no body_file output, so the upsert is skipped",
+    );
+}
+
+#[test]
+fn render_step_fails_loud_on_the_parse_failure_rc() {
+    // rc 2 is the renderer's documented "could not parse the hub response" — a real fault, not a
+    // finding. It travels the same fail-loud branch as a crash: no body_file output, upsert
+    // skipped, prior surface intact.
+    let dir = TempDir::new().expect("temp dir");
+    let stub = stub_renderer(dir.path(), 2, "");
+    let run = run_render(&stub, "not json");
+    assert!(
+        !run.status.success(),
+        "rc 2 fails the step; stderr=<{}>",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("exited 2"),
+        "the failure names rc 2: {}",
+        run.stderr,
+    );
+    assert_eq!(
+        run.output, "",
+        "a parse-failure rc writes no body_file output"
+    );
+}
+
+#[test]
+fn render_step_fails_loud_on_an_empty_body_even_under_a_finding_rc() {
+    // Defense in depth: a renderer that exits 0 or 1 but wrote an EMPTY body (a truncated or
+    // partial redirect) must still fail loud — an empty body posted would blank a good issue or
+    // spam a markerless one. Every real body opens with a marker, so a zero-byte body is a fault.
+    let dir = TempDir::new().expect("temp dir");
+    let stub = stub_renderer(dir.path(), 1, "");
+    let run = run_render(&stub, "{\"nags\":[{}]}");
+    assert!(
+        !run.status.success(),
+        "an empty body under a finding rc fails the step; stderr=<{}>",
+        run.stderr,
+    );
+    assert!(
+        run.stderr.contains("empty body"),
+        "the failure names the empty body: {}",
+        run.stderr,
+    );
+    assert_eq!(run.output, "", "an empty body writes no body_file output");
 }

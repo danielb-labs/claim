@@ -115,12 +115,13 @@ runs:
         HUB_URL: ${{ inputs.hub-url }}
         HUB_MAX_TIME: ${{ inputs.max-time }}
         HUB_NAG_MODE: ${{ inputs.mode }}
-        # The action's own directory, so the glue is found regardless of the caller's layout.
-        ACTION_PATH: ${{ github.action_path }}
       # Inputs are passed via env, never interpolated into the command line, to keep untrusted
       # input off the shell (the Actions injection footgun). The glue lives under the checked-
-      # out tool repo (_claim_tool/ci); this action directory is three levels below the caller
-      # root (.github/actions/hub-nag-deliver), so GITHUB_WORKSPACE holds _claim_tool.
+      # out tool repo (_claim_tool/ci): the "Check out the claim tool" step above ran
+      # `actions/checkout` with `path: _claim_tool`, which lands the tool repo at
+      # `$GITHUB_WORKSPACE/_claim_tool` (the separate-checkout model, like claim-clock's
+      # render.mjs) — so the glue is read from there, not resolved relative to this action's
+      # own directory.
       run: |
         case "$HUB_NAG_MODE" in
           issue|comment) ;;
@@ -138,21 +139,18 @@ runs:
           --out "$nags_file" \
           --max-time "$HUB_MAX_TIME"
 
-        # Render the pulled view to the delivery body, in the same one place regardless of the
-        # forge surface. The renderer exits 0 when the hub reports nothing to nag and 1 when
-        # there is a queue; that decision drives open-vs-close below. A render crash (exit 2) is
-        # treated as "not clean", erring toward keeping the nag open rather than silently
-        # closing it (invariant #6).
-        set +e
-        node "$glue/nag-deliver.mjs" --mode "$HUB_NAG_MODE" --nags "$nags_file" > "$body_file"
-        rc=$?
-        set -e
-        if [ "$rc" -eq 2 ]; then
-          echo "hub-nag-deliver: the renderer could not parse the hub response; failing loud" >&2
-          exit 1
-        fi
-        echo "clean=$rc" >> "$GITHUB_OUTPUT"
-        echo "body_file=$body_file" >> "$GITHUB_OUTPUT"
+        # Render the pulled view to the delivery body and enforce the renderer's exit contract,
+        # in nag-render.sh so the fault handling is testable off-runner (as hub-nags.sh is): a
+        # renderer that exits anything but 0/1, or leaves an empty body, is a LOUD failure that
+        # writes nothing to $GITHUB_OUTPUT — so `body_file` is unset, the upsert steps are
+        # skipped, and the previous surface is left intact rather than blanked or spammed with an
+        # empty body (invariant #6). On a real finding it appends `clean=` and `body_file=`.
+        "$glue/nag-render.sh" \
+          --renderer "$glue/nag-deliver.mjs" \
+          --mode "$HUB_NAG_MODE" \
+          --nags "$nags_file" \
+          --body-file "$body_file" \
+          --output-file "$GITHUB_OUTPUT"
 
     # Upsert the single standing issue (mode issue), found by its marker (in the body) and its
     # label. Open or update when the hub is nagging; close when it reports nothing. Idempotent:
