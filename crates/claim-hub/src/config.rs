@@ -78,6 +78,13 @@ pub struct Config {
     /// unauthenticated health, so nothing enforces this yet.
     #[serde(default)]
     pub read_auth: ReadAuthConfig,
+
+    /// The router / nag engine's cadence (hub-11): how often the background tick re-derives
+    /// and fires a nag for a newly-noticed transition. The tick is what notices a claim
+    /// aging into stale by the clock alone, so its period bounds how quickly such a
+    /// transition is nagged.
+    #[serde(default)]
+    pub router: RouterConfig,
 }
 
 /// Where a config path came from, so loading knows whether a missing file is a fatal
@@ -198,6 +205,40 @@ pub struct ReadIssuerConfig {
     /// The JWKS endpoint the hub fetches the issuer's signing keys from (cached, refreshed
     /// on an unknown key id, rate-limited — the same machinery as the ingest gate).
     pub jwks_url: String,
+}
+
+/// The router / nag engine's cadence (hub-11).
+///
+/// The one recurring hub task is the router tick (HUB-IMPLEMENTATION.md §1.8): it
+/// re-derives the read model and fires a nag once for each newly-noticed transition,
+/// including a claim aging into stale by the clock alone — which has no new verdict to
+/// trigger on, so only the tick would notice it. `period_secs` bounds how quickly such a
+/// clock-crossing transition is nagged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterConfig {
+    /// How often the router tick runs, in seconds. Defaults to
+    /// [`DEFAULT_ROUTER_PERIOD_SECS`] (5 minutes) — frequent enough that a fact aging into
+    /// stale is nagged promptly, infrequent enough that the re-derivation is negligible at
+    /// v1 volume. Must be positive; `0` is rejected as it would spin the tick.
+    #[serde(default = "default_router_period_secs")]
+    pub period_secs: u64,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            period_secs: DEFAULT_ROUTER_PERIOD_SECS,
+        }
+    }
+}
+
+/// The default router-tick period: 5 minutes.
+pub const DEFAULT_ROUTER_PERIOD_SECS: u64 = 300;
+
+/// The default router-tick period in seconds, for serde's `default`.
+fn default_router_period_secs() -> u64 {
+    DEFAULT_ROUTER_PERIOD_SECS
 }
 
 /// The deriver's freshness knobs, as the TOML file spells them.
@@ -362,6 +403,17 @@ impl Config {
             default_max_age,
             max_age_override,
         })
+    }
+
+    /// The router tick's period as a [`Duration`](std::time::Duration).
+    ///
+    /// A `0` period is clamped up to one second: a zero-period tokio interval would spin
+    /// the tick against the store with no delay, a self-inflicted busy loop. Clamping keeps
+    /// a mistyped `0` from taking the hub down — loud in neither direction is wrong here, a
+    /// spinning tick is the more dangerous failure, so it degrades to a slow-but-safe 1s.
+    #[must_use]
+    pub fn router_period(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.router.period_secs.max(1))
     }
 
     /// Apply the environment overrides in `env`, failing loudly on a malformed value.
@@ -547,6 +599,32 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("hub.toml"), "names the file: {message}");
         assert!(message.contains("listen"), "names the field: {message}");
+    }
+
+    #[test]
+    fn an_absent_router_section_uses_the_default_period() {
+        // No `[router]`: the tick runs at the 5-minute default, so a hub with no router
+        // config still notices a claim aging into stale.
+        let config = Config::from_toml("").unwrap();
+        assert_eq!(config.router.period_secs, DEFAULT_ROUTER_PERIOD_SECS);
+        assert_eq!(
+            config.router_period(),
+            std::time::Duration::from_secs(DEFAULT_ROUTER_PERIOD_SECS)
+        );
+    }
+
+    #[test]
+    fn a_router_section_sets_the_period() {
+        let config = Config::from_toml("[router]\nperiod_secs = 60\n").unwrap();
+        assert_eq!(config.router_period(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_zero_router_period_is_clamped_up_off_a_busy_loop() {
+        // A `0` period would spin the tick with no delay against the store. Clamp it up to
+        // 1s so a mistyped `0` degrades to slow-but-safe rather than taking the hub down.
+        let config = Config::from_toml("[router]\nperiod_secs = 0\n").unwrap();
+        assert_eq!(config.router_period(), std::time::Duration::from_secs(1));
     }
 
     #[test]

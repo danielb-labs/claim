@@ -25,6 +25,10 @@
 //! - `GET /api/feed` — the cursor feed: the ledger, pollable from a position
 //!   (`?cursor=<seq>`), **paginated by ledger seq, not offset**, so an intermittent agent
 //!   catches up deterministically with no gap and no dupe.
+//! - `GET /api/nags` — the router's rendered nag content (hub-11): the drift/stale/
+//!   lapsed-skip transitions grouped by breaking commit, each routed to its CODEOWNERS
+//!   owners, plus the dead-letter queue. What the CI glue pulls to deliver; a read that
+//!   fires nothing.
 //!
 //! Auth is deferred to hub-13; the mount seam is [`crate::build_app`]. These routes are
 //! unauthenticated for now.
@@ -120,6 +124,30 @@ pub fn router() -> Router<AppState> {
         .route("/api/due", get(due_set))
         .route("/api/suspect", get(suspect_set))
         .route("/api/feed", get(cursor_feed))
+        .route("/api/nags", get(nags))
+}
+
+/// `GET /api/nags`: the router's rendered nag content, for the CI glue to pull and deliver.
+///
+/// The hub *renders* nag content and serves it; the CI glue delivers it (the hub holds no
+/// forge write token — HUB-IMPLEMENTATION.md §4.5 decision 4). This endpoint serves the
+/// current owner-resolved nag groups and the dead-letter queue, derived from the live store
+/// at the read clock — the same derivation the router tick fires from, so the served content
+/// and the fired marks agree. Reading it is a **pure read**: it resolves owners from the
+/// mirror and reports the view, but appends no `nag` event (the tick fires; a read never
+/// does), so the endpoint is safe to poll without double-firing.
+async fn nags(State(state): State<AppState>) -> Response {
+    let now = (state.read_clock)();
+    match state.router().current_view(now).await {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render the nag view");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot render the nag queue right now",
+            )
+        }
+    }
 }
 
 /// The whole read model plus the raw ledger, derived once from the live store.
@@ -721,14 +749,20 @@ impl VerdictEntry {
     fn from_event(seq: u64, event: &claim_hub_core::Event) -> Option<Self> {
         match event.kind {
             claim_hub_core::EventKind::Verdict => {}
+            // A nag (or a later kind) is not a verdict and must never render as one in the
+            // history (invariant #4). Excluded, not mislabeled.
             _ => return None,
         }
+        // A verdict event carries both its verdict and its check (see `Event::verdict`); a
+        // verdict-kind event missing either is malformed telemetry, excluded from the
+        // history rather than rendered with a fabricated check or verdict.
+        let (verdict, check) = (event.verdict?, event.check.as_ref()?);
         Some(Self {
             seq,
-            verdict: event.verdict,
+            verdict,
             check: CheckRef {
-                index: event.check.index,
-                digest: event.check.digest.clone(),
+                index: check.index,
+                digest: check.digest.clone(),
             },
             reported_at: event.reported_at,
             commit: event.commit.clone(),

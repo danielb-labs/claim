@@ -26,7 +26,7 @@
 
 use claim_core::{parse_claim_file, Claim, Timestamp, Verdict};
 use claim_hub_core::deriver::{derive, ClaimEntry, DeriverConfig, RegistrySnapshot, Standing};
-use claim_hub_core::{check_digest, CheckRef, Event, EventKind, Producer};
+use claim_hub_core::{check_digest, CheckRef, Event, Producer};
 
 /// The verdicts a check's latest can take, plus the "never checked" absence.
 ///
@@ -59,20 +59,18 @@ fn n_check_claim(id: &str, n: usize) -> Claim {
 fn event_for_check(claim: &Claim, check_index: usize, verdict: Verdict, at: &str) -> Event {
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!("1"));
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim.id.as_str().to_owned(),
-        check: CheckRef {
+    Event::verdict(
+        claim.id.as_str().to_owned(),
+        CheckRef {
             index: check_index,
             digest: check_digest(&claim.checks[check_index]),
         },
         verdict,
-        evidence: None,
-        commit: "abc".into(),
-        store: "s".into(),
-        producer: Producer(producer),
-        reported_at: ts(at),
-    }
+        "abc",
+        "s",
+        Producer(producer),
+        ts(at),
+    )
 }
 
 fn single_claim_registry(claim: Claim) -> RegistrySnapshot {

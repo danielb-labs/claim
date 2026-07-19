@@ -1,10 +1,24 @@
 //! The event envelope: one attested observation on the hub's ledger.
 //!
 //! This is the shape of a single event as HUB.md §2 fixes it — the hub's one
-//! piece of primary state is an append-only log of these. In v1 every event is a
-//! `verdict`, but the grammar is deliberately wider: later kinds (a delivered
-//! `nag`, a spot-audit result, an acknowledgement) append to the same log with
-//! the same envelope, so the [`EventKind`] enum is the seam for that growth.
+//! piece of primary state is an append-only log of these. In v1 the log carries two
+//! kinds, and the grammar is deliberately wider: later kinds (a spot-audit result,
+//! an acknowledgement) append to the same log with the same envelope, so the
+//! [`EventKind`] enum is the seam for that growth.
+//!
+//! ## Two event kinds, one envelope
+//!
+//! A [`EventKind::Verdict`] is an attested observation from a CI producer — the
+//! ingest gate's only output. A [`EventKind::Nag`] is the hub's own scheduling
+//! telemetry (hub-11): a delivery mark the router appends when a claim *transitions*
+//! into drifted, stale, or a lapsed skip, so "already nagged" is **derived** from the
+//! ledger and never a mutable flag (invariant #3). A nag is *not* a verdict — it
+//! carries no [`verdict`](Event::verdict) and no single [`check`](Event::check) — so
+//! those two fields are [`Option`], `None` on a nag and `Some` on a verdict. That
+//! makes invariant #4 structural: a nag cannot be rendered as a verdict because it
+//! holds none, the same kind-filter the dossier applies. The nag's own payload (the
+//! transition and the group it fired for) rides in the [`Producer`] block, the hub's
+//! own principal (see [`crate::nag`]).
 //!
 //! Three properties are load-bearing and tested:
 //!
@@ -26,14 +40,22 @@
 use claim_core::{Timestamp, Verdict};
 use serde::{Deserialize, Serialize};
 
-/// One attested observation on the ledger: a fact reported about a claim's check
-/// at a moment, by a verified producer.
+/// One event on the ledger: a verified [`Verdict`] observation, or a hub-authored
+/// [`nag`](EventKind::Nag) delivery mark.
 ///
-/// The fields are exactly HUB.md §2's set; the type carries
-/// `#[serde(deny_unknown_fields)]` so a stored or received envelope with an
-/// unrecognized field is rejected naming it, never half-read. Equality is
-/// structural and the (de)serialization is lossless, so `to`/`from` JSON
-/// round-trips to an equal value — the property the ledger's integrity rests on.
+/// The fields are HUB.md §2's set; the type carries `#[serde(deny_unknown_fields)]`
+/// so a stored or received envelope with an unrecognized field is rejected naming it,
+/// never half-read. Equality is structural and the (de)serialization is lossless, so
+/// `to`/`from` JSON round-trips to an equal value — the property the ledger's integrity
+/// rests on.
+///
+/// [`verdict`](Event::verdict) and [`check`](Event::check) are `Option` because a nag
+/// event has neither: it is the hub's own scheduling telemetry, not a check result, and
+/// carrying no verdict is what keeps invariant #4 structural (a nag cannot masquerade as
+/// a verdict — there is nothing to render as one). A verdict event carries both `Some`;
+/// a nag carries both `None` and puts its payload in [`producer`](Event::producer). Use
+/// [`Event::verdict`] and [`Event::nag`] to construct the two so the invariant is upheld
+/// at the constructor, not just by convention.
 ///
 /// Dedup is not a field here: HUB.md §2's redelivery rule keys on
 /// (`producer` run, `claim`, `check` identity), which the storage layer enforces
@@ -42,47 +64,115 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Event {
-    /// The event kind. `verdict` in v1; the enum is the seam for later kinds.
+    /// The event kind: [`EventKind::Verdict`] or [`EventKind::Nag`].
     pub kind: EventKind,
-    /// The claim's id, as written in its store (e.g. `payments/libfoo-pin`).
+    /// The claim's id, as written in its store (e.g. `payments/libfoo-pin`). On a nag
+    /// this is the claim the transition is about (a grouped nag names its primary
+    /// claim; the whole group is in the producer payload).
     pub claim: String,
-    /// Which check of the claim this observation is about, by position and
-    /// content-identity. See [`CheckRef`].
-    pub check: CheckRef,
+    /// Which check of the claim a *verdict* is about, by position and content-identity
+    /// (see [`CheckRef`]). `None` on a nag, which is not about a single check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckRef>,
     /// The verdict reported for that check. The shared [`claim_core::Verdict`], so
     /// `held`/`drifted`/`unverifiable`/`broken` mean exactly what the CLI meant.
-    pub verdict: Verdict,
+    /// `None` on a nag, which reports no verdict (invariant #4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
     /// The evidence the check recorded, if any — capped at ingest (see
     /// [`crate::cap_evidence`]) before an envelope is built, so what lands here is
     /// already bounded. `None` when the check recorded none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
-    /// The commit sha the check was reported against, tying the observation to a
-    /// point in the store's history.
+    /// The commit sha this event is anchored to: for a verdict, the sha the check was
+    /// reported against; for a nag, the commit that groups the transition (one commit
+    /// breaking N claims is one nag).
     pub commit: String,
     /// The connected store the claim lives in (e.g. `github.com/acme/payments`).
     pub store: String,
-    /// The verified producer identity, kept whole. See [`Producer`].
+    /// The producer identity, kept whole. For a verdict, the verified pipeline
+    /// identity; for a nag, the hub's own principal plus the nag payload (see
+    /// [`Producer`] and [`crate::nag`]).
     pub producer: Producer,
-    /// When the producer reported this observation (a UTC instant, RFC 3339). The
-    /// shared [`claim_core::Timestamp`], so every hub timestamp round-trips
-    /// losslessly and compares unambiguously.
+    /// When this event was recorded (a UTC instant, RFC 3339). The shared
+    /// [`claim_core::Timestamp`], so every hub timestamp round-trips losslessly and
+    /// compares unambiguously.
     pub reported_at: Timestamp,
+}
+
+impl Event {
+    /// Construct a verdict event: an attested check observation.
+    ///
+    /// The [`check`](Event::check) and [`verdict`](Event::verdict) are `Some`, so this
+    /// is unambiguously a verdict. Evidence and the rest are set by the caller after.
+    #[must_use]
+    pub fn verdict(
+        claim: impl Into<String>,
+        check: CheckRef,
+        verdict: Verdict,
+        commit: impl Into<String>,
+        store: impl Into<String>,
+        producer: Producer,
+        reported_at: Timestamp,
+    ) -> Self {
+        Self {
+            kind: EventKind::Verdict,
+            claim: claim.into(),
+            check: Some(check),
+            verdict: Some(verdict),
+            evidence: None,
+            commit: commit.into(),
+            store: store.into(),
+            producer,
+            reported_at,
+        }
+    }
+
+    /// Construct a nag event: the hub's own delivery mark for a transition.
+    ///
+    /// [`check`](Event::check) and [`verdict`](Event::verdict) are `None` — a nag is not
+    /// a verdict — so this event can never be read as one (invariant #4). The `producer`
+    /// carries the hub principal and the nag payload; `commit` is the transition's group
+    /// commit; `claim` names the transition's primary claim.
+    #[must_use]
+    pub fn nag(
+        claim: impl Into<String>,
+        commit: impl Into<String>,
+        store: impl Into<String>,
+        producer: Producer,
+        reported_at: Timestamp,
+    ) -> Self {
+        Self {
+            kind: EventKind::Nag,
+            claim: claim.into(),
+            check: None,
+            verdict: None,
+            evidence: None,
+            commit: commit.into(),
+            store: store.into(),
+            producer,
+            reported_at,
+        }
+    }
 }
 
 /// The kind of an event on the ledger.
 ///
-/// v1 has one kind, `verdict`; the enum exists so later kinds (`nag`, `audit`,
-/// `ack`) extend the ledger grammar without a new store. `#[non_exhaustive]`
-/// reserves that growth: a match on this enum in the deriver must stay total, so a
-/// new kind forces every consumer to decide how to treat it rather than defaulting
-/// to a silent pass.
+/// v1 has two kinds; the enum exists so later kinds (`audit`, `ack`) extend the
+/// ledger grammar without a new store. `#[non_exhaustive]` reserves that growth: a
+/// match on this enum in a consumer must stay total, so a new kind forces every
+/// consumer to decide how to treat it rather than defaulting to a silent pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum EventKind {
-    /// A reported check result — the only kind in v1.
+    /// A reported check result: an attested observation from a CI producer.
     Verdict,
+    /// A nag delivery mark: the hub's own record that it routed a transition (a claim
+    /// entering drifted, crossing into stale, or a skip's `until` lapsing) to an owner.
+    /// Not a verdict — it bears on the *schedule*, never on a claim's standing (invariant
+    /// #4), so the deriver and the dossier skip it. Appended by the router (hub-11).
+    Nag,
 }
 
 /// Which check of a claim an event is about: its position *and* its content
@@ -137,7 +227,7 @@ pub struct Producer(pub serde_json::Map<String, serde_json::Value>);
 mod tests {
     use super::*;
 
-    /// A fully populated event, for round-trip and field tests.
+    /// A fully populated verdict event, for round-trip and field tests.
     fn sample_event() -> Event {
         let mut producer = serde_json::Map::new();
         producer.insert(
@@ -147,20 +237,35 @@ mod tests {
         producer.insert("repository".into(), serde_json::json!("acme/payments"));
         producer.insert("workflow".into(), serde_json::json!("verify"));
         producer.insert("run".into(), serde_json::json!("1234567890"));
-        Event {
-            kind: EventKind::Verdict,
-            claim: "payments/libfoo-pin".into(),
-            check: CheckRef {
+        let mut event = Event::verdict(
+            "payments/libfoo-pin",
+            CheckRef {
                 index: 1,
                 digest: "a".repeat(64),
             },
-            verdict: Verdict::Held,
-            evidence: Some("libfoo==4.2".into()),
-            commit: "8f2c0a1".into(),
-            store: "github.com/acme/payments".into(),
-            producer: Producer(producer),
-            reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
-        }
+            Verdict::Held,
+            "8f2c0a1",
+            "github.com/acme/payments",
+            Producer(producer),
+            "2026-07-18T06:00:00Z".parse().unwrap(),
+        );
+        event.evidence = Some("libfoo==4.2".into());
+        event
+    }
+
+    /// A nag event, carrying no verdict and no single check (invariant #4).
+    fn sample_nag() -> Event {
+        let mut producer = serde_json::Map::new();
+        producer.insert("principal".into(), serde_json::json!("hub-router"));
+        producer.insert("run".into(), serde_json::json!("drifted@8f2c0a1"));
+        producer.insert("transition".into(), serde_json::json!("drifted"));
+        Event::nag(
+            "payments/libfoo-pin",
+            "8f2c0a1",
+            "github.com/acme/payments",
+            Producer(producer),
+            "2026-07-18T06:00:00Z".parse().unwrap(),
+        )
     }
 
     #[test]
@@ -231,8 +336,36 @@ mod tests {
 
     #[test]
     fn kind_serializes_as_kebab_case() {
-        let json = serde_json::to_string(&EventKind::Verdict).unwrap();
-        assert_eq!(json, "\"verdict\"");
+        assert_eq!(
+            serde_json::to_string(&EventKind::Verdict).unwrap(),
+            "\"verdict\""
+        );
+        assert_eq!(serde_json::to_string(&EventKind::Nag).unwrap(), "\"nag\"");
+    }
+
+    #[test]
+    fn a_nag_event_round_trips_and_carries_no_verdict() {
+        // A nag has no verdict and no check — invariant #4 made structural: it cannot be
+        // read as a verdict because it holds none. Both fields are omitted from the wire.
+        let nag = sample_nag();
+        assert_eq!(nag.kind, EventKind::Nag);
+        assert!(nag.verdict.is_none(), "a nag carries no verdict");
+        assert!(nag.check.is_none(), "a nag is not about a single check");
+        let json = serde_json::to_string(&nag).unwrap();
+        assert!(
+            !json.contains("verdict") && !json.contains("\"check\""),
+            "a nag omits verdict and check on the wire: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(nag, back, "nag round-trips losslessly");
+    }
+
+    #[test]
+    fn the_verdict_constructor_sets_check_and_verdict() {
+        let event = sample_event();
+        assert_eq!(event.kind, EventKind::Verdict);
+        assert_eq!(event.verdict, Some(Verdict::Held));
+        assert!(event.check.is_some(), "a verdict is about a check");
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //!    race the finding proved, now survived.
 
 use claim_core::Verdict;
-use claim_hub_core::{CheckRef, Event, EventKind, Producer};
+use claim_hub_core::{CheckRef, Event, Producer};
 use claim_hub_store::{Ledger, Position, SqliteStore};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, Connection};
@@ -31,20 +31,20 @@ fn event(run: &str) -> Event {
     let mut producer = serde_json::Map::new();
     producer.insert("repository".into(), serde_json::json!("acme/payments"));
     producer.insert("run".into(), serde_json::json!(run));
-    Event {
-        kind: EventKind::Verdict,
-        claim: "payments/pin".into(),
-        check: CheckRef {
+    let mut event = Event::verdict(
+        "payments/pin",
+        CheckRef {
             index: 0,
             digest: "a".repeat(64),
         },
-        verdict: Verdict::Held,
-        evidence: Some("libfoo==4.2".into()),
-        commit: "8f2c0a1".into(),
-        store: "github.com/acme/payments".into(),
-        producer: Producer(producer),
-        reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
-    }
+        Verdict::Held,
+        "8f2c0a1",
+        "github.com/acme/payments",
+        Producer(producer),
+        "2026-07-18T06:00:00Z".parse().unwrap(),
+    );
+    event.evidence = Some("libfoo==4.2".into());
+    event
 }
 
 /// Open a raw WAL-mode connection to the file, so a test can issue the `PRAGMA

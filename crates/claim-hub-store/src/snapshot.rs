@@ -27,11 +27,12 @@
 //! no config window — a stale fact showing green, exactly the false-green invariant #6
 //! forbids.
 //!
-//! Per-check **skips** are deliberately *not* carried here (the entry's `skip` is `None`):
-//! a skip is queue/ranking data (hub-14, issue #9), and the deriver's *standing* folds
-//! only verdicts — a skipped check records no verdict, so it never bears on `verified` /
-//! `stale` / `drifted`. Persisting skips changes no standing today, so it stays with the
-//! item that ranks them.
+//! Per-check **skips** *are* carried here now (hub-11): each stored skip flows through
+//! `claim_entry` into the deriver's [`DerivedCheck`], so the deriver can surface a lapsed
+//! skip `until` as a transition the router routes (the deferred check is due again). A skip
+//! still never freshens a claim — the deriver's *standing* folds only verdicts, and a
+//! skipped check records no verdict — so this bears on lapsed-skip detection and the queue,
+//! not on the `verified` / `stale` / `drifted` standing.
 
 use claim_hub_core::{ClaimEntry, DerivedCheck, RegistrySnapshot};
 
@@ -79,16 +80,22 @@ where
 /// the join key the ledger's events also carry (both computed by the one
 /// [`claim_hub_core::check_digest`], so they match by construction) — and passes the
 /// claim's stored `hub:` hints straight through, so the deriver ages it on its own
-/// declared cadence. Per-check `skip` is left `None` here: it is queue-ranking data
-/// (hub-14), and the standing folds only verdicts, so a skip changes no standing (see the
-/// module docs).
+/// declared cadence.
+///
+/// Each check's stored **skip** is carried through too, so the deriver surfaces a lapsed
+/// skip the router routes (hub-11): a skip's `until` passing is a transition (the deferred
+/// check is due again). A skip is never a pass — the standing folds only verdicts — so it
+/// changes no verified/stale/drifted standing; it drives lapsed-skip detection and the
+/// queue only. `check_skips` is parallel to `check_digests`; a shorter or absent vector at
+/// an index means no skip.
 fn claim_entry(store: &str, registered: &RegisteredClaim) -> ClaimEntry {
     let checks = registered
         .check_digests
         .iter()
-        .map(|digest| DerivedCheck {
+        .enumerate()
+        .map(|(index, digest)| DerivedCheck {
             digest: digest.clone(),
-            skip: None,
+            skip: registered.check_skips.get(index).and_then(Option::clone),
         })
         .collect();
     ClaimEntry::new(

@@ -24,12 +24,14 @@ fn claim(id: &str, statement: &str, supports: &[&str], commit: &str) -> Register
         statement: statement.into(),
         supports: supports.iter().map(|s| (*s).to_owned()).collect(),
         commit: commit.into(),
+        path: format!(".claims/{id}.md"),
         // Most registry tests exercise the claim/statement/supports/version paths; a
         // claim with no checks is the simplest fixture. The digest read/write path has
         // its own dedicated test (`check_digests_round_trip`), and the hub-hint
         // round-trip has `hub_hints_round_trip`.
         check_digests: Vec::new(),
         hub: Default::default(),
+        check_skips: Vec::new(),
     }
 }
 
@@ -237,8 +239,10 @@ fn claim_with_digests(id: &str, digests: &[&str]) -> RegisteredClaim {
         statement: "S".into(),
         supports: vec![],
         commit: "c1".into(),
+        path: format!(".claims/{id}.md"),
         check_digests: digests.iter().map(|d| (*d).to_owned()).collect(),
         hub: Default::default(),
+        check_skips: Vec::new(),
     }
 }
 
@@ -330,11 +334,13 @@ async fn hub_hints_round_trip_through_the_registry() {
         statement: "S".into(),
         supports: vec![],
         commit: "c1".into(),
+        path: ".claims/pin.md".into(),
         check_digests: vec![],
         hub: HubHints {
             max_age: Some("30d".parse().unwrap()),
             recheck: Some("7d".parse().unwrap()),
         },
+        check_skips: vec![],
     };
     store.replace_store(STORE, &[hinted]).await.unwrap();
 

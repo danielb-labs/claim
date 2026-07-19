@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT statement, \"commit\" AS commit_sha, hub_max_age, hub_recheck\n            FROM claims_at_tip\n            WHERE store = ? AND claim_id = ?\n            ",
+  "query": "\n            SELECT statement, \"commit\" AS commit_sha, hub_max_age, hub_recheck, path\n            FROM claims_at_tip\n            WHERE store = ? AND claim_id = ?\n            ",
   "describe": {
     "columns": [
       {
@@ -22,6 +22,11 @@
         "name": "hub_recheck",
         "ordinal": 3,
         "type_info": "Text"
+      },
+      {
+        "name": "path",
+        "ordinal": 4,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -31,8 +36,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "74b615523fdd9eefa95e8f42c12aa8e95d4d2ce8fc0ad63cab78da96ff0370fc"
+  "hash": "81fd1c8ef0ef9f6ab190e7f3aa1824c54975b1d174eb6197c8358fceac435c9e"
 }

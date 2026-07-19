@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::Request;
 use claim_core::{parse_claim_file, Timestamp, Verdict};
-use claim_hub_core::{check_digest, CheckRef, Event, EventKind, Producer};
+use claim_hub_core::{check_digest, CheckRef, Event, Producer};
 use claim_hub_store::{Ledger, RegisteredClaim, Registry, SqliteStore};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -68,20 +68,20 @@ fn verdict_event(
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!("run-1"));
     producer.insert("repository".into(), serde_json::json!("acme/payments"));
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim.id.as_str().to_owned(),
-        check: CheckRef {
+    let mut event = Event::verdict(
+        claim.id.as_str().to_owned(),
+        CheckRef {
             index: check_index,
             digest: check_digest(&claim.checks[check_index]),
         },
         verdict,
-        evidence: (verdict == Verdict::Held).then(|| "libfoo==4.2".to_owned()),
-        commit: "abc1234".into(),
-        store: store_id.into(),
-        producer: Producer(producer),
-        reported_at: at.parse().unwrap(),
-    }
+        "abc1234",
+        store_id,
+        Producer(producer),
+        at.parse().unwrap(),
+    );
+    event.evidence = (verdict == Verdict::Held).then(|| "libfoo==4.2".to_owned());
+    event
 }
 
 /// A one-`cmd`-check claim frontmatter with the given id and optional extra lines.
@@ -335,20 +335,19 @@ async fn seed_hostile(store: &SqliteStore) {
     // A verdict event whose evidence, commit, and producer values are all hostile.
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!(HOSTILE));
-    let event = Event {
-        kind: EventKind::Verdict,
-        claim: claim.id.as_str().to_owned(),
-        check: CheckRef {
+    let mut event = Event::verdict(
+        claim.id.as_str().to_owned(),
+        CheckRef {
             index: 0,
             digest: check_digest(&claim.checks[0]),
         },
-        verdict: Verdict::Held,
-        evidence: Some(HOSTILE.to_owned()),
-        commit: HOSTILE.to_owned(),
-        store: PAYMENTS.into(),
-        producer: Producer(producer),
-        reported_at: "2026-07-18T00:00:00Z".parse().unwrap(),
-    };
+        Verdict::Held,
+        HOSTILE,
+        PAYMENTS,
+        Producer(producer),
+        "2026-07-18T00:00:00Z".parse().unwrap(),
+    );
+    event.evidence = Some(HOSTILE.to_owned());
     store.append(&event).await.unwrap();
 }
 

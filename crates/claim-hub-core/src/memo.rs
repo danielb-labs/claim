@@ -206,20 +206,18 @@ mod tests {
     fn verdict_event(claim: &Claim, verdict: Verdict, at: &str) -> Event {
         let mut producer = serde_json::Map::new();
         producer.insert("run".into(), serde_json::json!("1"));
-        Event {
-            kind: crate::EventKind::Verdict,
-            claim: claim.id.as_str().to_owned(),
-            check: crate::CheckRef {
+        Event::verdict(
+            claim.id.as_str().to_owned(),
+            crate::CheckRef {
                 index: 0,
                 digest: crate::check_digest(&claim.checks[0]),
             },
             verdict,
-            evidence: None,
-            commit: "abc".into(),
-            store: "s".into(),
-            producer: crate::Producer(producer),
-            reported_at: ts(at),
-        }
+            "abc",
+            "s",
+            crate::Producer(producer),
+            ts(at),
+        )
     }
 
     fn registry(version: u64, claims: Vec<Claim>) -> RegistrySnapshot {

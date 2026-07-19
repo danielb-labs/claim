@@ -21,6 +21,7 @@ expression: body
 - [GET /api/due](/api/due): the review queue — every drifted, stale, or due-for-recheck claim.
 - [GET /api/suspect](/api/suspect): every claim a drifted decision may have undermined.
 - [GET /api/feed](/api/feed): the ledger, pollable from a position (`?cursor=<seq>`), paginated by seq so an intermittent agent catches up with no gap and no dupe.
+- [GET /api/nags](/api/nags): the router's rendered nag content — drift/stale/lapsed-skip transitions grouped by breaking commit, each routed to its CODEOWNERS owners, plus the dead-letter queue (transitions with no resolvable owner). What the CI glue pulls to deliver; a read, so it fires nothing.
 
 ## Status (machine-readable position)
 

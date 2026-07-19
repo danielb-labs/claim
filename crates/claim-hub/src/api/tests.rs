@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::Request;
 use claim_core::{parse_claim_file, Timestamp, Verdict};
-use claim_hub_core::{check_digest, CheckRef as EventCheckRef, Event, EventKind, Producer};
+use claim_hub_core::{check_digest, CheckRef as EventCheckRef, Event, Producer};
 use claim_hub_store::{Ledger, RegisteredClaim, Registry, SqliteStore};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -90,20 +90,20 @@ fn verdict_event(
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!("run-1"));
     producer.insert("repository".into(), serde_json::json!("acme/payments"));
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim.id.as_str().to_owned(),
-        check: EventCheckRef {
+    let mut event = Event::verdict(
+        claim.id.as_str().to_owned(),
+        EventCheckRef {
             index: check_index,
             digest: check_digest(&claim.checks[check_index]),
         },
         verdict,
-        evidence: (verdict == Verdict::Held).then(|| "libfoo==4.2".to_owned()),
-        commit: "abc1234".into(),
-        store: store_id.into(),
-        producer: Producer(producer),
-        reported_at: at.parse().unwrap(),
-    }
+        "abc1234",
+        store_id,
+        Producer(producer),
+        at.parse().unwrap(),
+    );
+    event.evidence = (verdict == Verdict::Held).then(|| "libfoo==4.2".to_owned());
+    event
 }
 
 /// GET `uri` and return the status and parsed JSON body.

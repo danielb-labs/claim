@@ -6,7 +6,7 @@
 //! the dedup key, and immutability enforced below the trait by the triggers.
 
 use claim_core::Verdict;
-use claim_hub_core::{CheckRef, Event, EventKind, Producer};
+use claim_hub_core::{CheckRef, Event, Producer};
 use claim_hub_store::{Appended, Ledger, Position, SqliteStore, StoreError};
 use tempfile::TempDir;
 
@@ -35,20 +35,20 @@ fn event_in_store(store: &str, run: &str, claim: &str, digest: &str, verdict: Ve
     );
     producer.insert("repository".into(), serde_json::json!("acme/payments"));
     producer.insert("run".into(), serde_json::json!(run));
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim.into(),
-        check: CheckRef {
+    let mut event = Event::verdict(
+        claim,
+        CheckRef {
             index: 0,
             digest: digest.into(),
         },
         verdict,
-        evidence: Some("libfoo==4.2".into()),
-        commit: "8f2c0a1".into(),
-        store: store.into(),
-        producer: Producer(producer),
-        reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
-    }
+        "8f2c0a1",
+        store,
+        Producer(producer),
+        "2026-07-18T06:00:00Z".parse().unwrap(),
+    );
+    event.evidence = Some("libfoo==4.2".into());
+    event
 }
 
 #[tokio::test]
@@ -111,14 +111,18 @@ async fn redelivering_the_same_observation_yields_one_row_and_idempotent_success
     // the same run re-reporting the same check is the same observation, and a
     // changed verdict getting a second row would be a silent double-count.
     let mut tampered = e.clone();
-    tampered.verdict = Verdict::Drifted;
+    tampered.verdict = Some(Verdict::Drifted);
     let third = store.append(&tampered).await.unwrap();
     assert_eq!(third, Appended::Duplicate(pos));
 
     // Exactly one row on the ledger, still the original.
     let all = store.scan_from(Position(0)).await.unwrap();
     assert_eq!(all.len(), 1, "dedup kept a single row");
-    assert_eq!(all[0].event.verdict, Verdict::Held, "the original survived");
+    assert_eq!(
+        all[0].event.verdict,
+        Some(Verdict::Held),
+        "the original survived"
+    );
 }
 
 #[tokio::test]
@@ -170,7 +174,7 @@ async fn a_raw_update_against_events_is_rejected_by_the_trigger() {
 
     // The row is untouched.
     let all = store.scan_from(Position(0)).await.unwrap();
-    assert_eq!(all[0].event.verdict, Verdict::Held);
+    assert_eq!(all[0].event.verdict, Some(Verdict::Held));
 }
 
 #[tokio::test]
@@ -239,7 +243,11 @@ async fn a_raw_insert_or_replace_against_events_is_rejected_by_the_trigger() {
     // The original row is untouched — same verdict, same seq.
     let all = store.scan_from(Position(0)).await.unwrap();
     assert_eq!(all.len(), 1);
-    assert_eq!(all[0].event.verdict, Verdict::Held, "history not rewritten");
+    assert_eq!(
+        all[0].event.verdict,
+        Some(Verdict::Held),
+        "history not rewritten"
+    );
     assert_eq!(all[0].position, Position(1), "seq unchanged");
 }
 
@@ -361,4 +369,117 @@ async fn evidence_none_round_trips_as_none() {
     let back = store.scan_from(Position(0)).await.unwrap();
     assert_eq!(back[0].event.evidence, None, "absent evidence stays absent");
     assert_eq!(back[0].event, e);
+}
+
+/// A nag event carrying its fire key in the producer block, for the nag-ledger tests.
+fn nag_event(fire_key: &str) -> Event {
+    let producer = claim_hub_core::nag::nag_producer(
+        claim_hub_core::Transition::Drifted,
+        &claim_hub_core::FireKey::from_stored(fire_key.to_owned()),
+    );
+    Event::nag(
+        "payments/pin",
+        "deadbeef",
+        "github.com/acme/payments",
+        producer,
+        "2026-07-18T06:00:00Z".parse().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn a_nag_event_round_trips_and_carries_no_verdict() {
+    // A nag lives on the SAME append-only ledger as a verdict, but carries no verdict and no
+    // check (invariant #4): it can never be read as a verdict. It round-trips losslessly.
+    let (store, _dir) = fresh_store().await;
+    let nag = nag_event(&"f".repeat(64));
+    let appended = store.append(&nag).await.unwrap();
+    assert!(matches!(appended, Appended::New(_)), "the nag appended");
+
+    let back = store.scan_from(Position(0)).await.unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].event.kind, claim_hub_core::EventKind::Nag);
+    assert_eq!(back[0].event.verdict, None, "a nag carries no verdict");
+    assert_eq!(back[0].event.check, None, "a nag is about no single check");
+    assert_eq!(back[0].event, nag, "the nag round-trips losslessly");
+}
+
+#[tokio::test]
+async fn appending_the_same_nag_twice_dedups_on_the_fire_key() {
+    // Fire-once is derived from the ledger, but the dedup index is a second line of defense:
+    // the nag's fire key is its dedup digest, so the same fire key twice yields one row.
+    let (store, _dir) = fresh_store().await;
+    let nag = nag_event(&"a".repeat(64));
+    let first = store.append(&nag).await.unwrap();
+    let second = store.append(&nag).await.unwrap();
+    assert_eq!(
+        second,
+        Appended::Duplicate(first.position()),
+        "the same nag dedups to the original"
+    );
+    assert_eq!(
+        store.scan_from(Position(0)).await.unwrap().len(),
+        1,
+        "one nag row, not two"
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_event_with_no_verdict_is_rejected_and_writes_nothing() {
+    // The columns are nullable so a nag can hold NULL for verdict/check, but a VERDICT-kind
+    // event with a NULL verdict is unreadable: every later `scan_from` would fail on "a
+    // verdict row has no verdict", bricking the whole hub on an append-only ledger with no
+    // recovery. The write boundary must reject it, symmetrically with the missing-check
+    // guard — the opposite of the nag case, which legitimately carries no verdict.
+    let (store, _dir) = fresh_store().await;
+    let mut verdict_no_verdict = event("run-1", "payments/pin", &"a".repeat(64), Verdict::Held);
+    verdict_no_verdict.verdict = None;
+    assert_eq!(
+        verdict_no_verdict.kind,
+        claim_hub_core::EventKind::Verdict,
+        "still a verdict-kind event"
+    );
+
+    let err = store
+        .append(&verdict_no_verdict)
+        .await
+        .expect_err("a verdict-kind event with no verdict is rejected");
+    assert!(
+        matches!(err, StoreError::Corrupt { .. }),
+        "the rejection is loud corruption, not a coerced write: {err}"
+    );
+
+    // Nothing was written: the ledger stays empty, so no unreadable NULL row can poison a
+    // later scan.
+    assert!(
+        store.scan_from(Position(0)).await.unwrap().is_empty(),
+        "the rejected verdict added no row"
+    );
+}
+
+#[tokio::test]
+async fn fired_keys_derives_the_set_of_appended_nags() {
+    // The router's memory is derived from the ledger's nag events, not stored: `fired_keys`
+    // rebuilds it by scanning. A verdict event contributes no fire key; two distinct nags do.
+    use claim_hub_store::fired_keys;
+    let (store, _dir) = fresh_store().await;
+    store
+        .append(&event(
+            "run-1",
+            "payments/pin",
+            &"d".repeat(64),
+            Verdict::Held,
+        ))
+        .await
+        .unwrap();
+    store.append(&nag_event(&"1".repeat(64))).await.unwrap();
+    store.append(&nag_event(&"2".repeat(64))).await.unwrap();
+
+    let keys = fired_keys(&store).await.unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "two nags → two fire keys (the verdict adds none)"
+    );
+    assert!(keys.contains(&claim_hub_core::FireKey::from_stored("1".repeat(64))));
+    assert!(keys.contains(&claim_hub_core::FireKey::from_stored("2".repeat(64))));
 }

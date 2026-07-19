@@ -11,7 +11,7 @@
 
 use claim_core::{parse_claim_file, Claim, Timestamp, Verdict};
 use claim_hub_core::deriver::{derive, ClaimEntry, DeriverConfig, RegistrySnapshot, Standing};
-use claim_hub_core::{check_digest, CheckRef, Event, EventKind, Memo, Producer};
+use claim_hub_core::{check_digest, CheckRef, Event, Memo, Producer};
 
 fn ts(s: &str) -> Timestamp {
     s.parse().unwrap()
@@ -25,20 +25,18 @@ fn claim_with(id: &str, hub: &str) -> Claim {
 fn verdict_event(claim: &Claim, verdict: Verdict, at: &str) -> Event {
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!("1"));
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim.id.as_str().to_owned(),
-        check: CheckRef {
+    Event::verdict(
+        claim.id.as_str().to_owned(),
+        CheckRef {
             index: 0,
             digest: check_digest(&claim.checks[0]),
         },
         verdict,
-        evidence: None,
-        commit: "abc".into(),
-        store: "s".into(),
-        producer: Producer(producer),
-        reported_at: ts(at),
-    }
+        "abc",
+        "s",
+        Producer(producer),
+        ts(at),
+    )
 }
 
 fn registry(version: u64, claims: Vec<Claim>) -> RegistrySnapshot {

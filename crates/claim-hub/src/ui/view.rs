@@ -250,12 +250,17 @@ impl HistoryRow {
     fn from_event(seq: u64, event: &claim_hub_core::Event) -> Option<Self> {
         match event.kind {
             claim_hub_core::EventKind::Verdict => {}
+            // A nag (or a later kind) is not a verdict; excluded, not rendered as one.
             _ => return None,
         }
+        // A verdict event carries both its verdict and its check; a verdict-kind event
+        // missing either is malformed telemetry, excluded rather than rendered with a
+        // fabricated verdict or check (invariant #4/#6).
+        let (verdict, check) = (event.verdict?, event.check.as_ref()?);
         Some(Self {
             seq: seq.to_string(),
-            verdict: verdict_word(event.verdict),
-            check_index: event.check.index.to_string(),
+            verdict: verdict_word(verdict),
+            check_index: check.index.to_string(),
             commit: event.commit.clone(),
             reported_at: event.reported_at.to_string(),
             evidence: event.evidence.clone(),

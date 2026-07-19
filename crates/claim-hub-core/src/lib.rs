@@ -31,6 +31,11 @@
 //! exactly the three causes (a new event, a registry change, the clock crossing a
 //! threshold) — a cache, never a store.
 //!
+//! hub-11 adds the router's pure core ([`nag`]): the [`Transition`]s the router routes,
+//! the deterministic [`FireKey`] that makes a fire idempotent by diffing against the
+//! ledger's `nag` events (invariant #3, no mutable flag), and the grouping that turns one
+//! commit breaking N claims into one nag item.
+//!
 //! What is deliberately *not* here: any store, the ingest route, or anything async —
 //! those are later hub items. This crate is types and pure functions.
 
@@ -38,6 +43,7 @@ pub mod deriver;
 pub mod envelope;
 pub mod evidence;
 pub mod memo;
+pub mod nag;
 pub mod wire;
 
 mod digest;
@@ -50,3 +56,8 @@ pub use digest::check_digest;
 pub use envelope::{CheckRef, Event, EventKind, Producer};
 pub use evidence::{cap_evidence, EVIDENCE_CAP};
 pub use memo::Memo;
+pub use nag::{
+    fire_key_of, group_transitions, lapsed_skips, nag_producer, pending_transitions, DriftedClaim,
+    FireKey, NagGroup, PendingTransition, Transition, NAG_FIRE_KEY, NAG_PRINCIPAL,
+    NAG_PRINCIPAL_KEY, NAG_RUN_KEY, NAG_TRANSITION_KEY,
+};

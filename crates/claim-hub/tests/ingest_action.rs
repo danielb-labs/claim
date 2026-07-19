@@ -83,7 +83,7 @@ async fn a_valid_push_succeeds_and_the_hub_records_the_event() {
     let events = hub.store.scan_from(Position(0)).await.unwrap();
     assert_eq!(events.len(), 1, "the valid push landed one event");
     assert_eq!(events[0].event.claim, PIN_ID);
-    assert_eq!(events[0].event.verdict, claim_core::Verdict::Held);
+    assert_eq!(events[0].event.verdict, Some(claim_core::Verdict::Held));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -194,7 +194,7 @@ async fn a_drifted_report_is_still_pushed_not_swallowed() {
     );
     let events = hub.store.scan_from(Position(0)).await.unwrap();
     assert_eq!(events.len(), 1, "the drift was pushed as telemetry");
-    assert_eq!(events[0].event.verdict, claim_core::Verdict::Drifted);
+    assert_eq!(events[0].event.verdict, Some(claim_core::Verdict::Drifted));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -226,7 +226,7 @@ async fn a_broken_report_is_still_pushed_not_swallowed() {
         1,
         "the broken verdict was pushed as telemetry"
     );
-    assert_eq!(events[0].event.verdict, claim_core::Verdict::Broken);
+    assert_eq!(events[0].event.verdict, Some(claim_core::Verdict::Broken));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

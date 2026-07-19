@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use claim_core::{parse_claim_file, Timestamp, Verdict};
 use claim_hub::app::{AppState, ReadClock};
-use claim_hub_core::{check_digest, CheckRef, Event, EventKind, Producer};
+use claim_hub_core::{check_digest, CheckRef, Event, Producer};
 use claim_hub_store::{Ledger, RegisteredClaim, Registry, SqliteStore};
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -35,23 +35,20 @@ async fn app_with_seed() -> axum::Router {
         .unwrap();
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), json!("run-1"));
-    store
-        .append(&Event {
-            kind: EventKind::Verdict,
-            claim: "payments/pin".into(),
-            check: CheckRef {
-                index: 0,
-                digest: check_digest(&claim.checks[0]),
-            },
-            verdict: Verdict::Held,
-            evidence: Some("libfoo==4.2".into()),
-            commit: "abc1234".into(),
-            store: STORE.into(),
-            producer: Producer(producer),
-            reported_at: "2026-07-18T00:00:00Z".parse().unwrap(),
-        })
-        .await
-        .unwrap();
+    let mut event = Event::verdict(
+        "payments/pin",
+        CheckRef {
+            index: 0,
+            digest: check_digest(&claim.checks[0]),
+        },
+        Verdict::Held,
+        "abc1234",
+        STORE,
+        Producer(producer),
+        "2026-07-18T00:00:00Z".parse().unwrap(),
+    );
+    event.evidence = Some("libfoo==4.2".into());
+    store.append(&event).await.unwrap();
 
     let read_clock: ReadClock = Arc::new(|| READ_NOW.parse::<Timestamp>().expect("valid instant"));
     claim_hub::build_app(AppState::new(store, None).with_read_clock(read_clock))

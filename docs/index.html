@@ -396,6 +396,20 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     <code>503</code>, never a silent allow. Scopes are <em>read broadly, act narrowly</em> &mdash; v1 has no
     write surface, so <code>read</code> is the only scope any route requires. Open reads for a trusted private
     network are an explicit opt-in (<code>open_reads = true</code>), never the default.</p>
+    <p>The hub&rsquo;s reason to exist is the <strong>router / nag</strong>: the part that notices when a
+    fact stops holding and routes it to whoever owns the decision &mdash; the nag over time the
+    stateless CLI cannot issue. It watches three transitions &mdash; a claim <strong>drifting</strong>, a
+    claim going <strong>stale by the clock</strong> (aged past its window with no new verdict, caught by a
+    background tick since nothing else would notice), and a <strong>skip&rsquo;s <code>until</code>
+    lapsing</strong>. Each fires <strong>exactly once</strong>, and fire-once is <em>derived from the
+    ledger</em>, not stored: the router appends a <code>nag</code> event and diffs against those events, so
+    there is no &ldquo;notified&rdquo; flag to lose and a restart never re-nags. Owners resolve from
+    <strong>CODEOWNERS</strong> at fire time (from the synced git mirror, never a stored field), matched
+    against the claim&rsquo;s <strong>real synced path</strong> &mdash; the same path the CI glue matches, so
+    the two never disagree; one commit breaking many claims is <strong>one grouped nag</strong>; and a
+    transition with no owner is a first-class <strong>dead-letter</strong>, visible, never dropped. The hub <em>renders</em> the nag
+    content and serves it at <code>GET /api/nags</code>; the CI glue <em>delivers</em> it (the standing
+    issue and PR comments) &mdash; the hub holds no forge write credential.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
     once you have made the read-auth decision (an IdP, a minted token, or the explicit open-reads opt-in)

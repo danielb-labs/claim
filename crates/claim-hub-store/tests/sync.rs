@@ -501,8 +501,10 @@ async fn a_snapshot_write_is_atomic_so_a_failure_never_drops_a_findings_nag() {
         statement: id.to_owned(),
         supports: vec![],
         commit: "c1".to_owned(),
+        path: format!(".claims/{id}.md"),
         check_digests: Vec::new(),
         hub: Default::default(),
+        check_skips: Vec::new(),
     };
     let finding = |file: &str| SyncFinding {
         store: STORE_ID.to_owned(),

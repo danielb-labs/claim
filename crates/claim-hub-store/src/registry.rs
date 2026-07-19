@@ -60,6 +60,19 @@ pub struct RegisteredClaim {
     pub supports: Vec<String>,
     /// The commit sha this claim was read at.
     pub commit: String,
+    /// The claim file's real store-relative path — `.claims/payments/pin.md` for a
+    /// standalone file, or the host file's path (`CLAUDE.md`, `docs/AGENTS.md`) for an
+    /// embedded claim.
+    ///
+    /// Persisted for the router's owner resolution (hub-11): CODEOWNERS routing is per-file,
+    /// and a claim's id does **not** determine its path — the file can live at a
+    /// non-canonical path or be embedded in a host file. Matching a synthetic
+    /// `.claims/<id>.md` instead would route a claim to a directory owner it never belongs
+    /// to (a wrong owner, worse than a dead-letter — invariant #6). Registry sync has the
+    /// real path at parse time ([`claim_core::Source::path`]), so it records it here and the
+    /// router matches CODEOWNERS against it — the same path the CI glue matches, so hub-side
+    /// and glue-side owners agree.
+    pub path: String,
     /// Each check's canonical content digest ([`claim_hub_core::check_digest`]), in the
     /// claim's declared check order — so `check_digests[i]` is the identity of the
     /// check the CLI report calls index `i`.
@@ -85,6 +98,18 @@ pub struct RegisteredClaim {
     /// cross-crate struct literal). `HubHints` is the deriver's own constructible mirror
     /// of the two frozen v1 hints, so it flows to the deriver with no conversion.
     pub hub: claim_hub_core::HubHints,
+    /// Each check's declared skip, in the claim's declared check order — so
+    /// `check_skips[i]` is the skip (if any) on the check `check_digests[i]` identifies.
+    /// `None` for a check with no skip (the common case).
+    ///
+    /// Persisted for hub-11's router: a skip's `until` lapsing is a transition the router
+    /// routes (the deferred check is due again), and the deriver detects it only if the
+    /// skip's expiry reaches it. Registry sync has each check's skip in hand at parse time,
+    /// so it records it here; the deriver reads it into its per-check
+    /// [`DerivedSkip`](claim_hub_core::DerivedSkip). A skip is never a pass — it never
+    /// freshens a claim — so this bears on *lapsed-skip detection and the queue*, not on the
+    /// verified/stale/drifted standing.
+    pub check_skips: Vec<Option<claim_hub_core::DerivedSkip>>,
 }
 
 impl RegisteredClaim {
@@ -94,8 +119,10 @@ impl RegisteredClaim {
     /// The one place a `Claim` becomes a `RegisteredClaim`, so registry sync and any test
     /// that seeds a claim map the same fields the same way — the check digests via the one
     /// canonical [`claim_hub_core::check_digest`], the supports targets as their canonical
-    /// strings, and the `hub:` hints straight across. Keeping this a single constructor is
-    /// what stops the sync path and a test seeder from drifting on how a claim is stored.
+    /// strings, the `hub:` hints straight across, and the claim's real store-relative path
+    /// from its [`Source`](claim_core::Source) (the file's own path, which is where the
+    /// router matches CODEOWNERS). Keeping this a single constructor is what stops the sync
+    /// path and a test seeder from drifting on how a claim is stored.
     #[must_use]
     pub fn from_claim(claim: &claim_core::Claim, commit: &str) -> Self {
         Self {
@@ -107,6 +134,7 @@ impl RegisteredClaim {
                 .map(|t| t.as_str().to_owned())
                 .collect(),
             commit: commit.to_owned(),
+            path: claim.source.path().to_owned(),
             check_digests: claim
                 .checks
                 .iter()
@@ -116,6 +144,16 @@ impl RegisteredClaim {
                 recheck: claim.hub.recheck,
                 max_age: claim.hub.max_age,
             },
+            check_skips: claim
+                .checks
+                .iter()
+                .map(|check| {
+                    check.skip.as_ref().map(|skip| claim_hub_core::DerivedSkip {
+                        reason: skip.reason.clone(),
+                        until: skip.until,
+                    })
+                })
+                .collect(),
         }
     }
 }

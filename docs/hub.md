@@ -17,10 +17,12 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > over the deriver), the **web UI** (server-rendered pages over the same read model, each
 > with a machine-readable **markdown twin**), **`/llms.txt`** (the agent-facing index of every
 > surface), the **hub MCP** (the agent binding — five read-only tools over the same read
-> model, mounted at `/mcp`), and **read authentication** (a bearer-token layer over every read
-> surface — an IdP or hub-minted scoped tokens, secure by default). A freshly booted hub reports
-> a truthful *empty* position — head 0, version 0 — until a sync populates the registry and a CI
-> lane starts pushing verdicts through the ingest gate.
+> model, mounted at `/mcp`), the **router / nag** (it notices when a fact drifts, goes stale by
+> the clock, or a skip lapses, routes each to its CODEOWNERS owner exactly once, and serves the
+> rendered nag content at `GET /api/nags` for the CI glue to deliver), and **read authentication**
+> (a bearer-token layer over every read surface — an IdP or hub-minted scoped tokens, secure by
+> default). A freshly booted hub reports a truthful *empty* position — head 0, version 0 — until a
+> sync populates the registry and a CI lane starts pushing verdicts through the ingest gate.
 
 ## Running the binary
 
@@ -103,6 +105,16 @@ declares neither its own window nor a config default stays `verified` on a passi
 absent a window, the hub does not invent one. `max_age_override` is the operator's final
 word on cadence for this environment; `default_max_age` is the fallback for claims that
 declare none of their own.
+
+The `[router]` section tunes the **router / nag** tick (see below): `period_secs` is how
+often it re-derives and fires a nag for a newly-noticed transition. Its default (300, five
+minutes) bounds how quickly a claim aging into stale by the clock alone is nagged; a shorter
+period nags sooner at a negligible re-derivation cost:
+
+```toml
+[router]
+period_secs = 300   # how often the router tick runs (default 300 = 5 minutes)
+```
 
 The `[read_auth]` section configures **read authentication** for the API, UI, and MCP
 surfaces — see [Read authentication](#read-authentication) below. It is **secure by
@@ -613,6 +625,70 @@ caught up. A caught-up poll returns an empty `events` array with `next_cursor` u
 absent or negative cursor reads from the start. The events are the verbatim ledger envelopes
 (each flattened alongside its `seq`), so the feed is the raw evidence the standings derive
 from — again, dated observations to weigh, not commands.
+
+## The router and the nag (`GET /api/nags`)
+
+The read surfaces answer "what is the state right now." The **router** is the part that
+*notices when a fact stops holding and routes it to whoever owns the decision* — the whole
+reason the hub exists (invariant #6, the nag over time the stateless CLI cannot issue). It
+watches three **transitions**:
+
+- **`drifted`** — a claim's latest verdict says the fact is false now;
+- **`stale`** — a claim aged past its freshness window with **no new verdict**, purely by the
+  clock crossing its `max-age` (a certificate expiring); and
+- **`lapsed-skip`** — a check's skip declared an `until` that has now passed, so the deferred
+  check is due again.
+
+A background tick re-derives the read model on a cadence (`[router].period_secs`, default 300)
+and fires each **new** transition exactly once. This is what catches a fact aging into stale:
+there is no new verdict to trigger on, so only the tick notices.
+
+**Fire-once is derived from the ledger, not stored.** When the router fires, it appends a
+`nag` event to the same append-only ledger the verdicts live on. "Already nagged" is then
+*derived* by diffing the current transitions against those `nag` events — there is no mutable
+"notified" flag anywhere (invariant #3), so a hub restart re-derives the identical set from
+the ledger and never re-nags. A `nag` event is the hub's own scheduling telemetry: it carries
+no verdict and no single check, so it can never be read as a verdict (invariant #4).
+
+**Owners resolve from CODEOWNERS at fire time**, read from the synced git mirror — never a
+stored owner field (invariant #3), and never a forge call. The match is against the claim's
+**real synced path** (a standalone file's own path, or an embedded claim's host file), not a
+path guessed from the id — a claim's id does not fix where its file lives, so guessing would
+route to a directory owner the claim never belongs to. Because the path is real and the
+matcher is GitHub's last-matching-pattern-wins rule — the same path and rule the CI glue
+uses — a hub-side owner and a glue-side owner never disagree. **One commit breaking N claims
+is one grouped nag**, not N (the drift groups on the breaking commit). **A transition with no
+resolvable owner is a dead-letter** — first-class in the queue, visible, never silently
+dropped (invariant #6). Owners are re-resolved at read time, so a claim that dead-lettered
+for lack of an owner is delivered once an owner appears, and a re-owned claim shows its new
+owner — without either re-firing (the fire key does not depend on the owner).
+
+The hub **renders** nag content and serves it; the CI glue **delivers** it (the standing issue
+and PR comments). The hub holds no forge write credential in v1. `GET /api/nags` is what the
+glue pulls — a **read** that resolves owners and reports the queue but fires nothing (only the
+tick fires):
+
+```sh
+curl -s 'http://127.0.0.1:8080/api/nags'
+```
+
+```json
+{
+  "nags": [
+    { "transition": "drifted", "store": "github.com/acme/payments", "commit": "deadbeef",
+      "claims": [ { "id": "payments/libfoo-pin", "commit": "deadbeef",
+                    "statement": "libfoo is pinned to 4.2", "supports": ["decision:pin"] } ],
+      "owners": ["@acme/payments"], "fire_key": "9f2c…", "fired_this_pass": false }
+  ],
+  "dead_letters": [],
+  "fired_this_pass": 0
+}
+```
+
+`nags` are the owner-resolved items; `dead_letters` are the transitions with no owner (a nag
+about the inability to nag). `fired_this_pass` at the top counts marks a *tick* appended (a
+read is always `0`); each item's `fired_this_pass` says whether that item's mark was newly
+appended this pass. `fire_key` is the stable identity a transition is nagged once per.
 
 ## The web UI, the markdown twins, and `llms.txt`
 

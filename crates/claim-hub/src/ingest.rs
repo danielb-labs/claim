@@ -35,7 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use claim_core::{ClaimId, Timestamp};
 use claim_hub_core::wire::{CheckReport, CheckResult};
-use claim_hub_core::{cap_evidence, CheckRef, Event, EventKind};
+use claim_hub_core::{cap_evidence, CheckRef, Event};
 use claim_hub_store::{Appended, Ledger, Registry, Rejections};
 use serde::Serialize;
 use std::str::FromStr;
@@ -318,20 +318,20 @@ fn build_event(
     check: &CheckResult,
     reported_at: Timestamp,
 ) -> Event {
-    Event {
-        kind: EventKind::Verdict,
-        claim: claim_id.to_owned(),
-        check: CheckRef {
+    let mut event = Event::verdict(
+        claim_id.to_owned(),
+        CheckRef {
             index,
             digest: digest.to_owned(),
         },
-        verdict: check.verdict,
-        evidence: check.evidence.as_deref().map(cap_evidence),
-        commit: commit.to_owned(),
-        store: store.to_owned(),
-        producer: producer.producer().clone(),
+        check.verdict,
+        commit.to_owned(),
+        store.to_owned(),
+        producer.producer().clone(),
         reported_at,
-    }
+    );
+    event.evidence = check.evidence.as_deref().map(cap_evidence);
+    event
 }
 
 /// A rejection caused by the envelope (a malformed report, an unknown claim/check).

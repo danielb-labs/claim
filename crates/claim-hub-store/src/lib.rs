@@ -40,10 +40,17 @@
 //! The one implementation is [`SqliteStore`], over a single WAL-mode SQLite file —
 //! the data-ownership invariant made physical (export is `cp`, delete is `rm`) —
 //! implementing [`Ledger`], [`Registry`], [`Findings`], and [`Rejections`].
+//!
+//! The [`nag`] module is the router's storage-side half (hub-11): resolving a claim's
+//! owner from CODEOWNERS in the synced mirror at fire time ([`resolve_owners`], invariant
+//! #3 — provenance from git, no forge call), and rebuilding the router's fired set from
+//! the ledger's `nag` events ([`fired_keys`], invariant #3 — "already nagged" is derived,
+//! never stored).
 
 pub mod error;
 pub mod findings;
 pub mod ledger;
+pub mod nag;
 pub mod registry;
 pub mod rejections;
 pub mod snapshot;
@@ -53,6 +60,7 @@ pub mod sync;
 pub use error::{Result, StoreError};
 pub use findings::{Findings, SyncFinding};
 pub use ledger::{Appended, Ledger, Position, StoredEvent};
+pub use nag::{fired_keys, owners_for, read_codeowners_at, resolve_owners};
 pub use registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 pub use rejections::Rejections;
 pub use snapshot::{ledger_events, registry_snapshot};
