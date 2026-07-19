@@ -105,7 +105,7 @@ async fn api_get(app: &axum::Router, uri: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn tools_list_over_the_mount_names_the_five_read_tools() {
+async fn tools_list_over_the_mount_names_the_six_read_tools() {
     let app = app_with_seed().await;
     let (status, body) = mcp_post(
         &app,
@@ -121,8 +121,8 @@ async fn tools_list_over_the_mount_names_the_five_read_tools() {
         .collect();
     assert_eq!(
         names,
-        vec!["context", "dossier", "drifts", "due", "search"],
-        "the mount advertises the five read tools: {body}"
+        vec!["context", "dossier", "drifts", "due", "search", "skips"],
+        "the mount advertises the six read tools: {body}"
     );
 }
 

@@ -129,7 +129,7 @@ re-check. Derived at read time from the ledger and the clock; nothing here is st
 
 <div class="asof">
   As of ledger head <strong>2</strong>,
-  registry version <strong>2</strong>,
+  registry version <strong>3</strong>,
   clock <strong>2026-07-20T00:00:00Z</strong>.
 </div>
 
@@ -149,9 +149,54 @@ re-check. Derived at read time from the ledger and the clock; nothing here is st
       <td>&mdash;</td>
     </tr>
   
+    <tr>
+      <td><a href="/ui/claims/ops/parked">ops/parked</a></td>
+      <td>github.com/acme/ops</td>
+      <td><span class="badge stale">stale — needs re-verification</span></td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+    </tr>
+  
   </tbody>
 </table>
-<p class="twin-note">1 claim(s) in the queue.</p>
+<p class="twin-note">2 claim(s) in the queue.</p>
+
+
+<h2>Skipped checks</h2>
+<p class="lede">Checks deliberately not run, ranked by age and lapsed <code>until</code> &mdash; a
+skip whose <code>until</code> has passed (the deferred check is due again) leads. A skip is an
+acknowledged, bounded debt, never a pass: it records no verdict, so it never makes a claim
+verified &mdash; it is surfaced here for a look.</p>
+
+
+<table>
+  <thead>
+    <tr><th>claim</th><th>store</th><th>check</th><th>reason</th><th>until</th><th>status</th></tr>
+  </thead>
+  <tbody>
+  
+    <tr>
+      <td><a href="/ui/claims/ops/parked">ops/parked</a></td>
+      <td>github.com/acme/ops</td>
+      <td><code>6bfa447847a65de1dae55f9d44fc3f75e38e06ad52392f3ac409d335c50206df</code></td>
+      <td>no model runner in CI</td>
+      <td>2026-01-01T00:00:00Z</td>
+      <td><span class="badge drifted">lapsed — the deferred check is due again</span></td>
+    </tr>
+  
+    <tr>
+      <td><a href="/ui/claims/ops/parked">ops/parked</a></td>
+      <td>github.com/acme/ops</td>
+      <td><code>2d651de3c87105dc356de92fc44cfa06bf910c46dc38236258c3d92c714813e3</code></td>
+      <td>dashboard behind a flag</td>
+      <td>2027-06-01T00:00:00Z</td>
+      <td><span class="badge verified">within window</span></td>
+    </tr>
+  
+  </tbody>
+</table>
+<p class="twin-note">2 skipped check(s).</p>
 
 
 <footer class="site">

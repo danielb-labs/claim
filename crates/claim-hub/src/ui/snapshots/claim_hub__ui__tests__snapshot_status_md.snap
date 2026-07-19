@@ -11,11 +11,11 @@ zeros, never a fabricated "healthy".
 | field | value |
 |---|---|
 | ledger head | 2 |
-| registry version | 2 |
-| in review queue | 1 |
+| registry version | 3 |
+| in review queue | 2 |
 | rejected ingests | 0 |
 
-_As of ledger head 2, registry version 2, clock 2026-07-20T00:00:00Z._
+_As of ledger head 2, registry version 3, clock 2026-07-20T00:00:00Z._
 
 A rising **rejected ingests** count is the hub telling you telemetry is being turned
 away while the claims it would refresh go stale — watch it. The machine-readable JSON

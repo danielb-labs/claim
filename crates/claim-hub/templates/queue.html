@@ -33,4 +33,33 @@ re-check. Derived at read time from the ledger and the clock; nothing here is st
 </table>
 <p class="twin-note">{{ rows.len() }} claim(s) in the queue.</p>
 {% endif %}
+
+<h2>Skipped checks</h2>
+<p class="lede">Checks deliberately not run, ranked by age and lapsed <code>until</code> &mdash; a
+skip whose <code>until</code> has passed (the deferred check is due again) leads. A skip is an
+acknowledged, bounded debt, never a pass: it records no verdict, so it never makes a claim
+verified &mdash; it is surfaced here for a look.</p>
+
+{% if skips.is_empty() %}
+<p class="empty">No skipped checks: every check is running.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>claim</th><th>store</th><th>check</th><th>reason</th><th>until</th><th>status</th></tr>
+  </thead>
+  <tbody>
+  {% for skip in skips %}
+    <tr>
+      <td><a href="{{ skip.dossier_path }}">{{ skip.claim }}</a></td>
+      <td>{{ skip.store }}</td>
+      <td><code>{{ skip.check_digest }}</code></td>
+      <td>{{ skip.reason }}</td>
+      <td>{% match skip.until %}{% when Some with (t) %}{{ t }}{% when None %}&mdash; (indefinite){% endmatch %}</td>
+      <td><span class="badge {% if skip.lapsed %}drifted{% else %}verified{% endif %}">{{ skip.lapsed_label }}</span></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="twin-note">{{ skips.len() }} skipped check(s).</p>
+{% endif %}
 {% endblock %}

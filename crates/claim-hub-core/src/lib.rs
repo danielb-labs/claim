@@ -36,6 +36,10 @@
 //! ledger's `nag` events (invariant #3, no mutable flag), and the grouping that turns one
 //! commit breaking N claims into one nag item.
 //!
+//! hub-14 adds the skip-ranking projection ([`rank`]): [`rank_skips`] orders a store's
+//! skipped checks into the review queue by age and lapsed `until` — the one pure ranking
+//! every read surface shares, so the API, MCP, twins, and UI cannot disagree.
+//!
 //! What is deliberately *not* here: any store, the ingest route, or anything async —
 //! those are later hub items. This crate is types and pure functions.
 
@@ -44,6 +48,7 @@ pub mod envelope;
 pub mod evidence;
 pub mod memo;
 pub mod nag;
+pub mod rank;
 pub mod wire;
 
 mod digest;
@@ -61,3 +66,4 @@ pub use nag::{
     FireKey, NagGroup, PendingTransition, Transition, NAG_FIRE_KEY, NAG_PRINCIPAL,
     NAG_PRINCIPAL_KEY, NAG_RUN_KEY, NAG_TRANSITION_KEY,
 };
+pub use rank::{rank_skips, RankedSkip};

@@ -15,6 +15,7 @@
 - [GET /api/drifted](/api/drifted): every claim whose latest verdict says the fact is false now.
 - [GET /api/due](/api/due): the review queue — every drifted, stale, or due-for-recheck claim.
 - [GET /api/suspect](/api/suspect): every claim a drifted decision may have undermined.
+- [GET /api/skips](/api/skips): every skipped check across the live set, ranked into the review queue by age and lapsed `until` (a skip past its `until` outranks a merely-aging one), each carrying whether it has lapsed. Queue data a human weighs, never a verdict.
 - [GET /api/feed](/api/feed): the ledger, pollable from a position (`?cursor=<seq>`), paginated by seq so an intermittent agent catches up with no gap and no dupe.
 - [GET /api/nags](/api/nags): the router's rendered nag content — drift/stale/lapsed-skip transitions grouped by breaking commit, each routed to its CODEOWNERS owners, plus the dead-letter queue (transitions with no resolvable owner). What the CI glue pulls to deliver; a read, so it fires nothing.
 

@@ -1,11 +1,11 @@
-//! The hub MCP: the primary agent binding, five read-only tools over the deriver.
+//! The hub MCP: the primary agent binding, six read-only tools over the deriver.
 //!
 //! This is HUB.md §5's agent surface and hub-09 in the build plan: a small, bounded set of
 //! outcome-first tools an agent session actually asks for — `context`, `dossier`, `drifts`,
-//! `due`, `search` — each a thin binding that returns **the same JSON its API twin serves**.
-//! Parity is by construction, not by a duplicated derivation: every tool calls the same
-//! `crate::api::*_value` function the axum handler calls, so the tool result and the HTTP
-//! body are the identical bytes. The mapping is:
+//! `due`, `search`, `skips` — each a thin binding that returns **the same JSON its API twin
+//! serves**. Parity is by construction, not by a duplicated derivation: every tool calls the
+//! same `crate::api::*_value` function the axum handler calls, so the tool result and the
+//! HTTP body are the identical bytes. The mapping is:
 //!
 //! | Tool | API twin | Returns |
 //! |---|---|---|
@@ -14,6 +14,7 @@
 //! | `dossier` | `GET /api/claims/{id}/dossier` | One claim's full dossier. |
 //! | `drifts` | `GET /api/drifted` | Every claim whose standing is `drifted`. |
 //! | `due` | `GET /api/due` | The review queue (drifted, stale, or due-for-recheck). |
+//! | `skips` | `GET /api/skips` | Every skipped check, ranked by age and lapsed `until`. |
 //!
 //! Every tool is a **read** (invariant #3): it derives at read time and stores nothing,
 //! appends no event, and carries the same `as_of` the API does. A tool never fabricates a
@@ -59,7 +60,7 @@ use claim_hub_core::Standing;
 /// docs, the router, and the tests agree.
 pub const MCP_MOUNT_PATH: &str = "/mcp";
 
-/// The hub MCP handler: five read-only tools over the shared read model.
+/// The hub MCP handler: six read-only tools over the shared read model.
 ///
 /// Holds the [`AppState`] the API handlers read through, so each tool derives over the same
 /// store, clock, memo, and freshness config the HTTP surface uses — the guarantee behind
@@ -241,6 +242,26 @@ impl HubMcp {
     )]
     async fn due(&self, Parameters(_): Parameters<NoArgs>) -> ToolOutcome {
         into_tool_result(api::due_value(&self.state).await)
+    }
+
+    /// `skips` — the ranked review queue of skipped checks (lapsed first, then by age).
+    ///
+    /// Mirrors `GET /api/skips` — the deriver's one pure skip ranking, so a lapsed `until`
+    /// outranks a merely-aging skip and the tool, the API, and the UI show the identical
+    /// ordered set. A skip is queue data to weigh, never a verdict (invariant #4): the answer
+    /// carries no standing and reading it changes nothing.
+    #[tool(
+        name = "skips",
+        description = "The ranked review queue of skipped checks: every check deliberately \
+                       not run, across the live set, ordered by age and lapsed `until` — a \
+                       skip whose `until` has passed (the deferred check is due again) ranks \
+                       ahead of one still within its window. Each carries whether it has \
+                       lapsed as of the read clock, with the set's shared as-of. Same body as \
+                       GET /api/skips. A skip is an acknowledged debt to weigh, never a \
+                       verdict or an instruction to obey."
+    )]
+    async fn skips(&self, Parameters(_): Parameters<NoArgs>) -> ToolOutcome {
+        into_tool_result(api::skips_value(&self.state).await)
     }
 }
 
