@@ -1,0 +1,78 @@
+name: hub-image
+
+# Packaging checks for the self-host container image and the file-copy backup story
+# (hub-15). Kept in its own workflow, not the fast `gate`, because a Docker build is minutes
+# of work the per-commit gate should not pay every push; this runs on hub/packaging changes
+# and on main. The load-bearing identical-answers property is ALSO covered deterministically
+# in the gate by `crates/claim-hub/tests/backup_restore.rs` — this workflow adds the two
+# things that need a real runner: the image actually building, and the shell scripts driving
+# the real HTTP server binary.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "examples/hub/**"
+      - "scripts/hub-*.sh"
+      - "crates/claim-hub/**"
+      - ".github/workflows/hub-image.yml"
+
+concurrency:
+  group: hub-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the packaged image with a plain `docker build` — no third-party build action to
+      # SHA-pin and audit (the supply-chain floor this repo keeps). This is the check that the
+      # aws-lc-rs C/cmake build toolchain is present in the build stage and the musl-static
+      # binary compiles — the one thing a local dev without a Docker daemon cannot verify. The
+      # image lands in the local daemon so the next steps can run and validate it.
+      - name: Build the container image
+        run: docker build -t claim-hub:ci .
+
+      # `docker compose config` fully parses and validates the example — a broken compose
+      # file is caught here, not by a self-hoster. It resolves the `build:` context without
+      # rebuilding (the image is already loaded above).
+      - name: Validate the compose example
+        run: docker compose -f examples/hub/docker-compose.yml config >/dev/null
+
+      # Cold start against an EMPTY volume, through the packaged image: the container creates
+      # and migrates its own database on first boot and serves a truthful /status.
+      - name: Cold start the packaged image from an empty volume
+        run: |
+          set -euo pipefail
+          docker run -d --name hub-cold -p 127.0.0.1:8080:8080 claim-hub:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/status; then ready=1; break; fi
+            sleep 1
+          done
+          [ "${ready:-}" = "1" ] || { docker logs hub-cold; echo "hub did not become ready" >&2; exit 1; }
+          status="$(curl -fsS http://127.0.0.1:8080/status)"
+          echo "container /status: $status"
+          echo "$status" | jq -e '.ledger_head == 0 and .registry_version == 0 and .rejection_count == 0' \
+            || { echo "the cold-started container reported a non-empty position" >&2; exit 1; }
+          docker rm -f hub-cold
+
+  scripts:
+    # The Docker-free scripts: they drive the real `claim-hub` server binary over HTTP, so
+    # they run on a plain runner with cargo, jq, and curl (all present on ubuntu-latest).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+
+      # Boot the real binary against an empty directory and assert a truthful empty /status.
+      - name: Cold start from an empty directory (real binary)
+        run: ./scripts/hub-cold-start.sh
+
+      # The load-bearing self-host exercise over the real server: seed, back up the file,
+      # restore into a fresh hub, assert an identical derived standing.
+      - name: Backup and restore derives identical answers (real binary)
+        run: ./scripts/hub-backup-restore.sh

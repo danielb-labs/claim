@@ -257,15 +257,112 @@ git fixture, syncs it, POSTs one attested `held` verdict through the ingest gate
 into `stale` with no new event.
 
 To run a hub against an empty data directory and watch it stand up its own database on
-first boot, use the compose example (a minimal from-source boot; the packaged container
-image is a later item):
+first boot, use the compose example, which now boots the **packaged container image**:
 
 ```sh
-docker compose -f examples/hub/docker-compose.yml up
+docker compose -f examples/hub/docker-compose.yml up --build
 # in another shell:
 curl -s http://127.0.0.1:8080/status   # => head 0 / version 0 on a fresh volume
 ```
 
 The `hub-data` volume starts empty and holds `hub.db`; the hub creates and migrates it on
 first boot. Export the hub by copying that file, delete it by removing the volume — export
-is a copy, delete is an `rm` (HUB.md §1).
+is a copy, delete is an `rm` (HUB.md §1). The next section covers this ownership story in
+full.
+
+## Self-host: run it, own it, back it up, leave
+
+The hub is **one binary plus one SQLite file the customer owns** (HUB.md §1, §4). There is
+no product-run database, no phone-home, and no central store. Everything the hub knows lives
+in that file: the append-only verdict ledger and the git-mirror registry it derives standing
+from. That makes the ownership operations plain file operations — stated here as the things
+you actually run.
+
+### Run the container
+
+The packaged image is a small musl-static binary plus the two runtime dependencies the hub
+genuinely needs: `git` (registry sync shells out to it) and CA certificates (the JWKS fetch
+over HTTPS validates GitHub's certificate against the OS trust store). Build it from the
+repository's `Dockerfile`, or pull a prebuilt tag you have pushed to your own registry:
+
+```sh
+# Build the image from source.
+docker build -t claim-hub:local .
+
+# Run it against a customer-owned volume. The volume starts EMPTY; the hub creates and
+# migrates hub.db in it on first boot. Nothing else is installed.
+docker run -d --name hub \
+  -p 127.0.0.1:8080:8080 \
+  -v hub-data:/data \
+  claim-hub:local
+
+curl -s http://127.0.0.1:8080/status   # => {"ledger_head":0,"registry_version":0,"rejection_count":0}
+```
+
+The image sets `CLAIM_HUB_LISTEN=0.0.0.0:8080` and `CLAIM_HUB_DATABASE=/data/hub.db` so it
+binds a reachable address and lands its database on the mounted volume with no config file at
+all. To configure connected stores and the ingest gate's `[oidc]` trust, drop a `hub.toml`
+into the mounted volume (see [Configuration](#configuration) above) — env overrides still
+win, so the address and database path stay correct regardless.
+
+`examples/hub/docker-compose.yml` is the same run as a compose file, mounting one named
+volume for the one owned file.
+
+> **The single caveat to "static."** The build stage needs a C toolchain and `cmake`: the
+> HTTPS client's TLS backend (`aws-lc-rs`, via reqwest/rustls) compiles C and assembly. The
+> `Dockerfile`'s build stage installs them; the runtime image needs none of it. The one
+> runtime dependency beside the binary is the `git` the image ships.
+
+### Own, export, and delete the data — it is one file
+
+The whole hub is `hub.db` (with its `-wal`/`-shm` sidecars while running). So:
+
+- **Export** is a copy: `docker compose cp hub:/data/hub.db ./hub.db`, or `cp
+  /path/to/hub.db /elsewhere/` for a bare-binary hub. That file *is* your hub's history.
+- **Delete** is an `rm`: remove the file, or `docker compose down -v` to destroy the volume.
+  There is no server-side remnant, no soft-delete, no product-held copy.
+- **Leave** is taking the file: stand up `claim-hub` anywhere against a copy of `hub.db` and
+  it derives the identical answers — proven by the backup-restore exercise below. There is no
+  migration to escape, because there was never a store you did not control.
+
+### Back up
+
+Two supported ways, both to storage **you** control:
+
+1. **Litestream (continuous, near-real-time).** [Litestream](https://litestream.io) streams
+   the SQLite WAL to S3-compatible object storage as it is written, so a crash loses seconds,
+   not a day. It runs as an operational sidecar next to the hub — no code dependency, no hub
+   change — pointed at the same `hub.db`. Restore is `litestream restore` into a fresh data
+   directory, then boot the hub over it. Use this when the ledger is load-bearing enough that
+   point-in-time recovery matters.
+
+2. **Plain file copy (periodic, zero-dependency).** Because the hub is one file, a copy is a
+   backup. The consistent way to copy a *live* hub's database is to copy `hub.db` together
+   with its `-wal` and `-shm` sidecars (a "cold copy" that carries not-yet-checkpointed
+   writes), or to checkpoint the WAL first (`sqlite3 hub.db 'PRAGMA wal_checkpoint(TRUNCATE);'`)
+   and copy `hub.db` alone. A stopped hub is trivially copyable — the file is complete on a
+   clean shutdown. Schedule it however you back up any file (a nightly `cp` to durable
+   storage is enough for many hubs).
+
+Either way the backup is your file on your storage; the product never holds a copy.
+
+### The backup-restore exercise is tested, not asserted
+
+The ownership promise — *a copy of the file, restored into a fresh hub, derives the identical
+answer* — is checked, not just claimed:
+
+- `scripts/hub-backup-restore.sh` runs the **real server binary**: it seeds a hub (syncs a
+  git fixture, ingests one attested verdict through the real ingest gate), reads a claim's
+  standing over `/api/claims/{id}`, copies the database file, restores it into a second hub,
+  and asserts the restored hub's standing is byte-identical (`standing`, `verified_as_of`,
+  `stale_at`, and the ledger/registry as-of) — only the wall-clock read instant legitimately
+  differs.
+- `scripts/hub-cold-start.sh` boots the real binary against an empty directory and asserts a
+  truthful empty `/status` (head 0 / version 0 / no rejections) — the "point it at a fresh
+  volume and it just works" guarantee.
+- `crates/claim-hub/tests/backup_restore.rs` is the same identical-answers property as a
+  deterministic, in-process gate test (no ports, no external tools), so every branch and CI
+  run proves it.
+
+The container image builds and cold-starts, and the two scripts run, in CI
+(`.github/workflows/hub-image.yml`); the deterministic test runs in the gate.

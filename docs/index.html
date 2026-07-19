@@ -360,6 +360,15 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     single OIDC-authenticated write path a CI lane pushes <code>claim check --json</code> through. A
     forged, expired, or unauthorized push is rejected loudly and counted; the JSON API and the UI
     arrive in later items.</p>
+    <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
+    container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume and
+    stands up its own database on first boot. Because the whole hub is that one file, the ownership
+    operations are file operations &mdash; <strong>export</strong> is a copy, <strong>delete</strong> is
+    an <code>rm</code>, and you <strong>leave</strong> by taking the file: restored into a fresh hub, it
+    derives the identical answers. Back up with <a href="https://litestream.io">Litestream</a> streaming
+    to your own object storage, or a plain periodic file copy. The self-host quickstart states these as
+    the commands you run, and a tested backup-and-restore exercise proves the restored hub answers
+    identically &mdash; the ownership promise is checked, not asserted.</p>
   </section>
 
   <section id="witness">
