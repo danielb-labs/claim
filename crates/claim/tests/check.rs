@@ -428,12 +428,16 @@ fn a_broken_check_json_carries_the_structured_end() {
 
 #[test]
 fn check_with_no_claims_reports_the_full_phrase() {
+    // An empty store verified nothing: the human output says so plainly and, critically,
+    // never "all held" — a false green over zero checks is exactly what this tool must
+    // not emit (invariant #6).
     let repo = ready_repo();
     repo.claim()
         .arg("check")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("No claims to check."));
+        .stdout(predicate::str::contains("No claims match."))
+        .stdout(predicate::str::contains("all held").not());
 }
 
 #[test]
@@ -686,4 +690,292 @@ fn an_expired_until_runs_the_check_and_reports_the_lapse() {
             .contains("skip expired"),
         "the lapse is reported in the note: {check}"
     );
+}
+
+// --- Selection: positional ids and --path narrow which claims run (issue #19). ---
+
+/// Seed a store with three holding claims in distinct namespaces, so selection by id
+/// and by path can be told apart.
+fn selectable_store() -> TestRepo {
+    let repo = ready_repo();
+    repo.write_claim("auth/no-cycles", &pin_claim("auth/no-cycles"));
+    repo.write_claim("billing/tax", &pin_claim("billing/tax"));
+    repo.write_claim("infra/db", &pin_claim("infra/db"));
+    repo
+}
+
+/// The ids in a `check --json` result, sorted, for set assertions.
+fn checked_ids(output: &[u8]) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_slice(output).expect("check --json is one object");
+    let mut ids: Vec<String> = v["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_single_positional_id_checks_only_that_claim() {
+    let repo = selectable_store();
+    let out = repo
+        .claim()
+        .args(["--json", "check", "billing/tax"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(checked_ids(&out), vec!["billing/tax"]);
+}
+
+#[test]
+fn multiple_positional_ids_check_exactly_those_claims() {
+    let repo = selectable_store();
+    let out = repo
+        .claim()
+        .args(["--json", "check", "auth/no-cycles", "billing/tax"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(checked_ids(&out), vec!["auth/no-cycles", "billing/tax"]);
+}
+
+#[test]
+fn an_unknown_positional_id_is_a_usage_error_naming_it() {
+    // A named id asserts "this claim exists," so a typo must be a loud exit 2 naming
+    // the unresolved id — never a silent pass over nothing.
+    let repo = selectable_store();
+    repo.claim()
+        .args(["check", "auth/nocycles"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no claim with id 'auth/nocycles'"));
+}
+
+#[test]
+fn one_unknown_id_among_several_fails_the_whole_run() {
+    // If any named id is unresolved the run is a usage error, even when the others
+    // resolve — the caller asked for a claim that does not exist.
+    let repo = selectable_store();
+    repo.claim()
+        .args(["check", "billing/tax", "does/not-exist"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("'does/not-exist'"));
+}
+
+#[test]
+fn path_selects_the_matching_subset_and_agrees_with_list() {
+    // `check --path` and `list --path` must select the same claims by construction —
+    // both call the shared `claim_matches_path`. Here `auth/` matches exactly one.
+    let repo = selectable_store();
+
+    let checked = repo
+        .claim()
+        .args(["--json", "check", "--path", "auth/"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(checked_ids(&checked), vec!["auth/no-cycles"]);
+
+    let listed_out = repo
+        .claim()
+        .args(["--json", "list", "--path", "auth/"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: serde_json::Value = serde_json::from_slice(&listed_out).unwrap();
+    let listed_ids: Vec<&str> = listed["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed_ids, vec!["auth/no-cycles"], "list agrees with check");
+}
+
+#[test]
+fn ids_and_path_together_select_the_union() {
+    // Named `infra/db` OR under `auth/` → both, never the intersection.
+    let repo = selectable_store();
+    let out = repo
+        .claim()
+        .args(["--json", "check", "infra/db", "--path", "auth/"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(checked_ids(&out), vec!["auth/no-cycles", "infra/db"]);
+}
+
+#[test]
+fn a_path_matching_zero_claims_is_exit_zero_and_says_no_claims_match() {
+    // A path glob may legitimately be empty: exit 0, and the report says plainly that
+    // no claims match — critically NOT "all held", which over zero checks would be a
+    // false green (invariant #6).
+    let repo = selectable_store();
+    repo.claim()
+        .args(["check", "--path", "nowhere/"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("No claims match."))
+        .stdout(predicate::str::contains("all held").not());
+}
+
+#[test]
+fn a_zero_match_path_reports_run_level_zero_counts_in_json() {
+    let repo = selectable_store();
+    let out = repo
+        .claim()
+        .args(["--json", "check", "--path", "nowhere/"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["checked"], 0);
+    assert_eq!(v["ran"], 0, "a zero-match run verified nothing");
+    assert_eq!(v["skipped"], 0);
+    assert!(v["claims"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn selection_does_not_lower_the_load_error_floor() {
+    // A malformed sibling still floors the exit at 2 even when selection narrows to a
+    // holding claim: selection is orthogonal to load faults.
+    let repo = ready_repo();
+    repo.write_claim("good", &pin_claim("good"));
+    repo.write_claim("bad", "---\nchecks: [unterminated\n---\nS.\n");
+
+    repo.claim()
+        .args(["check", "good"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(".claims/bad.md"));
+}
+
+// --- Honest reporting when checks were skipped or nothing ran (issue #17). ---
+
+#[test]
+fn a_run_where_every_check_is_skipped_says_no_checks_ran_not_all_held() {
+    // The bug this fixes: with every selected check skipped, exit 0 is correct (a skip
+    // is an honest deferral), but the summary must say "no checks ran (all skipped)" —
+    // never "all held", which would be a false green over zero verifications.
+    let repo = ready_repo();
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip("parked", "    skip:\n      reason: no runner here\n"),
+    );
+
+    repo.claim()
+        .arg("check")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("no checks ran (all skipped)"))
+        .stdout(predicate::str::contains("all held").not());
+}
+
+#[test]
+fn a_mixed_held_and_skipped_run_names_both_in_the_summary() {
+    // One claim holds, another is skipped: the summary must name both the hold and the
+    // skip — reporting only the hold would hide the deferred check.
+    let repo = ready_repo();
+    repo.write_claim("held", &pin_claim("held"));
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip("parked", "    skip:\n      reason: no runner here\n"),
+    );
+
+    repo.claim()
+        .arg("check")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("held; 1 check(s) skipped"));
+}
+
+#[test]
+fn the_all_held_summary_is_unchanged_when_nothing_is_skipped() {
+    // The baseline: every check ran and held, none skipped → the wording is exactly the
+    // long-standing "all held, all supports resolved".
+    let repo = ready_repo();
+    repo.write_claim("pin", &pin_claim("pin"));
+
+    repo.claim()
+        .arg("check")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("all held, all supports resolved"));
+}
+
+#[test]
+fn run_level_counts_are_present_and_honest_in_json() {
+    // A hub reads `ran`/`skipped` off the envelope to see "this run verified nothing"
+    // without re-deriving it from the per-claim results.
+    let repo = ready_repo();
+    repo.write_claim("held", &pin_claim("held"));
+    repo.write_claim(
+        "parked",
+        &drifting_claim_with_skip("parked", "    skip:\n      reason: no runner here\n"),
+    );
+
+    let out = repo
+        .claim()
+        .args(["--json", "check"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["checked"], 2, "two claims were evaluated");
+    assert_eq!(v["ran"], 1, "one check produced a verdict");
+    assert_eq!(v["skipped"], 1, "one check was skipped");
+}
+
+#[test]
+fn a_review_finding_with_a_skipped_check_reads_as_review_not_all_skipped() {
+    // The end-to-end regression guard for #17's ordering: one claim with a real held
+    // check, a skipped check, and an unresolved `supports` target. The unresolved
+    // support drives exit 1, so the summary must say "review needed" — never "all
+    // skipped", which would mask the review finding behind the deferral. The multi-check
+    // shape also locks the counter distinction: `checked` counts claims (1), `ran` and
+    // `skipped` count checks (1 each).
+    let repo = ready_repo();
+    repo.write_claim(
+        "mixed",
+        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"grep -q 'libfoo==4.2' requirements.txt\"\n  - kind: cmd\n    run: \"false\"\n    skip:\n      reason: no runner here\nsupports:\n  - deleted-decision.md#anchor\n---\nOne check held, one skipped, and a vanished support.\n",
+    );
+
+    let out = repo
+        .claim()
+        .args(["--json", "check"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["checked"], 1, "one claim was evaluated");
+    assert_eq!(v["ran"], 1, "the held check produced a verdict");
+    assert_eq!(v["skipped"], 1, "the skipped check produced no verdict");
+
+    // The human summary reports the review finding, not the skip.
+    repo.claim()
+        .arg("check")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("review needed"))
+        .stdout(predicate::str::contains("all skipped").not())
+        .stdout(predicate::str::contains("all held").not());
 }
