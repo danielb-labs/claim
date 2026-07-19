@@ -10,6 +10,9 @@ the parts you touch.
   embeds live in [`assets/`](assets/) (copied from the repo's `diagrams/`).
 - [`ci.md`](ci.md) — CI and the hub: the exit-code contract, how the hub's GitHub
   Action wraps and POSTs `claim check --json`, the renderer and its JSON shape.
+- [`hub.md`](hub.md) — the hub self-host quickstart: what the hub is, running the
+  `claim-hub` binary against a config and data directory, and what `/status`
+  reports. This is the v1 shell; ingest, the API, and the UI arrive in later items.
 - [`agent-checks.md`](agent-checks.md) — running `kind: agent` checks: the
   `CLAIM_AGENT_CMD` runner contract, the response schema, and the verdict mapping
   that stops a misbehaving runner from faking a pass.

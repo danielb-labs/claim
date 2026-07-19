@@ -1,0 +1,88 @@
+[package]
+name = "claim-hub"
+description = "The hub binary: the axum application shell every later component mounts into. v1 ships config, the tower-layered router, /status, tracing, and boot; ingest, the API, MCP, and the UI arrive in later items."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The hub's storage seam: `/status` reads the ledger head and registry version
+# through the `Ledger`/`Registry` traits, and boot opens (creating if absent) the
+# SQLite database via `SqliteStore::open`, which runs the embedded migrations. One
+# store, shared across handlers.
+claim-hub-store = { path = "../claim-hub-store" }
+# The hub's domain types the store carries, named directly here so the shell shares
+# one set of honesty types with the crates below it; the `/status` handler reads the
+# `Ledger`/`Registry` traits through the store, and later handlers construct `Event`s
+# and read the wire types from this crate.
+claim-hub-core = { path = "../claim-hub-core" }
+# The API framework (HUB-IMPLEMENTATION.md §1.3): tokio-team maintained,
+# tower-composable middleware so auth, tracing, and timeouts each become a testable
+# layer, and native async handlers. rmcp (a later item) mounts into this router, so
+# the JSON API and the hub MCP end up one process on one middleware stack.
+axum = "0.8"
+# Middleware as testable tower layers (HUB-IMPLEMENTATION.md §1.14): the shell's
+# router is assembled from tower layers so a later item adds auth or a timeout as one
+# composable layer rather than framework-specific plumbing. Also the source of
+# `ServiceExt::oneshot`, which drives the app in-process in tests with no bound port
+# and no network.
+tower = { version = "0.5", features = ["util"] }
+# HTTP-specific tower layers: `TraceLayer` gives every request a tracing span so a
+# request carries span context through the stack (HUB-IMPLEMENTATION.md §1.12),
+# structured rather than hand-rolled. Later items reuse this crate for timeouts and
+# static assets.
+tower-http = { version = "0.6", features = ["trace"] }
+# The async runtime axum serves on, and the one rmcp and sqlx also use — the
+# workspace's single async runtime, already justified in item 07. The binary needs
+# the multi-threaded runtime (`rt-multi-thread`), the `#[tokio::main]` macro
+# (`macros`), and the TCP listener (`net`) to bind and serve.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+] }
+# Deserializes the one TOML config file (HUB-IMPLEMENTATION.md §1.12/§1.14):
+# serde-native and tiny. The listen address, database path, and the stub sections
+# later items fill are one serde-derived struct parsed from this format.
+toml = "0.8"
+# Structured spans through the request → handler path (HUB-IMPLEMENTATION.md §1.12):
+# the tokio-ecosystem standard, so a request's work is traceable without hand-rolled
+# logging. Later items add spans through ingest → append → derive on the same fabric.
+tracing = "0.1"
+# The tracing subscriber the binary installs at boot, reading `RUST_LOG` via its env
+# filter so operators tune verbosity without a rebuild. Structured output, not
+# `println` (CLAUDE.md).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The config file's fields and `/status`'s JSON body are serde-derived; reused
+# from the workspace.
+serde = { workspace = true }
+# `/status` renders its position as a JSON object via axum's `Json` responder;
+# reused from the workspace.
+serde_json = { workspace = true }
+# Binary errors: boot failures (a missing config file, a parse error naming the
+# field, a database that will not open) are surfaced with `anyhow`'s context chain,
+# the CLI binary's choice carried over.
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# Drive the assembled axum app in-process via `tower::ServiceExt::oneshot` — no bound
+# port, no network — asserting `/status` against a real, migrated temp store.
+tower = { version = "0.5", features = ["util"] }
+# A throwaway directory for the boot-and-serve test's SQLite file: each test opens a
+# fresh store in a temp dir and drops it. Part of the approved integration-test stack
+# (CLAUDE.md).
+tempfile = "3"
+# The store's trait methods are async, and the in-process app tests await the app's
+# response; both run on a real runtime.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+] }
+# Read `/status`'s response body in tests: `http-body-util`'s `BodyExt::collect`
+# drains the `axum::body::Body` the oneshot returns into bytes to assert on.
+http-body-util = "0.1"
+# The head-advance test builds a sample `Event` whose `verdict` is a
+# `claim_core::Verdict`; named directly so the test constructs the shared type.
+claim-core = { path = "../claim-core" }
