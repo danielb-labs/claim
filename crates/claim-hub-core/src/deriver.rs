@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use claim_core::{Claim, Days, Timestamp, Verdict};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::check_digest;
 use crate::envelope::{Event, EventKind};
@@ -294,9 +294,12 @@ fn effective_recheck(hub: &HubHints) -> Option<Days> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AsOf {
     /// The ledger head sequence the derivation saw: the seq of the last event in
-    /// the input slice, or `None` for an empty ledger. Pagination and the memo key
-    /// on this, never on a wall-clock time.
-    pub ledger_head: Option<u64>,
+    /// the input slice, or `0` for an empty ledger. Ledger positions start at 1, so
+    /// `0` unambiguously means "no events", matching what `/status` and `/api/feed`
+    /// report — one integer contract across every surface, never a `null` on one and
+    /// a number on another. Pagination and the memo key on this, never on a wall-clock
+    /// time.
+    pub ledger_head: u64,
     /// The registry version the derivation read.
     pub registry_version: u64,
     /// The clock instant the derivation used. A standing's freshness is arithmetic
@@ -315,7 +318,7 @@ pub struct AsOf {
 /// `#[non_exhaustive]` reserves the enum for growth: a later deriver rule (windowed
 /// claims, spot-audit) may add a variant, and forcing consumers to match
 /// exhaustively means a new standing can never default to a silent green.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Standing {
@@ -494,7 +497,7 @@ pub fn derive(
     config: &DeriverConfig,
 ) -> ReadModel {
     let as_of = AsOf {
-        ledger_head: events.iter().map(|(seq, _)| *seq).max(),
+        ledger_head: events.iter().map(|(seq, _)| *seq).max().unwrap_or(0),
         registry_version: registry.version,
         clock: now,
     };

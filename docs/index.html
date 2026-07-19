@@ -356,10 +356,16 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     what a drifted claim supports, which at small scale is the same information.)</p>
     <p>Running the hub yourself: the <a href="hub.md">hub self-host quickstart</a> covers the
     <code>claim-hub</code> binary &mdash; a config file, a data directory, the machine-readable
-    <code>/status</code> endpoint, and the <strong>ingest gate</strong> (<code>POST /ingest</code>), the
-    single OIDC-authenticated write path a CI lane pushes <code>claim check --json</code> through. A
-    forged, expired, or unauthorized push is rejected loudly and counted; the JSON API and the UI
-    arrive in later items.</p>
+    <code>/status</code> endpoint, the <strong>ingest gate</strong> (<code>POST /ingest</code>, the
+    single OIDC-authenticated write path a CI lane pushes <code>claim check --json</code> through; a
+    forged, expired, or unauthorized push is rejected loudly and counted), and the
+    <strong>read API</strong> (<code>GET /api/&hellip;</code>) &mdash; claims queries filtered by
+    path, store, standing, or supports target; the <code>drifted</code>/<code>due</code>/<code>suspect</code>
+    sets; a claim&rsquo;s full <strong>dossier</strong> (statement, checks, standing, verdict history,
+    provenance); and a <strong>cursor feed</strong> over the ledger, paginated by seq so an intermittent
+    agent catches up deterministically. Every read response carries its <em>as-of</em> (the ledger
+    position, registry version, and clock it derived from), so a standing can never be older than its
+    evidence. The hub MCP and the web UI arrive in later items over the same read model.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
     no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is

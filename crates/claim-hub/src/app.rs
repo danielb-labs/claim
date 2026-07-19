@@ -126,18 +126,18 @@ impl AppState {
 /// Assemble the hub's axum [`Router`] over `state`, with the shared middleware stack.
 ///
 /// The router is the mount board for every hub surface. It mounts `/status` always and
-/// the read API's `GET /api/claims/{id}` (the hub-07 walking-skeleton read), and the
-/// ingest route `POST /ingest` **only when the state carries a verifier** — a hub with no
-/// OIDC config has no way to authenticate a producer, so it exposes no write path rather
-/// than a route that rejects everything. The remaining mount points are named for the
-/// later items:
+/// the read API ([`api::router`] — the claims queries, the derived sets, the dossier, and
+/// the cursor feed, all under `/api`), and the ingest route `POST /ingest` **only when the
+/// state carries a verifier** — a hub with no OIDC config has no way to authenticate a
+/// producer, so it exposes no write path rather than a route that rejects everything. The
+/// remaining mount points are named for the later items:
 ///
-/// - **hub-08 JSON API** — the full read surface (query sets, dossier, cursor feed),
-///   growing the `/api` nest this item seeds with one endpoint.
 /// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
 ///   `Router::nest_service`.
 /// - **hub-10 UI + twins** — the server-rendered pages, `/llms.txt`, and the `.md`
 ///   twins.
+/// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api` (and MCP); the read
+///   routes are unauthenticated until it lands.
 ///
 /// The [`TraceLayer`] wraps every route so a request carries a tracing span through
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
@@ -145,8 +145,8 @@ impl AppState {
 pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/status", get(status::status))
-        // The read API's one hub-07 endpoint: derive a claim's standing over the live
-        // store. hub-08 grows the rest of the read surface into this same nest.
+        // The read API (hub-08): claims queries, the drifted/due/suspect sets, the
+        // dossier, and the cursor feed, all over the deriver under `/api`.
         .merge(api::router());
     if state.verifier.is_some() {
         // The single telemetry write path (HUB.md §3). Mounted only with a verifier so a
