@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO check_digests (store, claim_id, check_index, digest, skip_reason, skip_until)\n                VALUES (?, ?, ?, ?, ?, ?)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "e5200e670cab11044da802759d42ea5c5584fb115fe4db5b96fd133478df5f5b"
+}

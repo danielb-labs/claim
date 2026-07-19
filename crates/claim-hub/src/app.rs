@@ -79,6 +79,11 @@ pub struct AppState {
     /// The freshness config the read API derives under, mapped from the hub's `[deriver]`
     /// section. Its hash keys the memo, so a config change invalidates cached answers.
     pub deriver_config: DeriverConfig,
+    /// Where the per-store git mirrors live, so the router (`GET /api/nags`) resolves
+    /// owners from CODEOWNERS locally at fire time (invariant #3). `None` when the hub has
+    /// no data directory configured yet — the router then dead-letters every owned rule,
+    /// honestly, since there is no mirror to read.
+    pub mirror_root: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -98,7 +103,27 @@ impl AppState {
             read_clock: Arc::new(Timestamp::now),
             memo: Arc::new(Memo::new()),
             deriver_config: DeriverConfig::default(),
+            mirror_root: None,
         }
+    }
+
+    /// This state with its mirror root set — boot points the router at where sync stores
+    /// mirrors, so `GET /api/nags` resolves owners from CODEOWNERS locally.
+    #[must_use]
+    pub fn with_mirror_root(mut self, mirror_root: std::path::PathBuf) -> Self {
+        self.mirror_root = Some(mirror_root);
+        self
+    }
+
+    /// A [`crate::router::Router`] over this state — the store, the mirror root, and the
+    /// freshness config — for the router tick and the `GET /api/nags` endpoint.
+    #[must_use]
+    pub fn router(&self) -> crate::router::Router {
+        crate::router::Router::new(
+            self.store.clone(),
+            self.mirror_root.clone(),
+            self.deriver_config.clone(),
+        )
     }
 
     /// This state with its ingest clock replaced, for deterministic ingest tests.
@@ -295,19 +320,17 @@ mod tests {
     fn sample_event() -> claim_hub_core::Event {
         let mut producer = serde_json::Map::new();
         producer.insert("run".into(), serde_json::json!("1234567890"));
-        claim_hub_core::Event {
-            kind: claim_hub_core::EventKind::Verdict,
-            claim: "payments/libfoo-pin".into(),
-            check: claim_hub_core::CheckRef {
+        claim_hub_core::Event::verdict(
+            "payments/libfoo-pin",
+            claim_hub_core::CheckRef {
                 index: 0,
                 digest: "a".repeat(64),
             },
-            verdict: claim_core::Verdict::Held,
-            evidence: None,
-            commit: "8f2c0a1".into(),
-            store: "github.com/acme/payments".into(),
-            producer: claim_hub_core::Producer(producer),
-            reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
-        }
+            claim_core::Verdict::Held,
+            "8f2c0a1",
+            "github.com/acme/payments",
+            claim_hub_core::Producer(producer),
+            "2026-07-18T06:00:00Z".parse().unwrap(),
+        )
     }
 }

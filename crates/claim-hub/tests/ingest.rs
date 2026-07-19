@@ -41,10 +41,14 @@ async fn a_valid_token_and_envelope_appends_verbatim_and_returns_the_position() 
     assert_eq!(events.len(), 1, "exactly one event appended");
     let event = &events[0].event;
     assert_eq!(event.claim, "payments/libfoo-pin");
-    assert_eq!(event.verdict, claim_core::Verdict::Held);
-    assert_eq!(event.check.index, 0);
+    assert_eq!(event.verdict, Some(claim_core::Verdict::Held));
+    let check = event
+        .check
+        .as_ref()
+        .expect("a verdict event carries a check");
+    assert_eq!(check.index, 0);
     assert_eq!(
-        event.check.digest, expected_digest,
+        check.digest, expected_digest,
         "the digest is the registry's, computed from the check definition (issue #18)"
     );
     assert_eq!(
@@ -114,16 +118,20 @@ async fn a_skipped_check_before_a_run_check_files_the_verdict_under_the_right_di
     let events = store.scan_from(Position(0)).await.unwrap();
     assert_eq!(events.len(), 1);
     let event = &events[0].event;
+    let check = event
+        .check
+        .as_ref()
+        .expect("a verdict event carries a check");
     assert_eq!(
-        event.check.index, 1,
+        check.index, 1,
         "the declared index is recorded, not the offset"
     );
     assert_eq!(
-        event.check.digest, digest_b,
+        check.digest, digest_b,
         "the drift is filed under check B's identity (declared index 1), NOT check A's"
     );
     assert_ne!(
-        event.check.digest, digest_a,
+        check.digest, digest_a,
         "keying by array offset 0 would have mis-filed it under A — the bug this guards"
     );
 }

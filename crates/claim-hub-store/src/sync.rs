@@ -308,7 +308,7 @@ fn update_mirror(connected: &ConnectedStore, mirror_root: &Path) -> Result<PathB
         ),
         source,
     })?;
-    let mirror = mirror_root.join(format!("{}.git", sanitize_store_id(connected.id())));
+    let mirror = mirror_path(mirror_root, connected.id());
 
     if mirror.join("HEAD").exists() {
         // An existing mirror: fetch new refs and prune deleted ones. `git -C <mirror>
@@ -739,6 +739,17 @@ fn finding(store_id: &str, err: LoadError, commit: &str) -> SyncFinding {
         commit: commit.to_owned(),
         reason: err.message,
     }
+}
+
+/// The bare mirror directory for a connected store under `mirror_root`, as
+/// [`update_mirror`] creates it — `mirror_root/<sanitized-id>.git`.
+///
+/// Exposed to the crate so owner resolution (hub-11) reads CODEOWNERS out of the same
+/// mirror sync maintains, rather than re-cloning: the mirror is already local, so
+/// resolving an owner is a local `git show` (invariant #3 — provenance derived from git,
+/// no forge call at fire time).
+pub(crate) fn mirror_path(mirror_root: &Path, store_id: &str) -> PathBuf {
+    mirror_root.join(format!("{}.git", sanitize_store_id(store_id)))
 }
 
 /// Turn a store id into a filesystem-safe mirror directory stem.

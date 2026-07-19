@@ -85,6 +85,18 @@ pub struct RegisteredClaim {
     /// cross-crate struct literal). `HubHints` is the deriver's own constructible mirror
     /// of the two frozen v1 hints, so it flows to the deriver with no conversion.
     pub hub: claim_hub_core::HubHints,
+    /// Each check's declared skip, in the claim's declared check order — so
+    /// `check_skips[i]` is the skip (if any) on the check `check_digests[i]` identifies.
+    /// `None` for a check with no skip (the common case).
+    ///
+    /// Persisted for hub-11's router: a skip's `until` lapsing is a transition the router
+    /// routes (the deferred check is due again), and the deriver detects it only if the
+    /// skip's expiry reaches it. Registry sync has each check's skip in hand at parse time,
+    /// so it records it here; the deriver reads it into its per-check
+    /// [`DerivedSkip`](claim_hub_core::DerivedSkip). A skip is never a pass — it never
+    /// freshens a claim — so this bears on *lapsed-skip detection and the queue*, not on the
+    /// verified/stale/drifted standing.
+    pub check_skips: Vec<Option<claim_hub_core::DerivedSkip>>,
 }
 
 impl RegisteredClaim {
@@ -116,6 +128,16 @@ impl RegisteredClaim {
                 recheck: claim.hub.recheck,
                 max_age: claim.hub.max_age,
             },
+            check_skips: claim
+                .checks
+                .iter()
+                .map(|check| {
+                    check.skip.as_ref().map(|skip| claim_hub_core::DerivedSkip {
+                        reason: skip.reason.clone(),
+                        until: skip.until,
+                    })
+                })
+                .collect(),
         }
     }
 }

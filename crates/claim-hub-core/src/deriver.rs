@@ -577,16 +577,25 @@ fn index_latest_verdicts(events: &[(u64, Event)]) -> LatestMap {
     let mut latest: LatestMap = BTreeMap::new();
     for (_, event) in events {
         // A match, not an `if let`, so a future `EventKind` forces a decision here
-        // rather than silently counting toward — or against — a standing.
+        // rather than silently counting toward — or against — a standing. A `nag` is the
+        // hub's own scheduling telemetry: it bears on the schedule, never on a claim's
+        // standing (invariant #4), so it is skipped and can never manufacture a green.
         match event.kind {
             EventKind::Verdict => {}
+            EventKind::Nag => continue,
         }
+        // A verdict event always carries its verdict and check (see `Event::verdict`); a
+        // stray verdict-kind event with either missing is malformed telemetry, skipped
+        // rather than folded, so a broken producer can never turn a `None` into a green.
+        let (Some(verdict), Some(check)) = (event.verdict, event.check.as_ref()) else {
+            continue;
+        };
         let key = (
             event.store.clone(),
             event.claim.clone(),
-            event.check.digest.clone(),
+            check.digest.clone(),
         );
-        let candidate = (event.verdict, event.reported_at);
+        let candidate = (verdict, event.reported_at);
         latest
             .entry(key)
             .and_modify(|current| {
@@ -866,20 +875,18 @@ mod tests {
         let check = &claim.checks[check_index];
         let mut producer = serde_json::Map::new();
         producer.insert("run".into(), serde_json::json!("1"));
-        Event {
-            kind: EventKind::Verdict,
-            claim: claim.id.as_str().to_owned(),
-            check: crate::CheckRef {
+        Event::verdict(
+            claim.id.as_str().to_owned(),
+            crate::CheckRef {
                 index: check_index,
                 digest: check_digest(check),
             },
             verdict,
-            evidence: None,
-            commit: "abc".into(),
-            store: store.into(),
-            producer: crate::Producer(producer),
-            reported_at: ts(at),
-        }
+            "abc",
+            store,
+            crate::Producer(producer),
+            ts(at),
+        )
     }
 
     fn registry(claims: Vec<(&str, Claim)>) -> RegistrySnapshot {
@@ -975,6 +982,46 @@ mod tests {
         assert_eq!(
             model.standing("s", "t").unwrap().standing,
             Standing::Drifted
+        );
+    }
+
+    #[test]
+    fn a_nag_event_never_bears_on_a_standing() {
+        // A nag on the ledger is the hub's own scheduling telemetry (invariant #4): it
+        // must never fold into a standing, or it could manufacture — or clear — a green.
+        // A claim with a held verdict plus a nag stays exactly as its verdict says.
+        let claim = simple_claim("t", "hub:\n  max-age: 30d\n");
+        let hold = verdict_event("s", &claim, 0, Verdict::Held, "2026-07-01T00:00:00Z");
+        let mut producer = serde_json::Map::new();
+        producer.insert("run".into(), serde_json::json!("nag-run"));
+        let nag = Event::nag(
+            "t",
+            "abc",
+            "s",
+            crate::Producer(producer),
+            ts("2026-07-02T00:00:00Z"),
+        );
+        let reg = registry(vec![("s", claim)]);
+        let with_nag = derive(
+            &reg,
+            &[(1, hold.clone()), (2, nag)],
+            ts("2026-07-10T00:00:00Z"),
+            &DeriverConfig::default(),
+        );
+        let without_nag = derive(
+            &reg,
+            &[(1, hold)],
+            ts("2026-07-10T00:00:00Z"),
+            &DeriverConfig::default(),
+        );
+        assert_eq!(
+            with_nag.standing("s", "t").unwrap().standing,
+            Standing::Verified
+        );
+        // The nag changed nothing about the standing — same as if it were not there.
+        assert_eq!(
+            with_nag.standing("s", "t").unwrap(),
+            without_nag.standing("s", "t").unwrap()
         );
     }
 

@@ -240,24 +240,75 @@ fn producer_run(producer: &Producer) -> Option<String> {
     Some(run)
 }
 
+/// The value stored in the `check_digest` column — the dedup key's digest component — for
+/// an event of either kind.
+///
+/// A verdict carries its check's content digest; a nag carries its [`FireKey`](claim_hub_core::FireKey) in the
+/// producer block, and that fire key IS the digest the dedup index keys on — so the ledger
+/// enforces fire-once (one nag per fire key per store+run+claim) beneath the router's
+/// derived ledger-diff. A nag with no fire key, or a verdict-kind event with no check, is
+/// ill-formed: it is rejected loudly rather than stored with a NULL digest that would never
+/// dedup and could double-fire (invariant #6).
+fn dedup_digest(event: &Event) -> Result<String> {
+    match event.kind {
+        EventKind::Verdict => event
+            .check
+            .as_ref()
+            .map(|c| c.digest.clone())
+            .ok_or_else(|| StoreError::Corrupt {
+                context: "a verdict event carries no check digest".to_owned(),
+                value: event.claim.clone(),
+            }),
+        EventKind::Nag => claim_hub_core::fire_key_of(event)
+            .map(|k| k.as_str().to_owned())
+            .ok_or_else(|| StoreError::Corrupt {
+                context: "a nag event carries no fire key in its producer block".to_owned(),
+                value: event.claim.clone(),
+            }),
+        // `EventKind` is `#[non_exhaustive]`: a future kind has no dedup-digest convention
+        // yet, so it is refused loudly rather than filed under a guessed identity (invariant
+        // #6). The item that adds a kind adds its arm here.
+        _ => Err(StoreError::Corrupt {
+            context: "an event of an unrecognized kind has no dedup identity".to_owned(),
+            value: event.claim.clone(),
+        }),
+    }
+}
+
 impl Ledger for SqliteStore {
     async fn append(&self, event: &Event) -> Result<Appended> {
         let kind = kind_to_text(event.kind)?;
-        let verdict = verdict_to_text(event.verdict)?;
+        // `verdict` and `check` are `None` on a nag (invariant #4: a nag reports no
+        // verdict and is about no single check), so both columns are nullable and the
+        // nag row honestly stores NULL for verdict/index.
+        let verdict = event.verdict.map(verdict_to_text).transpose()?;
+        let check_index = event
+            .check
+            .as_ref()
+            .map(|c| {
+                i64::try_from(c.index).map_err(|_| StoreError::Corrupt {
+                    context: "check.index too large for the ledger".to_owned(),
+                    value: c.index.to_string(),
+                })
+            })
+            .transpose()?;
+        // The dedup `check_digest` column: for a verdict, the check's content digest; for
+        // a nag, the fire key its producer block carries, so the dedup index gives
+        // fire-once a second line of defense beneath the router's ledger-diff. A nag with
+        // no fire key is ill-formed telemetry and is rejected loudly rather than filed
+        // with a NULL digest that would never dedup (invariant #6).
+        let check_digest = dedup_digest(event)?;
         let producer_json =
             serde_json::to_string(&event.producer).map_err(|source| StoreError::Json {
                 context: "producer".to_owned(),
                 source,
             })?;
-        // A verdict with no usable producer run is unattributable and cannot dedup
+        // An event with no usable producer run is unattributable and cannot dedup
         // safely; reject it loudly rather than bucket it into an empty-run collision
-        // class (invariant #6). The run is also the run component of the dedup key.
+        // class (invariant #6). The run is also the run component of the dedup key. A nag
+        // carries the fire key as its run, so it always satisfies this.
         let dedup_run = producer_run(&event.producer).ok_or(StoreError::MissingProducerRun)?;
         let reported_at = event.reported_at.to_string();
-        let check_index = i64::try_from(event.check.index).map_err(|_| StoreError::Corrupt {
-            context: "check.index too large for the ledger".to_owned(),
-            value: event.check.index.to_string(),
-        })?;
 
         // A dedup collision is not an error: it is the idempotent-redelivery success
         // of HUB.md §2. `ON CONFLICT DO NOTHING` leaves the original row untouched;
@@ -276,7 +327,7 @@ impl Ledger for SqliteStore {
             kind,
             event.claim,
             check_index,
-            event.check.digest,
+            check_digest,
             verdict,
             event.evidence,
             event.commit,
@@ -302,7 +353,7 @@ impl Ledger for SqliteStore {
             event.store,
             dedup_run,
             event.claim,
-            event.check.digest,
+            check_digest,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -331,25 +382,66 @@ impl Ledger for SqliteStore {
                     context: "producer".to_owned(),
                     source,
                 })?;
-            let index = usize::try_from(row.check_index).map_err(|_| StoreError::Corrupt {
-                context: "check_index out of range".to_owned(),
-                value: row.check_index.to_string(),
-            })?;
             let reported_at =
                 Timestamp::from_str(&row.reported_at).map_err(|_| StoreError::Corrupt {
                     context: "reported_at is not an RFC 3339 instant".to_owned(),
                     value: row.reported_at.clone(),
                 })?;
+            let kind = kind_from_text(&row.kind)?;
+            // A verdict reconstructs its `check` and `verdict`; a nag has neither (invariant
+            // #4). The `check_digest` column holds the check's content digest for a verdict
+            // and the nag's fire key for a nag — the nag's fire key stays in the producer
+            // block on the reconstructed event, so `check` is `None` and the event cannot be
+            // read as a verdict. A match makes a future kind decide explicitly.
+            let (check, verdict) = match kind {
+                EventKind::Verdict => {
+                    let index = row
+                        .check_index
+                        .map(|i| {
+                            usize::try_from(i).map_err(|_| StoreError::Corrupt {
+                                context: "check_index out of range".to_owned(),
+                                value: i.to_string(),
+                            })
+                        })
+                        .transpose()?
+                        .ok_or_else(|| StoreError::Corrupt {
+                            context: "a verdict row has no check_index".to_owned(),
+                            value: row.claim_id.clone(),
+                        })?;
+                    let digest = row
+                        .check_digest
+                        .clone()
+                        .ok_or_else(|| StoreError::Corrupt {
+                            context: "a verdict row has no check_digest".to_owned(),
+                            value: row.claim_id.clone(),
+                        })?;
+                    let verdict_text =
+                        row.verdict.as_deref().ok_or_else(|| StoreError::Corrupt {
+                            context: "a verdict row has no verdict".to_owned(),
+                            value: row.claim_id.clone(),
+                        })?;
+                    (
+                        Some(CheckRef { index, digest }),
+                        Some(verdict_from_text(verdict_text)?),
+                    )
+                }
+                EventKind::Nag => (None, None),
+                // A future kind stored by a newer hub has no reconstruction rule here yet;
+                // reading it back is a loud corruption signal, never a coerced verdict.
+                _ => {
+                    return Err(StoreError::Corrupt {
+                        context: "a stored event has an unrecognized kind".to_owned(),
+                        value: row.kind.clone(),
+                    })
+                }
+            };
             events.push(StoredEvent {
                 position: Position(row.seq),
                 event: Event {
-                    kind: kind_from_text(&row.kind)?,
+                    kind,
                     claim: row.claim_id,
-                    check: CheckRef {
-                        index,
-                        digest: row.check_digest,
-                    },
-                    verdict: verdict_from_text(&row.verdict)?,
+                    check,
+                    verdict,
                     evidence: row.evidence,
                     commit: row.commit_sha,
                     store: row.store,
@@ -430,21 +522,31 @@ async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) 
 
         // The per-check digests, keyed by the check's declared position, so the ingest
         // gate maps a positional CLI report onto content identities (issue #18) without
-        // re-parsing. Cascades away with the claim on the next snapshot replace.
+        // re-parsing, plus each check's declared skip (reason + until) so the router
+        // detects a lapsed skip (hub-11). Cascades away with the claim on the next snapshot
+        // replace.
         for (index, digest) in claim.check_digests.iter().enumerate() {
             let check_index = i64::try_from(index).map_err(|_| StoreError::Corrupt {
                 context: "check index too large for the registry".to_owned(),
                 value: index.to_string(),
             })?;
+            // The skip at this index, if the claim carried one. `check_skips` is parallel to
+            // `check_digests` (both in declared order), so a shorter or absent vector just
+            // means no skip — never a mismatch that could file a skip against the wrong check.
+            let skip = claim.check_skips.get(index).and_then(|s| s.as_ref());
+            let skip_reason = skip.map(|s| s.reason.clone());
+            let skip_until = skip.and_then(|s| s.until).map(|u| u.to_string());
             sqlx::query!(
                 r#"
-                INSERT INTO check_digests (store, claim_id, check_index, digest)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO check_digests (store, claim_id, check_index, digest, skip_reason, skip_until)
+                VALUES (?, ?, ?, ?, ?, ?)
                 "#,
                 store,
                 id,
                 check_index,
                 digest,
+                skip_reason,
+                skip_until,
             )
             .execute(&mut **tx)
             .await?;
@@ -559,7 +661,7 @@ impl Registry for SqliteStore {
         for row in rows {
             let id = parse_claim_id(&row.claim_id)?;
             let supports = self.supports_targets_of(store, &id).await?;
-            let check_digests = self.check_digests_of(store, &id).await?;
+            let (check_digests, check_skips) = self.checks_of(store, &id).await?;
             claims.push(RegisteredClaim {
                 id,
                 statement: row.statement,
@@ -567,6 +669,7 @@ impl Registry for SqliteStore {
                 commit: row.commit_sha,
                 check_digests,
                 hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
+                check_skips,
             });
         }
         Ok(claims)
@@ -590,7 +693,7 @@ impl Registry for SqliteStore {
             return Ok(None);
         };
         let supports = self.supports_targets_of(store, id).await?;
-        let check_digests = self.check_digests_of(store, id).await?;
+        let (check_digests, check_skips) = self.checks_of(store, id).await?;
         Ok(Some(RegisteredClaim {
             id: id.clone(),
             statement: row.statement,
@@ -598,6 +701,7 @@ impl Registry for SqliteStore {
             commit: row.commit_sha,
             check_digests,
             hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
+            check_skips,
         }))
     }
 
@@ -668,15 +772,24 @@ impl Registry for SqliteStore {
 }
 
 impl SqliteStore {
-    /// Every check digest for `id` in `store`, ordered by the check's declared index,
-    /// so the returned vector is `RegisteredClaim::check_digests` — `[i]` is the digest
-    /// of check `i`. An empty vector means the claim declares no checks (or is not at
-    /// tip).
-    async fn check_digests_of(&self, store: &str, id: &ClaimId) -> Result<Vec<String>> {
+    /// Every check's digest **and** declared skip for `id` in `store`, ordered by the
+    /// check's declared index, so the two returned vectors are `RegisteredClaim`'s
+    /// `check_digests` and `check_skips` — `[i]` is the digest and skip of check `i`. Empty
+    /// vectors mean the claim declares no checks (or is not at tip).
+    ///
+    /// The skip's `until` is parsed back from its stored RFC 3339 text; a stored value the
+    /// timestamp parser rejects is loud corruption ([`StoreError::Corrupt`]), never coerced
+    /// to a silent `None` that would hide a lapsed skip (invariant #6).
+    #[allow(clippy::type_complexity)]
+    async fn checks_of(
+        &self,
+        store: &str,
+        id: &ClaimId,
+    ) -> Result<(Vec<String>, Vec<Option<claim_hub_core::DerivedSkip>>)> {
         let id_str = id.as_str();
         let rows = sqlx::query!(
             r#"
-            SELECT digest FROM check_digests
+            SELECT digest, skip_reason, skip_until FROM check_digests
             WHERE store = ? AND claim_id = ?
             ORDER BY check_index ASC
             "#,
@@ -685,7 +798,29 @@ impl SqliteStore {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| r.digest).collect())
+        let mut digests = Vec::with_capacity(rows.len());
+        let mut skips = Vec::with_capacity(rows.len());
+        for row in rows {
+            digests.push(row.digest);
+            // A skip exists iff a reason was stored; the `until` is optional even then.
+            let skip = match row.skip_reason {
+                Some(reason) => {
+                    let until = row
+                        .skip_until
+                        .map(|raw| {
+                            Timestamp::from_str(&raw).map_err(|_| StoreError::Corrupt {
+                                context: "skip_until is not an RFC 3339 instant".to_owned(),
+                                value: raw,
+                            })
+                        })
+                        .transpose()?;
+                    Some(claim_hub_core::DerivedSkip { reason, until })
+                }
+                None => None,
+            };
+            skips.push(skip);
+        }
+        Ok((digests, skips))
     }
 }
 

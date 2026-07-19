@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT digest, skip_reason, skip_until FROM check_digests\n            WHERE store = ? AND claim_id = ?\n            ORDER BY check_index ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "digest",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "skip_reason",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "skip_until",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "197c0a195137fc86b328e467612213566ad54e74bb1d6e399eb8d271a8047566"
+}

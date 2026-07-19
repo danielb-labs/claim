@@ -33,11 +33,13 @@ pub mod http;
 pub mod ingest;
 pub mod mcp;
 pub mod oidc;
+pub mod router;
 pub mod status;
 pub mod ui;
 
 pub use app::{build_app, AppState};
 pub use config::Config;
+pub use router::{spawn_router_tick, Router, RouterView};
 pub use status::Status;
 
 use anyhow::Context;
@@ -62,7 +64,8 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Open the store from `config`, assemble the app, and serve until the process stops.
+/// Open the store from `config`, assemble the app, spawn the router tick, and serve until
+/// the process stops.
 ///
 /// This is the boot path: it opens (creating if absent) the SQLite database at
 /// `config.database` via [`SqliteStore::open`], which runs the embedded migrations,
@@ -71,10 +74,16 @@ pub fn init_tracing() {
 /// freshness config, so the read surface ages claims per the operator's window. When the
 /// config carries an `[oidc]` section it builds the ingest gate's verifier, so
 /// `POST /ingest` is mounted; with no OIDC config the hub serves reads only and exposes no
-/// write path. It then binds `config.listen` and serves the router. A database that will
-/// not open, a malformed `[deriver]` window, an OIDC trust anchor that cannot initialize,
-/// or an address that will not bind is a loud boot failure naming the fault — a hub that
-/// cannot serve says so rather than exiting silently.
+/// write path.
+///
+/// It points the router at the mirror directory beside the database (where registry sync
+/// keeps its per-store mirrors) so `GET /api/nags` resolves owners from CODEOWNERS locally,
+/// and it spawns the **router tick** — the one recurring task (HUB-IMPLEMENTATION.md §1.8)
+/// that wakes the router to notice clock-crossing staleness with no new verdict. It then
+/// binds `config.listen` and serves. A database that will not open, a malformed `[deriver]`
+/// window, an OIDC trust anchor that cannot initialize, or an address that will not bind is
+/// a loud boot failure naming the fault — a hub that cannot serve says so rather than
+/// exiting silently.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let store = SqliteStore::open(&config.database).await.with_context(|| {
         format!(
@@ -91,7 +100,28 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "no [oidc] config: the ingest gate is not mounted; the hub serves reads only"
         );
     }
-    let app = build_app(AppState::new(store, verifier).with_deriver_config(deriver_config));
+    // The mirror directory registry sync writes to sits beside the database, so the router
+    // reads CODEOWNERS from the same local mirrors — no forge call at fire time (invariant #3).
+    let data_dir = config
+        .database
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let mirror_root = router::mirror_root_for(&data_dir);
+    let state = AppState::new(store, verifier)
+        .with_deriver_config(deriver_config)
+        .with_mirror_root(mirror_root);
+
+    // Spawn the router tick: it re-derives on a cadence and fires a nag once per new
+    // transition, so a claim aging into stale by the clock is noticed without a new verdict.
+    // Detached; it keeps running until the process stops.
+    let _tick = spawn_router_tick(state.router(), config.router_period(), |result| {
+        if let Err(error) = result {
+            tracing::error!(%error, "a router pass failed; retrying next tick");
+        }
+    });
+
+    let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding the hub listener on `{}`", config.listen))?;

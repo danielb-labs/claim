@@ -69,20 +69,18 @@ async fn status_reflects_a_non_empty_store_after_boot() {
     let (app, store, _dir) = boot_app_from_minimal_config().await;
     let mut producer = serde_json::Map::new();
     producer.insert("run".into(), serde_json::json!("run-1"));
-    let event = claim_hub_core::Event {
-        kind: claim_hub_core::EventKind::Verdict,
-        claim: "payments/libfoo-pin".into(),
-        check: claim_hub_core::CheckRef {
+    let event = claim_hub_core::Event::verdict(
+        "payments/libfoo-pin",
+        claim_hub_core::CheckRef {
             index: 0,
             digest: "b".repeat(64),
         },
-        verdict: claim_core::Verdict::Held,
-        evidence: None,
-        commit: "8f2c0a1".into(),
-        store: "github.com/acme/payments".into(),
-        producer: claim_hub_core::Producer(producer),
-        reported_at: "2026-07-18T06:00:00Z".parse().unwrap(),
-    };
+        claim_core::Verdict::Held,
+        "8f2c0a1",
+        "github.com/acme/payments",
+        claim_hub_core::Producer(producer),
+        "2026-07-18T06:00:00Z".parse().unwrap(),
+    );
     store.append(&event).await.unwrap();
 
     let (status, body) = get_json(app, "/status").await;

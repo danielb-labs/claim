@@ -79,16 +79,22 @@ where
 /// the join key the ledger's events also carry (both computed by the one
 /// [`claim_hub_core::check_digest`], so they match by construction) — and passes the
 /// claim's stored `hub:` hints straight through, so the deriver ages it on its own
-/// declared cadence. Per-check `skip` is left `None` here: it is queue-ranking data
-/// (hub-14), and the standing folds only verdicts, so a skip changes no standing (see the
-/// module docs).
+/// declared cadence.
+///
+/// Each check's stored **skip** is carried through too, so the deriver surfaces a lapsed
+/// skip the router routes (hub-11): a skip's `until` passing is a transition (the deferred
+/// check is due again). A skip is never a pass — the standing folds only verdicts — so it
+/// changes no verified/stale/drifted standing; it drives lapsed-skip detection and the
+/// queue only. `check_skips` is parallel to `check_digests`; a shorter or absent vector at
+/// an index means no skip.
 fn claim_entry(store: &str, registered: &RegisteredClaim) -> ClaimEntry {
     let checks = registered
         .check_digests
         .iter()
-        .map(|digest| DerivedCheck {
+        .enumerate()
+        .map(|(index, digest)| DerivedCheck {
             digest: digest.clone(),
-            skip: None,
+            skip: registered.check_skips.get(index).and_then(Option::clone),
         })
         .collect();
     ClaimEntry::new(

@@ -383,6 +383,19 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     active link, or live HTML tag into the <code>.md</code> an agent reads. <code>/llms.txt</code>
     indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
     to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.</p>
+    <p>The hub&rsquo;s reason to exist is the <strong>router / nag</strong>: the part that notices when a
+    fact stops holding and routes it to whoever owns the decision &mdash; the nag over time the
+    stateless CLI cannot issue. It watches three transitions &mdash; a claim <strong>drifting</strong>, a
+    claim going <strong>stale by the clock</strong> (aged past its window with no new verdict, caught by a
+    background tick since nothing else would notice), and a <strong>skip&rsquo;s <code>until</code>
+    lapsing</strong>. Each fires <strong>exactly once</strong>, and fire-once is <em>derived from the
+    ledger</em>, not stored: the router appends a <code>nag</code> event and diffs against those events, so
+    there is no &ldquo;notified&rdquo; flag to lose and a restart never re-nags. Owners resolve from
+    <strong>CODEOWNERS</strong> at fire time (from the synced git mirror, never a stored field); one commit
+    breaking many claims is <strong>one grouped nag</strong>; and a transition with no owner is a
+    first-class <strong>dead-letter</strong>, visible, never dropped. The hub <em>renders</em> the nag
+    content and serves it at <code>GET /api/nags</code>; the CI glue <em>delivers</em> it (the standing
+    issue and PR comments) &mdash; the hub holds no forge write credential.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
     no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is
