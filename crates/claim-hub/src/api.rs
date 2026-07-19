@@ -28,6 +28,7 @@ use claim_hub_store::{ledger_events, registry_snapshot};
 use serde::Serialize;
 
 use crate::app::AppState;
+use crate::http::problem;
 
 /// The read API's router: `GET /api/claims/{id}` in the hub-07 skeleton.
 ///
@@ -125,27 +126,6 @@ impl<'a> ClaimStandingResponse<'a> {
     }
 }
 
-/// Build a `{ "error": <reason> }` JSON problem response with `status`.
-///
-/// One shape for every non-2xx, matching the ingest gate's, so a client (human or agent)
-/// reads the reason the same way regardless of which read failed.
-fn problem(status: StatusCode, reason: &str) -> Response {
-    (
-        status,
-        Json(ProblemBody {
-            error: reason.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-/// The body of a read error: a single machine-readable reason.
-#[derive(Debug, Serialize)]
-struct ProblemBody {
-    /// The client-facing reason the read could not be answered, naming what is wrong.
-    error: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,14 +154,10 @@ mod tests {
     async fn seed(store: &SqliteStore, frontmatter: &str) -> claim_core::Claim {
         let text = format!("---\n{frontmatter}\n---\nStatement.\n");
         let claim = parse_claim_file(".claims/t.md", &text).expect("valid claim");
-        let registered = RegisteredClaim {
-            id: claim.id.clone(),
-            statement: claim.statement.clone(),
-            supports: vec![],
-            commit: "seedcommit".to_owned(),
-            check_digests: claim.checks.iter().map(check_digest).collect(),
-        };
-        store.replace_store(STORE, &[registered]).await.unwrap();
+        store
+            .replace_store(STORE, &[RegisteredClaim::from_claim(&claim, "seedcommit")])
+            .await
+            .unwrap();
         claim
     }
 
@@ -289,6 +265,46 @@ mod tests {
             store.head().await.unwrap(),
             head_before,
             "a read stored nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_id_across_two_stores_returns_the_lexicographically_first_store() {
+        // The documented tie-break for the M0 single-id-per-URL shape: two stores each hold
+        // a claim with the same id (ids are unique only *within* a store). The read model is
+        // keyed by (store, id) in a BTreeMap, so `find` returns the ascending-first store's
+        // standing. Pinned so the behavior is a deliberate contract, not an accident — the
+        // full query API (hub-08) will add a `store` selector to address a claim exactly.
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let text = "---\nid: payments/libfoo-pin\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nStatement.\n";
+        let claim = parse_claim_file(".claims/t.md", text).unwrap();
+        // Two stores, ascending: "...billing" sorts before "...payments".
+        let first = "github.com/acme/billing";
+        let second = "github.com/acme/payments";
+        for store_id in [first, second] {
+            store
+                .replace_store(
+                    store_id,
+                    &[RegisteredClaim::from_claim(&claim, "seedcommit")],
+                )
+                .await
+                .unwrap();
+        }
+        // A held verdict only in the FIRST store; the second store's claim has no verdict, so
+        // it would derive `stale`. The returned standing must be the first store's.
+        let mut ev = held_event(&claim, "2026-07-19T00:00:00Z");
+        ev.store = first.into();
+        store.append(&ev).await.unwrap();
+
+        let (status, json) = get(&app(store), "payments/libfoo-pin").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["store"], first,
+            "the lexicographically-first store wins the tie-break: {json}"
+        );
+        assert_eq!(
+            json["standing"], "verified",
+            "and its standing (held) is what is returned, not the other store's stale: {json}"
         );
     }
 }

@@ -20,7 +20,6 @@ use axum::http::{Request, StatusCode};
 use claim_core::{Claim, Timestamp};
 use claim_hub::app::{AppState, Clock};
 use claim_hub::oidc::{JwksSource, OidcError, OidcVerifier};
-use claim_hub_core::check_digest;
 use claim_hub_store::{RegisteredClaim, Registry, SqliteStore};
 use http_body_util::BodyExt;
 use jsonwebtoken::jwk::JwkSet;
@@ -321,23 +320,13 @@ fn sign_body(body: &serde_json::Value, key_pem: &str) -> String {
     encode(&header, body, &key).expect("sign token")
 }
 
-/// Seed the registry with a claim parsed from `frontmatter`, so its check digests are
-/// stored and the ingest gate can resolve them by index. Returns the parsed claim (whose
-/// checks the caller uses to compute expected digests).
+/// Seed the registry with a claim parsed from `frontmatter`, so its check digests and
+/// `hub:` hints are stored and the ingest gate/deriver can read them. Returns the parsed
+/// claim (whose checks the caller uses to compute expected digests).
 pub async fn seed_claim(store: &SqliteStore, file: &str, frontmatter: &str) -> Claim {
     let text = format!("---\n{frontmatter}\n---\nStatement body.\n");
     let claim = claim_core::parse_claim_file(file, &text).expect("valid claim fixture");
-    let registered = RegisteredClaim {
-        id: claim.id.clone(),
-        statement: claim.statement.clone(),
-        supports: claim
-            .supports
-            .iter()
-            .map(|t| t.as_str().to_owned())
-            .collect(),
-        commit: "seedcommit".to_owned(),
-        check_digests: claim.checks.iter().map(check_digest).collect(),
-    };
+    let registered = RegisteredClaim::from_claim(&claim, "seedcommit");
     store
         .replace_store(TEST_STORE, &[registered])
         .await

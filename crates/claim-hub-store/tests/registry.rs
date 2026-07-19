@@ -6,6 +6,7 @@
 //! fresh temp file and drives the trait — no shared state, no network.
 
 use claim_core::ClaimId;
+use claim_hub_core::HubHints;
 use claim_hub_store::{RegisteredClaim, Registry, RegistryVersion, SqliteStore, SupportsEdge};
 use std::str::FromStr;
 use tempfile::TempDir;
@@ -25,8 +26,10 @@ fn claim(id: &str, statement: &str, supports: &[&str], commit: &str) -> Register
         commit: commit.into(),
         // Most registry tests exercise the claim/statement/supports/version paths; a
         // claim with no checks is the simplest fixture. The digest read/write path has
-        // its own dedicated test (`check_digests_round_trip`).
+        // its own dedicated test (`check_digests_round_trip`), and the hub-hint
+        // round-trip has `hub_hints_round_trip`.
         check_digests: Vec::new(),
+        hub: Default::default(),
     }
 }
 
@@ -235,6 +238,7 @@ fn claim_with_digests(id: &str, digests: &[&str]) -> RegisteredClaim {
         supports: vec![],
         commit: "c1".into(),
         check_digests: digests.iter().map(|d| (*d).to_owned()).collect(),
+        hub: Default::default(),
     }
 }
 
@@ -311,5 +315,102 @@ async fn a_snapshot_replace_retires_a_removed_claims_check_digests() {
         store.check_digest(STORE, &id, 0).await.unwrap(),
         None,
         "the retired claim's digest is gone"
+    );
+}
+
+#[tokio::test]
+async fn hub_hints_round_trip_through_the_registry() {
+    // A claim's own `hub:` hints are persisted and read back verbatim, so the deriver ages
+    // it on its own declared cadence — not just a config default. Without this a claim
+    // declaring `max-age: 30d` would read verified forever under no config window
+    // (invariant #6).
+    let (store, _dir) = fresh_store().await;
+    let hinted = RegisteredClaim {
+        id: ClaimId::from_str("pin").unwrap(),
+        statement: "S".into(),
+        supports: vec![],
+        commit: "c1".into(),
+        check_digests: vec![],
+        hub: HubHints {
+            max_age: Some("30d".parse().unwrap()),
+            recheck: Some("7d".parse().unwrap()),
+        },
+    };
+    store.replace_store(STORE, &[hinted]).await.unwrap();
+
+    let id = ClaimId::from_str("pin").unwrap();
+    let read = store.claim(STORE, &id).await.unwrap().unwrap();
+    assert_eq!(read.hub.max_age, Some("30d".parse().unwrap()));
+    assert_eq!(read.hub.recheck, Some("7d".parse().unwrap()));
+
+    // `claims_of` reads the same hints (the deriver-snapshot path uses it).
+    let all = store.claims_of(STORE).await.unwrap();
+    assert_eq!(all[0].hub.max_age, Some("30d".parse().unwrap()));
+    assert_eq!(all[0].hub.recheck, Some("7d".parse().unwrap()));
+}
+
+#[tokio::test]
+async fn a_claim_with_no_hub_hints_reads_none_not_a_fabricated_window() {
+    // A claim declaring no `hub:` reads back with None hints, so freshness falls to config
+    // rather than a window nobody set.
+    let (store, _dir) = fresh_store().await;
+    store
+        .replace_store(STORE, &[claim("pin", "S", &[], "c1")])
+        .await
+        .unwrap();
+    let read = store
+        .claim(STORE, &ClaimId::from_str("pin").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.hub, HubHints::default());
+}
+
+#[tokio::test]
+async fn stores_lists_connected_stores_in_ascending_order() {
+    // The deriver-snapshot builder walks every connected store; `stores()` is that list,
+    // ascending for a deterministic snapshot build.
+    let (store, _dir) = fresh_store().await;
+    // Insert out of order to prove the ordering is the query's, not the insertion's.
+    store
+        .replace_store("github.com/acme/payments", &[claim("a", "S", &[], "c1")])
+        .await
+        .unwrap();
+    store
+        .replace_store("github.com/acme/billing", &[claim("b", "S", &[], "c1")])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.stores().await.unwrap(),
+        vec![
+            "github.com/acme/billing".to_owned(),
+            "github.com/acme/payments".to_owned(),
+        ],
+        "connected stores list ascending"
+    );
+}
+
+#[tokio::test]
+async fn an_emptied_store_stays_connected_so_its_ledger_only_claims_can_retire() {
+    // A store synced to empty — every claim deleted from git — must still appear in
+    // `stores()`. The deriver needs the store present to derive its ledger-only claims as
+    // `Retired` rather than have them vanish; a connected-but-empty store is load-bearing.
+    let (store, _dir) = fresh_store().await;
+    store
+        .replace_store(STORE, &[claim("pin", "S", &[], "c1")])
+        .await
+        .unwrap();
+    // Re-sync the store to empty (all claims removed upstream).
+    store.replace_store(STORE, &[]).await.unwrap();
+
+    assert_eq!(
+        store.stores().await.unwrap(),
+        vec![STORE.to_owned()],
+        "an emptied store stays connected"
+    );
+    assert!(
+        store.claims_of(STORE).await.unwrap().is_empty(),
+        "but it has no live claims"
     );
 }

@@ -98,7 +98,11 @@ async fn the_whole_spine_derives_a_held_verdict_into_verified() {
 }
 
 #[tokio::test]
-async fn the_same_claim_ages_into_stale_by_the_clock_alone() {
+async fn the_same_claim_ages_into_stale_by_its_own_hub_max_age() {
+    // The false-green guard: with NO hub config window set (skeleton_app uses
+    // DeriverConfig::default()), the claim ages purely on ITS OWN `hub.max-age: 30d`,
+    // carried through registry sync. If the claim's hint were dropped, it would read
+    // verified forever — the stale-fact-shows-green invariant #6 forbids.
     let fixture = GitFixture::with_claim(".claims/pin.md", PIN_FRONTMATTER);
     let store = SqliteStore::open_in_memory().await.unwrap();
     sync_fixture(&store, &fixture).await;
@@ -110,9 +114,15 @@ async fn the_same_claim_ages_into_stale_by_the_clock_alone() {
     let (status, _json) = post_ingest(&app, Some(&token), &body).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Within the 30-day window: verified.
+    // Within the claim's own 30-day window: verified.
     let (_status, fresh) = get_claim(&app, "payments/libfoo-pin").await;
     assert_eq!(fresh["standing"], "verified", "fresh at day 10: {fresh}");
+    // The stale-at instant is the claim's own window (day 0 + 30d), proving the per-claim
+    // hint — not a config default — set the horizon.
+    assert_eq!(
+        fresh["stale_at"], "2026-08-17T12:00:00Z",
+        "stale_at is the claim's own 30d window from the verdict instant: {fresh}"
+    );
 
     // Advance the read clock past the window — no new event, no new sync. The verdict
     // was reported at day 0 (INGEST_INSTANT); at day 40 the 30-day window has lapsed.
@@ -183,18 +193,14 @@ async fn skeleton_app(store: SqliteStore, read_now: String) -> (axum::Router, Se
     );
     let ingest_clock: Clock = Arc::new(ingest_instant);
     let read_clock = SettableClock::new(&read_now);
-    // The read API derives with no config window, so freshness comes from the claim's own
-    // `hub.max-age` (30d) carried through the registry. (Per hub-07's noted follow-up the
-    // registry does not yet persist per-claim hints, so this test seeds the hint via the
-    // config default below so the aging path is exercised end to end.)
-    let deriver_config = claim_hub_core::DeriverConfig {
-        default_max_age: Some("30d".parse().unwrap()),
-        max_age_override: None,
-    };
+    // NO config window: `DeriverConfig::default()` sets neither a default nor an override
+    // max-age. Freshness comes entirely from the claim's OWN `hub.max-age` (30d), carried
+    // through the registry — so the aging test proves the claim's declared cadence drives
+    // staleness, not a config default. (Were the hint dropped, the claim would read
+    // verified forever here — the exact false-green this guards against.)
     let state = AppState::new(store, Some(Arc::new(verifier)))
         .with_clock(ingest_clock)
-        .with_read_clock(read_clock.read_clock())
-        .with_deriver_config(deriver_config);
+        .with_read_clock(read_clock.read_clock());
     (claim_hub::build_app(state), read_clock)
 }
 

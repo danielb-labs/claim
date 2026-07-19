@@ -40,7 +40,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claim_core::{extract_embedded_claims, Claim};
-use claim_hub_core::check_digest;
 use claim_store::{discover, LoadError, StoreError as ClaimStoreError};
 
 use crate::error::{Result, StoreError};
@@ -718,26 +717,14 @@ fn is_embedded_host_file(path: &Path) -> bool {
 
 /// Turn a parsed [`Claim`] into the registry's stored shape, stamped with the tip sha.
 ///
-/// The [`Registry`] holds a claim's *stored* shape — id, statement, supports, commit,
-/// and each check's content digest — not the full check *definitions*, which live with
-/// the verdicts they produce on the ledger. The digests are computed here, at parse
-/// time, by the one canonical [`check_digest`] function over the checks in declared
-/// order, so `check_digests[i]` is the identity of check `i`; the ingest gate reads
-/// them by position to map a positional CLI report onto content-keyed events (issue
-/// #18) without re-parsing. Supports targets are carried as their canonical strings,
-/// the transparent serialized form the store persists and returns.
+/// A thin alias over [`RegisteredClaim::from_claim`], the one place a claim becomes its
+/// stored shape (id, statement, supports, commit, each check's content digest, and the
+/// claim's own `hub:` hints). Sync and any test seeder go through it so they cannot drift
+/// on how a claim is stored — the digests via the one canonical
+/// [`claim_hub_core::check_digest`] (issue #18), the `hub:` hints carried so the deriver
+/// ages the claim on its own declared cadence (invariant #6).
 fn registered(claim: &Claim, commit: &str) -> RegisteredClaim {
-    RegisteredClaim {
-        id: claim.id.clone(),
-        statement: claim.statement.clone(),
-        supports: claim
-            .supports
-            .iter()
-            .map(|t| t.as_str().to_owned())
-            .collect(),
-        commit: commit.to_owned(),
-        check_digests: claim.checks.iter().map(check_digest).collect(),
-    }
+    RegisteredClaim::from_claim(claim, commit)
 }
 
 /// Turn a store-load [`LoadError`] into a recorded [`SyncFinding`].

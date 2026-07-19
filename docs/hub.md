@@ -76,20 +76,23 @@ audience = "https://hub.acme.example"   # what the hub identifies itself as
 repositories = ["acme/payments"]         # connected repos a token may come from
 ```
 
-The `[deriver]` section tunes how the **read API** ages claims — the freshness window
-the deriver applies (HUB.md §2). Both values are `<N>d` day counts, the same spelling a
-claim file uses; a malformed value fails the boot loudly, naming the field:
+The `[deriver]` section is the operator's layer over each claim's *own* `hub.max-age`
+(HUB.md §2). By default the read API ages a claim on the window it declares in its own
+`hub:` block, which registry sync persists; `[deriver]` only overrides or backfills that.
+Both values are `<N>d` day counts, the same spelling a claim file uses; a malformed value
+fails the boot loudly, naming the field:
 
 ```toml
 [deriver]
-default_max_age = "30d"    # window for a claim that declares no hub.max-age
-max_age_override = "7d"     # (optional) forces this window on every claim, winning over its own
+default_max_age = "30d"    # window ONLY for a claim that declares no hub.max-age of its own
+max_age_override = "7d"     # (optional) forces this window on EVERY claim, winning over its own
 ```
 
-With no `[deriver]` section, no window applies and a passing claim stays fresh forever —
-the CLI's stance: absent a window, the hub does not invent one. `max_age_override` is the
-operator's final word on cadence for this environment; `default_max_age` is the fallback
-for claims that declare none of their own.
+With no `[deriver]` section, each claim ages on its own `hub.max-age`; a claim that
+declares neither its own window nor a config default stays `verified` on a passing check —
+absent a window, the hub does not invent one. `max_age_override` is the operator's final
+word on cadence for this environment; `default_max_age` is the fallback for claims that
+declare none of their own.
 
 Other sections a later item consumes are already accepted so an operator's file
 keeps working as the hub grows: `[[stores]]` (connected git stores, syncing),
@@ -223,21 +226,26 @@ verdict holds *and* the claim is within its freshness window; `stale` when a che
 overdue, broken, or never verified; `drifted` when any check's latest is `drifted`. A
 claim the registry does not know is a `404`.
 
+Freshness honors **the claim's own `hub.max-age`** first: registry sync persists each
+claim's `hub:` hints, so a claim declaring `max-age: 30d` ages into `stale` 30 days after
+its last passing verdict — on its own declared cadence, not a hub-wide default. The
+`[deriver]` config is the operator's layer over that: `max_age_override` forces a window on
+every claim (winning over its own), and `default_max_age` supplies one only for claims that
+declare none. A claim with neither its own `max-age` nor a config window never ages by the
+clock (a passing check keeps it `verified`) — absent a window, the hub does not invent one.
+
 The **as-of** makes every answer honest and reproducible: the same (`ledger_head`,
 `registry_version`, `clock`) always derives the same standing, and the standing can never
 be older than the evidence it names. Nothing is stored — the standing is computed at read
 time from the ledger and the clock every time (invariant #3), so a claim **ages into stale
-by the clock alone**: with a `[deriver]` window set, a claim that was `verified` reads
-`stale` once the read clock passes `stale_at`, with no new verdict and no write.
+by the clock alone**: a claim that was `verified` reads `stale` once the read clock passes
+`stale_at`, with no new verdict and no write.
 
-> **Note (v1):** the registry does not yet persist a claim's own `hub.max-age`/`recheck`
-> hints, so freshness comes from the `[deriver]` config window rather than a per-claim
-> hint. The check-identity join is already exact — a verdict lands only on the check whose
-> definition it names — so the standing itself is correct; a focused follow-up on registry
-> sync will carry each claim's own cadence through, at which point a claim's declared
-> window wins where the config sets no override. The `/api/claims/{id}` endpoint is the
-> walking skeleton; the full read surface (claims by path/repo/standing, the drifted and
-> due sets, the dossier, the cursor feed) arrives with the JSON API.
+> **Note (v1):** the `/api/claims/{id}` endpoint is the walking skeleton — one read that
+> proves the loop. The full read surface (claims by path/repo/standing, the drifted and due
+> sets, the dossier, the cursor feed) arrives with the JSON API. Where two connected stores
+> hold a claim with the same id, this endpoint returns the lexicographically-first store's
+> standing; the JSON API adds a `store` selector to address a claim exactly.
 
 ## Trying the whole loop
 

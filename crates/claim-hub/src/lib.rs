@@ -29,6 +29,7 @@
 pub mod api;
 pub mod app;
 pub mod config;
+pub mod http;
 pub mod ingest;
 pub mod oidc;
 pub mod status;

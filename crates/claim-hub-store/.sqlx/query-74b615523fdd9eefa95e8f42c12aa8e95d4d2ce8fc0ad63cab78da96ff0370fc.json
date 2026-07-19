@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT statement, \"commit\" AS commit_sha, hub_max_age, hub_recheck\n            FROM claims_at_tip\n            WHERE store = ? AND claim_id = ?\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "statement",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_sha",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "hub_max_age",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "hub_recheck",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "74b615523fdd9eefa95e8f42c12aa8e95d4d2ce8fc0ad63cab78da96ff0370fc"
+}

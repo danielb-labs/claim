@@ -15,21 +15,25 @@
 //! - [`ledger_events`] scans the ledger into the `(seq, Event)` pairs the deriver folds,
 //!   in ascending position order.
 //!
-//! ## Why a store-built entry carries no per-claim `hub:` hints (yet)
+//! ## What a store-built entry carries
 //!
 //! A [`RegisteredClaim`] holds each check's content **digest** — the deriver's join key,
-//! which is all issue #18 needs — but **not** the claim's `hub:` freshness hints
-//! (`recheck`/`max-age`) nor its per-check skips: the registry schema (hub-05) does not
-//! persist them. So the [`ClaimEntry`] built here carries no per-claim hints, and the
-//! deriver's freshness falls back to the hub config's default/override
-//! ([`claim_hub_core::DeriverConfig`]) — which is exactly what the config mapping supplies.
-//! This is honest, not a silent gap: a claim with a per-claim `max-age` is aged by the
-//! config's window rather than its own until sync stores the hints. Persisting the `hub:`
-//! hints (and skips) in the registry is a focused follow-up on hub-05's schema; when it
-//! lands, this builder passes them through and the deriver honors the claim's own cadence.
-//! The join keys are already correct today, which is what the M0 loop proves.
+//! which is all issue #18 needs — and the claim's own `hub:` freshness hints
+//! (`max-age`/`recheck`), which the registry persists so the deriver ages a claim on its
+//! own declared cadence, not only a hub-wide config default. Both flow through
+//! `claim_entry` unchanged: the digest as the join key, the hints as the deriver's
+//! `HubHints`, read with the hub config as override and fallback. Without the hints a
+//! claim declaring `max-age: 30d` would read `verified` past 30 days — or forever, under
+//! no config window — a stale fact showing green, exactly the false-green invariant #6
+//! forbids.
+//!
+//! Per-check **skips** are deliberately *not* carried here (the entry's `skip` is `None`):
+//! a skip is queue/ranking data (hub-14, issue #9), and the deriver's *standing* folds
+//! only verdicts — a skipped check records no verdict, so it never bears on `verified` /
+//! `stale` / `drifted`. Persisting skips changes no standing today, so it stays with the
+//! item that ranks them.
 
-use claim_hub_core::{ClaimEntry, DerivedCheck, HubHints, RegistrySnapshot};
+use claim_hub_core::{ClaimEntry, DerivedCheck, RegistrySnapshot};
 
 use crate::error::Result;
 use crate::ledger::Ledger;
@@ -73,10 +77,11 @@ where
 ///
 /// Maps each stored check digest to a [`DerivedCheck`] in declared order — the digest is
 /// the join key the ledger's events also carry (both computed by the one
-/// [`claim_hub_core::check_digest`], so they match by construction). Skips and `hub:`
-/// hints are absent here because the registry does not store them yet (see the module
-/// docs); the entry carries [`HubHints::default`] and no skips, so freshness falls to
-/// config.
+/// [`claim_hub_core::check_digest`], so they match by construction) — and passes the
+/// claim's stored `hub:` hints straight through, so the deriver ages it on its own
+/// declared cadence. Per-check `skip` is left `None` here: it is queue-ranking data
+/// (hub-14), and the standing folds only verdicts, so a skip changes no standing (see the
+/// module docs).
 fn claim_entry(store: &str, registered: &RegisteredClaim) -> ClaimEntry {
     let checks = registered
         .check_digests
@@ -90,7 +95,7 @@ fn claim_entry(store: &str, registered: &RegisteredClaim) -> ClaimEntry {
         store.to_owned(),
         registered.id.as_str().to_owned(),
         checks,
-        HubHints::default(),
+        registered.hub,
     )
 }
 
@@ -132,17 +137,7 @@ mod tests {
     async fn seed(store: &SqliteStore, store_id: &str, file: &str, frontmatter: &str) {
         let text = format!("---\n{frontmatter}\n---\nStatement body.\n");
         let claim = parse_claim_file(file, &text).expect("valid claim");
-        let registered = RegisteredClaim {
-            id: claim.id.clone(),
-            statement: claim.statement.clone(),
-            supports: claim
-                .supports
-                .iter()
-                .map(|t| t.as_str().to_owned())
-                .collect(),
-            commit: "seedcommit".to_owned(),
-            check_digests: claim.checks.iter().map(check_digest).collect(),
-        };
+        let registered = RegisteredClaim::from_claim(&claim, "seedcommit");
         store
             .replace_store(store_id, &[registered])
             .await
@@ -201,6 +196,42 @@ mod tests {
             entry.checks[0].digest, expected,
             "the entry's join key is the registry's stored digest"
         );
+    }
+
+    #[tokio::test]
+    async fn a_claims_own_hub_hints_flow_through_to_the_entry() {
+        // The false-green fix: a claim's declared hub.max-age/recheck are persisted and
+        // reach the deriver's ClaimEntry, so freshness ages on the claim's OWN cadence,
+        // not only a config default.
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        seed(
+            &store,
+            "github.com/acme/payments",
+            ".claims/a.md",
+            "id: payments/a\nhub:\n  max-age: 30d\n  recheck: 7d\nchecks:\n  - kind: cmd\n    run: \"true\"",
+        )
+        .await;
+
+        let snapshot = registry_snapshot(&store).await.unwrap();
+        let entry = &snapshot.claims[0];
+        assert_eq!(entry.hub.max_age, Some("30d".parse().unwrap()));
+        assert_eq!(entry.hub.recheck, Some("7d".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_claim_with_no_hub_hints_carries_none() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        seed(
+            &store,
+            "github.com/acme/payments",
+            ".claims/a.md",
+            "id: payments/a\nchecks:\n  - kind: cmd\n    run: \"true\"",
+        )
+        .await;
+        let snapshot = registry_snapshot(&store).await.unwrap();
+        let entry = &snapshot.claims[0];
+        assert_eq!(entry.hub.max_age, None);
+        assert_eq!(entry.hub.recheck, None);
     }
 
     #[tokio::test]
