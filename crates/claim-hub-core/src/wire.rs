@@ -3,23 +3,31 @@
 //! These types deserialize exactly what `claim check --json` emits, and they are
 //! **deliberately independent** of the CLI crate's own serialize structs, never
 //! imported from it (`HUB-IMPLEMENTATION.md` §1.7). The hub ingests reports from
-//! many repos running many CLI versions: it must parse *what is on the wire* and
-//! reject malformed input with the offending field named, and a type shared with
-//! the in-tree CLI would only ever prove the CLI matches itself — it could not
-//! catch a real producer drifting from the contract. The workspace contract test
-//! (this crate's `tests/`) runs the built `claim` binary and parses its real
-//! output through these types, which keeps the two ends honest *without* coupling
-//! them.
+//! many repos running many CLI versions: it must parse *what is on the wire*, and
+//! a type shared with the in-tree CLI would only ever prove the CLI matches
+//! itself — it could not catch a real producer drifting from the contract. The
+//! workspace contract test (this crate's `tests/`) runs the built `claim` binary
+//! and parses its real output through these types, which keeps the two ends honest
+//! *without* coupling them.
 //!
-//! Strictness is the point. Every object the hub's own contract fixes carries
-//! `#[serde(deny_unknown_fields)]`, so a report that adds or renames a field the
-//! hub does not know is rejected with the field named, not silently accepted and
-//! half-understood. The one deliberate exception is a check's `end` (a
-//! [`claim_core::ProcessEnd`], which is `#[non_exhaustive]`): a *newer* CLI may add
-//! a process-end kind, and rejecting an unknown end kind would refuse an otherwise
-//! valid, verdict-bearing report. So `end` is captured as a tagged value that
-//! preserves the discriminator and its payload verbatim without constraining the
-//! set of kinds — the verdict, not the end, is what the ledger turns on.
+//! **These wire types are forward-compatible: an unknown field is tolerated, not
+//! rejected.** They deliberately do *not* carry `#[serde(deny_unknown_fields)]`.
+//! The obligation to reject an unknown field naming it is the *envelope's*, not
+//! the wire report's (`HUB-IMPLEMENTATION.md` §1.7, §4.3–§4.4): the envelope is
+//! the hub's own frozen shape, while the report is a foreign input from an
+//! independently-versioned producer. If a newer CLI adds one field to its report,
+//! an older hub must still read the fields it knows — rejecting the whole report
+//! would age every claim in that repo into stale over a field the hub does not
+//! even need, a self-inflicted outage and exactly the silent-staleness failure
+//! invariant #6 forbids. Genuinely malformed input is still caught: serde rejects
+//! a missing required field or a wrong-typed field by default, naming it, without
+//! `deny_unknown_fields`.
+//!
+//! A check's `end` (a [`claim_core::ProcessEnd`], `#[non_exhaustive]`) is captured
+//! as a tagged value that preserves the discriminator and its payload verbatim
+//! without constraining the set of kinds, so a *newer* CLI's added end kind
+//! round-trips through the hub — the verdict, not the end, is what the ledger
+//! turns on.
 
 use claim_core::Verdict;
 use serde::Deserialize;
@@ -29,9 +37,9 @@ use serde::Deserialize;
 /// The report of one `claim check` run: an overall status and exit code, run
 /// tallies, the per-claim results, and any per-file load errors. Parsing this
 /// successfully means every field the hub relies on was present and well-typed;
-/// an unknown or renamed field is rejected naming it (`deny_unknown_fields`).
+/// an unknown field is tolerated (forward-compat — see the module docs), while a
+/// missing required or wrong-typed field is rejected naming it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckReport {
     /// Always `"ok"` today: the verb ran. The findings live in `exit` and the
     /// per-claim results — a drift is a successful run that found a drift.
@@ -55,7 +63,6 @@ pub struct CheckReport {
 /// One claim's result within a report: its checks' verdicts, its suppressed
 /// skips, its supports' resolutions, and its exit contribution.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClaimResult {
     /// The claim's id.
     pub id: String,
@@ -80,7 +87,6 @@ pub struct ClaimResult {
 /// both ends of the wire — so `held`/`drifted`/`unverifiable`/`broken` cannot be
 /// interpreted two ways. `end` is captured permissively (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CheckResult {
     /// The verdict the check reported.
     pub verdict: Verdict,
@@ -126,7 +132,6 @@ pub struct ProcessEndWire {
 /// A check whose declared skip suppressed this run: reported so a skip is never
 /// silent, and carrying no verdict — a skip is not a pass.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SkippedCheck {
     /// The author's justification, from the claim's `skip.reason`.
     pub reason: String,
@@ -138,7 +143,6 @@ pub struct SkippedCheck {
 
 /// One resolved (or unresolved) `supports` target within a claim's result.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SupportResult {
     /// The target as written in the claim's `supports` list.
     pub target: String,
@@ -153,7 +157,6 @@ pub struct SupportResult {
 /// claim file or a duplicate id. Reported, never fatal, and flooring the exit at
 /// 2.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LoadError {
     /// The file that failed to load, relative to the store root.
     pub file: String,
@@ -162,20 +165,21 @@ pub struct LoadError {
 }
 
 impl CheckReport {
-    /// Parse a `claim check --json` report from its JSON bytes, rejecting any
-    /// unknown or renamed field with the field named.
+    /// Parse a `claim check --json` report from its JSON bytes.
     ///
     /// This is the hub's ingest-side reader of the CLI's wire format. It succeeds
-    /// only on a report whose every hub-relevant field is present and well-typed;
-    /// on any deviation it returns the `serde_json` error, whose message names the
-    /// offending field (`unknown field \`foo\``, `missing field \`exit\``), so a
-    /// rejection tells a producer exactly what to fix (invariant #6: loud, never a
-    /// silent drop).
+    /// on any report whose fields the hub relies on are present and well-typed,
+    /// **tolerating unknown fields** so a newer CLI's added field does not make an
+    /// older hub reject an otherwise-valid report (forward-compat; see the module
+    /// docs). On a genuinely malformed report it returns the `serde_json` error,
+    /// whose message names the offending field (`missing field \`exit\``,
+    /// `invalid type` at a field), so a rejection tells a producer exactly what to
+    /// fix (invariant #6: loud, never a silent drop).
     ///
     /// # Errors
     ///
     /// Returns the [`serde_json::Error`] for malformed JSON, a missing required
-    /// field, a wrong field type, or an unknown field.
+    /// field, or a wrong field type. An *unknown* field is not an error.
     pub fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
         serde_json::from_slice(bytes)
     }
@@ -224,40 +228,64 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_top_level_field_is_rejected_naming_it() {
+    fn an_unknown_top_level_field_is_tolerated() {
+        // Forward-compat: a newer CLI adding a report field must not make an older
+        // hub reject the whole report (that would age the repo's claims into stale
+        // over a field the hub does not need — invariant #6). The unknown field is
+        // ignored and the known fields read through.
         let mut v: serde_json::Value = serde_json::from_str(held_report()).unwrap();
         v.as_object_mut()
             .unwrap()
-            .insert("surprise".into(), serde_json::json!(true));
-        let err = CheckReport::from_json(v.to_string().as_bytes()).unwrap_err();
-        assert!(
-            err.to_string().contains("surprise"),
-            "the error names the offending field: {err}"
-        );
+            .insert("run_duration_ms".into(), serde_json::json!(1234));
+        let report = CheckReport::from_json(v.to_string().as_bytes())
+            .expect("an unknown top-level field is tolerated, not rejected");
+        assert_eq!(report.exit, 0);
+        assert_eq!(report.claims[0].checks[0].verdict, Verdict::Held);
     }
 
     #[test]
-    fn an_unknown_field_on_a_check_is_rejected_naming_it() {
+    fn an_unknown_field_on_a_check_is_tolerated() {
+        // Same forward-compat at the nested level: an added per-check field (e.g. a
+        // future `confidence`) is ignored, and the known fields still parse.
         let mut v: serde_json::Value = serde_json::from_str(held_report()).unwrap();
         v["claims"][0]["checks"][0]
             .as_object_mut()
             .unwrap()
             .insert("confidence".into(), serde_json::json!(0.9));
-        let err = CheckReport::from_json(v.to_string().as_bytes()).unwrap_err();
-        assert!(
-            err.to_string().contains("confidence"),
-            "the error names the nested offending field: {err}"
-        );
+        let report = CheckReport::from_json(v.to_string().as_bytes())
+            .expect("an unknown per-check field is tolerated, not rejected");
+        assert_eq!(report.claims[0].checks[0].verdict, Verdict::Held);
+        assert_eq!(report.claims[0].checks[0].end.kind, "exited");
     }
 
     #[test]
     fn a_missing_required_field_is_rejected_naming_it() {
+        // Tolerating *unknown* fields must not weaken to tolerating a *missing*
+        // required one: serde still rejects it by default, naming it.
         let mut v: serde_json::Value = serde_json::from_str(held_report()).unwrap();
         v.as_object_mut().unwrap().remove("exit");
         let err = CheckReport::from_json(v.to_string().as_bytes()).unwrap_err();
         assert!(
             err.to_string().contains("exit"),
             "the error names the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_field_is_rejected_not_silently_accepted() {
+        // A field present but of the wrong type is genuinely malformed, not a
+        // forward-compat addition: dropping `deny_unknown_fields` must not weaken to
+        // accepting garbage. Here `checked` (an integer count) carries a string, and
+        // the parse fails with a diagnostic naming the expected type and location.
+        // (serde_json reports a scalar type mismatch positionally, not by field name
+        // — unlike a *missing* field, which it does name; that path is covered by
+        // `a_missing_required_field_is_rejected_naming_it`.)
+        let mut v: serde_json::Value = serde_json::from_str(held_report()).unwrap();
+        v["checked"] = serde_json::json!("not a number");
+        let err = CheckReport::from_json(v.to_string().as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type"),
+            "a wrong-typed field is rejected with a diagnostic: {err}"
         );
     }
 

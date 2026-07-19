@@ -38,6 +38,13 @@ use sha2::{Digest, Sha256};
 /// the break explicit and total (every digest changes at once) rather than a
 /// silent partial divergence. It is not a security parameter; it is a schema
 /// version for the digest's input.
+///
+/// Maintenance obligation: [`canonical_bytes`] reads `claim-core`'s [`Check`] and
+/// [`Skip`] field by field, so adding a *semantic* field to either — one that
+/// changes what a check verifies or when it runs — obliges bumping this version.
+/// A new field is not a compile error here (the struct is destructured by the
+/// fields the encoding names, not exhaustively), so it would otherwise be silently
+/// omitted from the digest, letting two materially different checks collide.
 const CANONICAL_VERSION: &[u8] = b"claim-check-digest/1";
 
 /// The canonical, collision-resistant digest of a check's definition, as a
@@ -298,20 +305,31 @@ mod tests {
             "id: t\nchecks:\n  - kind: cmd\n    run: \"x\"\n    skip:\n      reason: a\n      until: 2030-01-01",
         );
         assert_ne!(check_digest(&reason_a), check_digest(&with_until));
+
+        // `unless` is genuine identity: it changes *when* the check runs (a
+        // condition that cancels the skip), so two skips differing only in `unless`
+        // are different verifications and must not share a digest.
+        let with_unless = check_of(
+            "id: t\nchecks:\n  - kind: cmd\n    run: \"x\"\n    skip:\n      reason: a\n      unless: \"test -f flag\"",
+        );
+        assert_ne!(check_digest(&reason_a), check_digest(&with_unless));
     }
 
     #[test]
     fn the_length_prefix_prevents_a_boundary_collision() {
-        // Without length prefixes, ("ab", reason "") could encode identically to
-        // ("a", reason "b"). Prove two such checks digest differently. Both are cmd
-        // checks with a skip; only the split between `run` and `reason` differs.
-        let ab_empty =
+        // Two checks whose concatenated field *bytes* would coincide but for the
+        // length prefixes: `run="ab"` + `reason="z"` versus `run="a"` + `reason="bz"`
+        // move one character across the run/reason boundary while keeping every other
+        // byte equal (both cmd, `negate=false`, same skip-presence byte). The fixed
+        // bytes between the two strings do not disambiguate them — only each field's
+        // own length prefix does — so this fails if a prefix is ever dropped.
+        let ab_z =
             check_of("id: t\nchecks:\n  - kind: cmd\n    run: \"ab\"\n    skip:\n      reason: z");
-        let a_b =
+        let a_bz =
             check_of("id: t\nchecks:\n  - kind: cmd\n    run: \"a\"\n    skip:\n      reason: bz");
         assert_ne!(
-            check_digest(&ab_empty),
-            check_digest(&a_b),
+            check_digest(&ab_z),
+            check_digest(&a_bz),
             "field boundaries must be unambiguous"
         );
     }

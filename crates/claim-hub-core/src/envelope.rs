@@ -16,11 +16,12 @@
 //!   [`claim_core::Verdict`] and `reported_at` is a [`claim_core::Timestamp`], the
 //!   same types the CLI produces — so the two ends of the wire cannot disagree
 //!   about what `held` means or how an instant is spelled.
-//! - **The producer block is verbatim.** The verified pipeline identity (issuer,
-//!   repository, workflow, run) is kept as structured JSON exactly as the ingest
-//!   gate verified it, never distilled into named fields, so the trust judgment
-//!   stays *re-derivable* later rather than made once at the door (HUB.md §4,
-//!   invariant #3).
+//! - **The producer block is kept whole.** The verified pipeline identity (issuer,
+//!   repository, workflow, run) is retained as structured JSON — every claim the
+//!   ingest gate verified, value-for-value, none distilled into named fields — so
+//!   the trust judgment stays *re-derivable* later rather than made once at the
+//!   door (HUB.md §4, invariant #3). It is preserved semantically, not byte-for-byte
+//!   (see [`Producer`]).
 
 use claim_core::{Timestamp, Verdict};
 use serde::{Deserialize, Serialize};
@@ -61,7 +62,7 @@ pub struct Event {
     pub commit: String,
     /// The connected store the claim lives in (e.g. `github.com/acme/payments`).
     pub store: String,
-    /// The verified producer identity, kept verbatim. See [`Producer`].
+    /// The verified producer identity, kept whole. See [`Producer`].
     pub producer: Producer,
     /// When the producer reported this observation (a UTC instant, RFC 3339). The
     /// shared [`claim_core::Timestamp`], so every hub timestamp round-trips
@@ -104,7 +105,7 @@ pub struct CheckRef {
     pub digest: String,
 }
 
-/// The verified producer identity behind an event, kept verbatim.
+/// The verified producer identity behind an event, kept whole.
 ///
 /// The ingest gate verifies a pipeline's OIDC id-token and records the claims it
 /// verified — issuer, repository, workflow, ref, run id — into this block *as it
@@ -115,10 +116,19 @@ pub struct CheckRef {
 /// discard exactly the evidence a future audit needs. Provenance is derived from
 /// this, never asserted by a claim file (invariant #3).
 ///
-/// Held as a `serde_json::Map` so it is always a JSON object and round-trips
-/// key-for-key. The producer's *run* identifier — one of the keys here — is part
-/// of the dedup key HUB.md §2 defines, read by the storage layer, not enforced by
-/// this type.
+/// Held as a `serde_json::Map` so it is always a JSON object. The values are
+/// preserved value-for-value and no key is added or dropped, so the trust judgment
+/// re-derives from exactly the claims that were verified. It is *not* byte-faithful
+/// to the received JSON: this workspace's `serde_json` has no `preserve_order`, so
+/// the map is a `BTreeMap` that sorts keys and re-normalizes whitespace on
+/// re-serialization — the semantics survive, the exact byte form does not. That
+/// matters only for a future the deferred signed-attestation path opens (HUB.md
+/// §4): if the hub ever verifies a signature over the *exact* producer JSON bytes,
+/// it will need byte fidelity (e.g. enabling `serde_json/preserve_order`, or
+/// retaining the raw bytes beside this structured view). A caveat for that item,
+/// not a v1 change. The producer's *run* identifier — one of the keys here — is
+/// part of the dedup key HUB.md §2 defines, read by the storage layer, not
+/// enforced by this type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Producer(pub serde_json::Map<String, serde_json::Value>);
@@ -200,9 +210,11 @@ mod tests {
     }
 
     #[test]
-    fn producer_is_preserved_verbatim_key_for_key() {
-        // A producer with an unusual extra claim must survive round-trip untouched:
-        // the trust judgment is re-derived from the raw block, so nothing is dropped.
+    fn producer_claims_survive_round_trip_value_for_value() {
+        // A producer with an unusual extra claim must survive round-trip with every
+        // key and value intact: the trust judgment is re-derived from the whole
+        // block, so nothing is dropped. (Key *order* and byte form are not promised —
+        // this workspace's serde_json sorts keys — but no claim is lost.)
         let mut event = sample_event();
         event.producer.0.insert(
             "job_workflow_ref".into(),
