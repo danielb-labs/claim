@@ -23,16 +23,30 @@
 //! - [`cap_evidence`] — capping an event's evidence at ingest, truncating with a
 //!   recorded marker rather than dropping silently (invariant #6).
 //!
-//! What is deliberately *not* here: any store, the deriver, the ingest route, or
-//! anything async — those are later hub items. This crate is types and two pure
-//! functions.
+//! On those primitives, hub-06 adds **the deriver** ([`deriver`]): the pure function
+//! that turns a registry snapshot, the ledger's events, a clock, and config into the
+//! read model — per-claim standing, freshness, the due set, skip ages — with the
+//! conservative "bad news dominates" join that no combination of events can turn into
+//! a manufactured green. [`memo`] caches the most recent derivation, invalidated by
+//! exactly the three causes (a new event, a registry change, the clock crossing a
+//! threshold) — a cache, never a store.
+//!
+//! What is deliberately *not* here: any store, the ingest route, or anything async —
+//! those are later hub items. This crate is types and pure functions.
 
+pub mod deriver;
 pub mod envelope;
 pub mod evidence;
+pub mod memo;
 pub mod wire;
 
 mod digest;
 
+pub use deriver::{
+    derive, AsOf, ClaimEntry, ClaimStanding, DeriverConfig, ReadModel, RegistrySnapshot, SkipAge,
+    Standing,
+};
 pub use digest::check_digest;
 pub use envelope::{CheckRef, Event, EventKind, Producer};
 pub use evidence::{cap_evidence, EVIDENCE_CAP};
+pub use memo::Memo;
