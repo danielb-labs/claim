@@ -18,11 +18,12 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 use claim_core::Timestamp;
+use claim_hub_core::{DeriverConfig, Memo};
 use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
 use crate::oidc::SharedVerifier;
-use crate::{ingest, status};
+use crate::{api, ingest, status};
 
 /// A source of the current instant, injectable so ingest is deterministic under test.
 ///
@@ -33,18 +34,33 @@ use crate::{ingest, status};
 /// so [`AppState`] stays `Clone` and cheap to share.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
-/// State shared across the hub's handlers: the store, the OIDC verifier, and the clock.
+/// A source of the read clock, injectable so the read API's derivation is deterministic
+/// under test.
+///
+/// The read surfaces derive a claim's standing *as of a clock instant* — freshness is
+/// arithmetic against it (a claim aging into stale is measured from `now`), and the
+/// instant is part of every answer's as-of (HUB.md §4). In production this is wall-clock
+/// `now`; a test injects a fixed or advancing value so the aging path is exercised without
+/// sleeping (CLAUDE.md's determinism rule). Boxed behind an `Arc` so [`AppState`] stays
+/// `Clone`. Kept distinct from the ingest [`Clock`] because the two are conceptually
+/// different — one stamps *when a verdict was recorded*, the other decides *how stale it is
+/// now* — even though production points both at wall-clock time.
+pub type ReadClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
+/// State shared across the hub's handlers: the store, the OIDC verifier, the clocks, and
+/// the deriver's cache and config.
 ///
 /// The [`SqliteStore`] is a reference-counted pool, so cloning is cheap and every
 /// handler shares one database (HUB-IMPLEMENTATION.md §1.4). The `verifier` is the
 /// ingest gate's OIDC trust anchor, `None` when the hub has no OIDC config (the ingest
-/// route is then not mounted). The `clock` produces the ingest instant. Held in an
-/// [`AppState`] so a later item adds shared state (the deriver's memo) as a field
-/// without changing every handler's extractor.
+/// route is then not mounted). The `clock` produces the ingest instant; the `read_clock`
+/// the read-time derivation instant. The `memo` caches the last derivation (a cache,
+/// never a store — invariant #3), and `deriver_config` is the freshness config the read
+/// API derives under.
 #[derive(Clone)]
 pub struct AppState {
-    /// The ledger-and-registry store `/status` reads, ingest appends to, and later
-    /// surfaces derive over.
+    /// The ledger-and-registry store `/status` reads, ingest appends to, and the read
+    /// API derives over.
     pub store: SqliteStore,
     /// The OIDC verifier the ingest gate authenticates producers with. `None` when the
     /// hub has no `[oidc]` config — the ingest route is then not mounted, so the
@@ -53,39 +69,71 @@ pub struct AppState {
     /// The clock the ingest gate stamps each event's `reported_at` from. Defaults to
     /// wall-clock `now`; a test injects a fixed instant.
     pub clock: Clock,
+    /// The clock the read API derives standing as-of. Defaults to wall-clock `now`; a
+    /// test injects a fixed or advancing instant to exercise clock-driven staleness.
+    pub read_clock: ReadClock,
+    /// The deriver's memo, shared across read requests. A cache the read API derives
+    /// through; discardable by construction (invariant #3). Behind an `Arc` so cloning
+    /// the state shares one cache.
+    pub memo: Arc<Memo>,
+    /// The freshness config the read API derives under, mapped from the hub's `[deriver]`
+    /// section. Its hash keys the memo, so a config change invalidates cached answers.
+    pub deriver_config: DeriverConfig,
 }
 
 impl AppState {
-    /// State for a hub with an ingest gate: the store, its verifier, and wall-clock time.
+    /// State for a hub with an ingest gate: the store, its verifier, wall-clock time, an
+    /// empty memo, and a default (no-window) deriver config.
     ///
-    /// The common production shape. [`with_clock`](AppState::with_clock) swaps the clock
-    /// for a deterministic one under test.
+    /// The common production shape. [`with_clock`](AppState::with_clock) swaps the ingest
+    /// clock, [`with_read_clock`](AppState::with_read_clock) the read clock, and
+    /// [`with_deriver_config`](AppState::with_deriver_config) the freshness config, for
+    /// deterministic tests and for boot to install the config it parsed.
     #[must_use]
     pub fn new(store: SqliteStore, verifier: Option<SharedVerifier>) -> Self {
         Self {
             store,
             verifier,
             clock: Arc::new(Timestamp::now),
+            read_clock: Arc::new(Timestamp::now),
+            memo: Arc::new(Memo::new()),
+            deriver_config: DeriverConfig::default(),
         }
     }
 
-    /// This state with its clock replaced, for deterministic ingest tests.
+    /// This state with its ingest clock replaced, for deterministic ingest tests.
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// This state with its read clock replaced, for deterministic read/aging tests.
+    #[must_use]
+    pub fn with_read_clock(mut self, read_clock: ReadClock) -> Self {
+        self.read_clock = read_clock;
+        self
+    }
+
+    /// This state with its deriver config replaced — boot installs the config it parsed.
+    #[must_use]
+    pub fn with_deriver_config(mut self, config: DeriverConfig) -> Self {
+        self.deriver_config = config;
         self
     }
 }
 
 /// Assemble the hub's axum [`Router`] over `state`, with the shared middleware stack.
 ///
-/// The router is the mount board for every hub surface. It mounts `/status` always, and
-/// the ingest route `POST /ingest` **only when the state carries a verifier** — a hub
-/// with no OIDC config has no way to authenticate a producer, so it exposes no write
-/// path rather than a route that rejects everything. The remaining mount points are
-/// named for the later items:
+/// The router is the mount board for every hub surface. It mounts `/status` always and
+/// the read API's `GET /api/claims/{id}` (the hub-07 walking-skeleton read), and the
+/// ingest route `POST /ingest` **only when the state carries a verifier** — a hub with no
+/// OIDC config has no way to authenticate a producer, so it exposes no write path rather
+/// than a route that rejects everything. The remaining mount points are named for the
+/// later items:
 ///
-/// - **hub-08 JSON API** — the read surface, nested under `/api`.
+/// - **hub-08 JSON API** — the full read surface (query sets, dossier, cursor feed),
+///   growing the `/api` nest this item seeds with one endpoint.
 /// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
 ///   `Router::nest_service`.
 /// - **hub-10 UI + twins** — the server-rendered pages, `/llms.txt`, and the `.md`
@@ -95,14 +143,17 @@ impl AppState {
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
 /// whole router, and it is where a later item stacks auth and timeout layers.
 pub fn build_app(state: AppState) -> Router {
-    let mut router = Router::new().route("/status", get(status::status));
+    let mut router = Router::new()
+        .route("/status", get(status::status))
+        // The read API's one hub-07 endpoint: derive a claim's standing over the live
+        // store. hub-08 grows the rest of the read surface into this same nest.
+        .merge(api::router());
     if state.verifier.is_some() {
         // The single telemetry write path (HUB.md §3). Mounted only with a verifier so a
         // hub that cannot authenticate producers exposes no ingest at all.
         router = router.route("/ingest", post(ingest::ingest));
     }
     router
-        // hub-08: `.nest("/api", api::router())`.
         // hub-09: `.nest_service("/mcp", mcp_service)`.
         // hub-10: the UI pages, `/llms.txt`, and the markdown twins.
         .layer(TraceLayer::new_for_http())

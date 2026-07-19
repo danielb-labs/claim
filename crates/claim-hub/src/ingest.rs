@@ -41,6 +41,7 @@ use serde::Serialize;
 use std::str::FromStr;
 
 use crate::app::AppState;
+use crate::http::problem;
 use crate::oidc::{AuthReject, VerifiedProducer, VerifyError};
 
 /// The `Authorization: Bearer <token>` scheme prefix the OIDC id-token arrives under.
@@ -373,28 +374,6 @@ async fn count_rejection(state: &AppState) {
     if let Err(error) = state.store.record_rejection().await {
         tracing::error!(%error, "failed to record an ingest rejection in the counter");
     }
-}
-
-/// Build a `{ "error": <reason> }` JSON problem response with `status`.
-///
-/// One shape for every non-2xx, so a producer (human or agent) reads the reason the same
-/// way regardless of which check failed. The body is machine-readable and the reason is
-/// the loud, actionable message.
-fn problem(status: StatusCode, reason: &str) -> Response {
-    (
-        status,
-        Json(ProblemBody {
-            error: reason.to_owned(),
-        }),
-    )
-        .into_response()
-}
-
-/// The body of a rejection: a single machine-readable reason.
-#[derive(Debug, Serialize)]
-struct ProblemBody {
-    /// The producer-facing reason the push was refused, naming what to fix.
-    error: String,
 }
 
 /// The body of an accepted ingest: how many events landed and where.

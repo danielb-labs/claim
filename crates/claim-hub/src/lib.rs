@@ -26,8 +26,10 @@
 //! ([`serve`]), so a test drives the whole router in-process via
 //! [`tower::ServiceExt::oneshot`] with no bound port and no network.
 
+pub mod api;
 pub mod app;
 pub mod config;
+pub mod http;
 pub mod ingest;
 pub mod oidc;
 pub mod status;
@@ -63,13 +65,14 @@ pub fn init_tracing() {
 /// This is the boot path: it opens (creating if absent) the SQLite database at
 /// `config.database` via [`SqliteStore::open`], which runs the embedded migrations,
 /// so a hub pointed at an empty directory stands up its own schema on first boot
-/// (HUB-IMPLEMENTATION.md §1.13). When the config carries an `[oidc]` section it builds
-/// the ingest gate's verifier, so `POST /ingest` is mounted; with no OIDC config the hub
-/// serves reads only and exposes no write path. It then binds
-/// `config.listen` and serves the router. A database that will not open, an OIDC trust
-/// anchor that cannot initialize, or an address that will not bind is a loud boot
-/// failure naming the fault — a hub that cannot serve says so rather than exiting
-/// silently.
+/// (HUB-IMPLEMENTATION.md §1.13). It maps the `[deriver]` section onto the read API's
+/// freshness config, so the read surface ages claims per the operator's window. When the
+/// config carries an `[oidc]` section it builds the ingest gate's verifier, so
+/// `POST /ingest` is mounted; with no OIDC config the hub serves reads only and exposes no
+/// write path. It then binds `config.listen` and serves the router. A database that will
+/// not open, a malformed `[deriver]` window, an OIDC trust anchor that cannot initialize,
+/// or an address that will not bind is a loud boot failure naming the fault — a hub that
+/// cannot serve says so rather than exiting silently.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let store = SqliteStore::open(&config.database).await.with_context(|| {
         format!(
@@ -77,13 +80,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             config.database.display()
         )
     })?;
+    let deriver_config = config
+        .deriver_config()
+        .context("configuring the read API's freshness windows")?;
     let verifier = build_verifier(&config).context("configuring the ingest gate (OIDC)")?;
     if verifier.is_none() {
         tracing::warn!(
             "no [oidc] config: the ingest gate is not mounted; the hub serves reads only"
         );
     }
-    let app = build_app(AppState::new(store, verifier));
+    let app = build_app(AppState::new(store, verifier).with_deriver_config(deriver_config));
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding the hub listener on `{}`", config.listen))?;

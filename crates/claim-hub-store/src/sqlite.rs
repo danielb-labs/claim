@@ -16,8 +16,8 @@ use crate::findings::{Findings, SyncFinding};
 use crate::ledger::{Appended, Ledger, Position, StoredEvent};
 use crate::registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 use crate::rejections::Rejections;
-use claim_core::{ClaimId, Timestamp, Verdict};
-use claim_hub_core::{CheckRef, Event, EventKind, Producer};
+use claim_core::{ClaimId, Days, Timestamp, Verdict};
+use claim_hub_core::{CheckRef, Event, EventKind, HubHints, Producer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
@@ -359,15 +359,22 @@ async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) 
 
     for claim in claims {
         let id = claim.id.as_str();
+        // The claim's `hub:` hints as their canonical `<N>d` strings (or NULL), so the
+        // deriver ages the claim on its own declared cadence. `Days`'s Display is the
+        // file's exact spelling, round-tripped losslessly by its FromStr on read.
+        let hub_max_age = claim.hub.max_age.map(|d| d.to_string());
+        let hub_recheck = claim.hub.recheck.map(|d| d.to_string());
         sqlx::query!(
             r#"
-            INSERT INTO claims_at_tip (store, claim_id, statement, "commit")
-            VALUES (?, ?, ?, ?)
+            INSERT INTO claims_at_tip (store, claim_id, statement, "commit", hub_max_age, hub_recheck)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
             store,
             id,
             claim.statement,
             claim.commit,
+            hub_max_age,
+            hub_recheck,
         )
         .execute(&mut **tx)
         .await?;
@@ -490,10 +497,20 @@ impl Registry for SqliteStore {
         Ok(RegistryVersion(row.version))
     }
 
+    async fn stores(&self) -> Result<Vec<String>> {
+        // `store` is a TEXT PRIMARY KEY, which sqlite reports as nullable in query
+        // metadata; the `!` asserts the non-null the schema guarantees so the column
+        // maps to `String`, not `Option<String>`.
+        let rows = sqlx::query!(r#"SELECT store AS "store!" FROM stores ORDER BY store ASC"#)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.store).collect())
+    }
+
     async fn claims_of(&self, store: &str) -> Result<Vec<RegisteredClaim>> {
         let rows = sqlx::query!(
             r#"
-            SELECT claim_id, statement, "commit" AS commit_sha
+            SELECT claim_id, statement, "commit" AS commit_sha, hub_max_age, hub_recheck
             FROM claims_at_tip
             WHERE store = ?
             ORDER BY claim_id ASC
@@ -514,6 +531,7 @@ impl Registry for SqliteStore {
                 supports,
                 commit: row.commit_sha,
                 check_digests,
+                hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
             });
         }
         Ok(claims)
@@ -523,7 +541,7 @@ impl Registry for SqliteStore {
         let id_str = id.as_str();
         let row = sqlx::query!(
             r#"
-            SELECT statement, "commit" AS commit_sha
+            SELECT statement, "commit" AS commit_sha, hub_max_age, hub_recheck
             FROM claims_at_tip
             WHERE store = ? AND claim_id = ?
             "#,
@@ -544,6 +562,7 @@ impl Registry for SqliteStore {
             supports,
             commit: row.commit_sha,
             check_digests,
+            hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
         }))
     }
 
@@ -719,6 +738,35 @@ fn parse_claim_id(s: &str) -> Result<ClaimId> {
         context: "claim_id is not a valid claim id".to_owned(),
         value: s.to_owned(),
     })
+}
+
+/// Build [`HubHints`] from the stored `<N>d` hint columns, or fail loudly on a value the
+/// day-count parser rejects.
+///
+/// `None` in (the column was NULL — the claim declared no such hint) yields `None` out.
+/// A present value is parsed with [`Days`]'s `FromStr`; a stored string it rejects is a
+/// foreign writer or corruption, surfaced as [`StoreError::Corrupt`] rather than coerced
+/// to a silent `None` — which would drop a real freshness window and let a stale claim
+/// read green (invariant #6). The value written was `Days::to_string`, so a round-trip is
+/// lossless and this only fails on genuine corruption.
+fn hub_hints(max_age: Option<&str>, recheck: Option<&str>) -> Result<HubHints> {
+    Ok(HubHints {
+        max_age: parse_days_column("hub_max_age", max_age)?,
+        recheck: parse_days_column("hub_recheck", recheck)?,
+    })
+}
+
+/// Parse one stored `<N>d` hint column into `Option<Days>`, naming the column on
+/// corruption.
+fn parse_days_column(column: &str, value: Option<&str>) -> Result<Option<Days>> {
+    value
+        .map(|raw| {
+            Days::from_str(raw).map_err(|_| StoreError::Corrupt {
+                context: format!("{column} is not a valid day count"),
+                value: raw.to_owned(),
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

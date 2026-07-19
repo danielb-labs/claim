@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT store AS \"store!\" FROM stores ORDER BY store ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "store!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a040a39d8bedd79ea87de30ad39b2699d65d6a60e77386b98cb7d86e6e63ebbc"
+}

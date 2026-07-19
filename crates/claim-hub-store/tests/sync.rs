@@ -215,6 +215,30 @@ async fn sync_stores_each_claims_check_digests_for_the_ingest_gate() {
 }
 
 #[tokio::test]
+async fn sync_persists_a_claims_hub_hints_so_the_deriver_ages_on_its_own_cadence() {
+    // The full path from git: a claim declaring `hub: max-age/recheck` is synced, and the
+    // registry holds its hints, so the deriver ages it on its OWN window — not only a hub
+    // config default (invariant #6: a stale fact must not read green).
+    let fixture = Fixture::new();
+    let body = "---\nid: pin\nhub:\n  max-age: 30d\n  recheck: 7d\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nStatement.\n";
+    fixture.write(".claims/pin.md", body);
+    fixture.commit("a claim with hub hints");
+
+    let (store, dir) = store().await;
+    sync_store(&store, &fixture.connected(), &mirror_root(&dir))
+        .await
+        .unwrap();
+
+    let claim = store
+        .claim(STORE_ID, &ClaimId::from_str("pin").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.hub.max_age, Some("30d".parse().unwrap()));
+    assert_eq!(claim.hub.recheck, Some("7d".parse().unwrap()));
+}
+
+#[tokio::test]
 async fn deleting_a_claim_retires_it_and_clears_both_supports_directions() {
     let fixture = Fixture::new();
     fixture.write(".claims/a.md", &claim_file("a", "A", &["decisions/shared"]));
@@ -478,6 +502,7 @@ async fn a_snapshot_write_is_atomic_so_a_failure_never_drops_a_findings_nag() {
         supports: vec![],
         commit: "c1".to_owned(),
         check_digests: Vec::new(),
+        hub: Default::default(),
     };
     let finding = |file: &str| SyncFinding {
         store: STORE_ID.to_owned(),

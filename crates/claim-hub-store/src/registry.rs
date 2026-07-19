@@ -71,6 +71,53 @@ pub struct RegisteredClaim {
     /// out-of-range index at ingest is a claim the producer and the registry disagree
     /// about, rejected rather than fabricated (invariant #6).
     pub check_digests: Vec<String>,
+    /// The claim's own `hub:` freshness hints (`max-age`, `recheck`), persisted so the
+    /// deriver ages a claim on ITS OWN declared cadence, not only a hub-wide config
+    /// default. Registry sync has `claim.hub` in hand at parse time, so it records them
+    /// here; the deriver reads them straight through with the hub config as override and
+    /// fallback. Either field is `None` for a claim that declares no such hint — the
+    /// deriver then falls back to config. Without this a claim declaring `max-age: 30d`
+    /// would read `verified` past 30 days (or forever, under no config window), a stale
+    /// fact showing green (invariant #6).
+    ///
+    /// [`HubHints`](claim_hub_core::HubHints), not `claim_core::Hub`: the store must be
+    /// able to *build* this from stored day counts, and `Hub` is `#[non_exhaustive]` (no
+    /// cross-crate struct literal). `HubHints` is the deriver's own constructible mirror
+    /// of the two frozen v1 hints, so it flows to the deriver with no conversion.
+    pub hub: claim_hub_core::HubHints,
+}
+
+impl RegisteredClaim {
+    /// Build the registry's stored shape from a parsed [`claim_core::Claim`] read at
+    /// `commit`.
+    ///
+    /// The one place a `Claim` becomes a `RegisteredClaim`, so registry sync and any test
+    /// that seeds a claim map the same fields the same way — the check digests via the one
+    /// canonical [`claim_hub_core::check_digest`], the supports targets as their canonical
+    /// strings, and the `hub:` hints straight across. Keeping this a single constructor is
+    /// what stops the sync path and a test seeder from drifting on how a claim is stored.
+    #[must_use]
+    pub fn from_claim(claim: &claim_core::Claim, commit: &str) -> Self {
+        Self {
+            id: claim.id.clone(),
+            statement: claim.statement.clone(),
+            supports: claim
+                .supports
+                .iter()
+                .map(|t| t.as_str().to_owned())
+                .collect(),
+            commit: commit.to_owned(),
+            check_digests: claim
+                .checks
+                .iter()
+                .map(claim_hub_core::check_digest)
+                .collect(),
+            hub: claim_hub_core::HubHints {
+                recheck: claim.hub.recheck,
+                max_age: claim.hub.max_age,
+            },
+        }
+    }
 }
 
 /// One `supports` edge in the cross-store index: a claim and a target it justifies.
@@ -149,6 +196,17 @@ pub trait Registry {
     /// The current registry version — the number of syncs applied. `0` on a fresh
     /// registry. One of the deriver's memo keys.
     fn version(&self) -> impl std::future::Future<Output = Result<RegistryVersion>> + Send;
+
+    /// Every connected store's canonical id, in ascending order.
+    ///
+    /// A store appears here from the moment it is connected (its first
+    /// [`replace_store`](Registry::replace_store)/[`replace_store_snapshot`](Registry::replace_store_snapshot)),
+    /// even with no live claims — a connected-but-empty store is still connected. The
+    /// deriver-snapshot builder walks these to gather every claim across every store into
+    /// one [`claim_hub_core::RegistrySnapshot`], so a read endpoint derives the whole read
+    /// model rather than one store's slice. Ascending order keeps that build
+    /// deterministic.
+    fn stores(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
 
     /// Every claim currently at tip in `store`, in ascending id order.
     ///

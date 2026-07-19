@@ -1,0 +1,62 @@
+# A minimal compose example that boots the claim-hub binary against an EMPTY mounted
+# volume, proving the self-host "boots from empty" guarantee: point the hub at a fresh
+# directory and it creates and migrates its own SQLite database on first boot, then
+# serves /status truthfully (head 0 / version 0 until a sync and ingest populate it).
+#
+# This is deliberately minimal (hub-07). The proper container image — a small musl binary
+# plus git and CA certs — is hub-15; until it lands, this example builds and runs the
+# binary from source inside the official Rust image, with the repository mounted read-only
+# and a SEPARATE, initially-empty named volume for the one file the customer owns (the
+# database). That separation is the point: the data volume starts empty, and the hub
+# stands up its whole schema in it on the first boot with no external tooling.
+#
+# Run it from the repository root:
+#
+#     docker compose -f examples/hub/docker-compose.yml up
+#
+# then, from another shell:
+#
+#     curl -s http://127.0.0.1:8080/status
+#     # => {"ledger_head":0,"registry_version":0,"rejection_count":0}
+#
+# The `hub-data` volume holds `hub.db`; export it with `docker compose cp`, or delete the
+# whole hub by removing the volume (`docker compose down -v`) — export is a copy, delete is
+# an rm, and there is no database server the product runs on your behalf (HUB.md §1).
+
+services:
+  hub:
+    image: rust:1-bookworm
+    working_dir: /repo
+    # The hub reads its config file and creates/migrates the database it names on first
+    # boot. CLAIM_HUB_LISTEN and CLAIM_HUB_DATABASE override the file per instance, so the
+    # database lands on the mounted data volume regardless of what the file says. Binding
+    # 0.0.0.0 (not the loopback default) is required for the port to be reachable from
+    # outside the container; it is safe here because only the mapped port below is exposed.
+    # CARGO_TARGET_DIR / CARGO_HOME point at writable volumes because the repo is mounted
+    # read-only — a from-source build needs somewhere to write. (In hub-15's prebuilt
+    # image none of this remains: the binary is already compiled.)
+    environment:
+      CLAIM_HUB_LISTEN: "0.0.0.0:8080"
+      CLAIM_HUB_DATABASE: "/data/hub.db"
+      CARGO_TARGET_DIR: "/build/target"
+      CARGO_HOME: "/build/cargo"
+    command: >
+      sh -c "printf 'listen = \"0.0.0.0:8080\"\n' > /data/hub.toml &&
+             cargo run --quiet -p claim-hub -- --config /data/hub.toml"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # The repository, read-only: the source the binary is built from. Replaced by a
+      # prebuilt image in hub-15, at which point this mount and the `cargo run` command go
+      # away entirely.
+      - ../..:/repo:ro
+      # The one file the customer owns. Starts EMPTY — the hub creates hub.db here on first
+      # boot. This is what makes "boots from an empty mounted volume" literally true.
+      - hub-data:/data
+      # A writable build cache, so the read-only repo mount can still be compiled from.
+      # Only needed while this example builds from source (removed with hub-15's image).
+      - hub-build:/build
+
+volumes:
+  hub-data:
+  hub-build:

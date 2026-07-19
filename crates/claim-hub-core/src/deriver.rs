@@ -48,15 +48,20 @@ use serde::Serialize;
 use crate::check_digest;
 use crate::envelope::{Event, EventKind};
 
-/// One claim as the registry holds it at a store's tip: its parsed definition and
-/// the store it lives in.
+/// One claim as the deriver joins over it at a store's tip: its id, the store it
+/// lives in, its per-check identities and skips, and its `hub:` freshness hints.
 ///
-/// The registry ([`RegistrySnapshot`]) is the hub's mirror of git — every claim
-/// file at the tip of its default branch — so a claim's *definition* (its checks,
-/// and its `hub:` freshness hints) reaches the deriver through this type, parsed by
-/// the one `claim-core` grammar that the CLI also uses. The deriver reads the
-/// checks to compute their digests (the join's keys) and the `hub:` hints to
-/// compute freshness; it never parses anything itself.
+/// The registry ([`RegistrySnapshot`]) is the hub's mirror of git — every claim file
+/// at the tip of its default branch — so a claim's derivation-relevant shape reaches
+/// the deriver through this type. It deliberately carries the **already-computed check
+/// digests** (the join's keys) rather than the checks' full definitions, so the type is
+/// buildable from what the storage layer holds — the registry stores each check's
+/// content digest, not its source. This is the integration seam hub-07 wires: a store
+/// builds a `ClaimEntry` from its `RegisteredClaim` with [`new`](ClaimEntry::new), and a
+/// caller holding a parsed [`Claim`] builds one with [`from_claim`](ClaimEntry::from_claim),
+/// which computes each digest with the one canonical [`crate::check_digest`] the registry
+/// and ingest also use — so the deriver's per-check join keys match the ledger events'
+/// digests by construction, never by a recomputation that could diverge.
 ///
 /// The `store` is the connected store the claim lives in (e.g.
 /// `github.com/acme/payments`), matched against an [`Event`]'s `store`+`claim` to
@@ -66,16 +71,122 @@ pub struct ClaimEntry {
     /// The connected store this claim lives in, as it appears on an event's
     /// `store` field.
     pub store: String,
-    /// The parsed claim: its id, checks, and `hub:` hints. Its checks' digests are
-    /// the identities the join keys verdict history on.
-    pub claim: Claim,
+    /// The claim's id, as events reference it (`claim` on the envelope).
+    pub id: String,
+    /// Each check's derivation-relevant facts, in the claim's declared check order:
+    /// the content digest the join keys verdict history on, and the declared skip.
+    /// The order matters only for surfacing; identity is the digest.
+    pub checks: Vec<DerivedCheck>,
+    /// The claim's `hub:` freshness hints (`recheck`, `max-age`), used to compute
+    /// due-ness and staleness. A hub config override wins over these (see
+    /// [`DeriverConfig`]); absent both, the config default (if any) governs.
+    pub hub: HubHints,
+}
+
+/// One check's facts the deriver folds: its content identity and any declared skip.
+///
+/// The digest is [`crate::check_digest`] of the check's canonical definition — the
+/// ledger's join key (issue #18), so a verdict lands only on the check whose definition
+/// it was reported against. The skip is carried for the review queue (it is never a
+/// pass); a skip's presence does not freshen a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedCheck {
+    /// The check's canonical content digest — the identity the ledger keys on.
+    pub digest: String,
+    /// The declared skip on this check, if any. `None` — the common case — means the
+    /// check always runs.
+    pub skip: Option<DerivedSkip>,
+}
+
+/// The skip data the deriver surfaces on a standing for the review queue.
+///
+/// A skip is an acknowledged, bounded debt, never a pass ([`SkipAge`] is what the read
+/// model exposes it as). This carries the two fields the queue reads — the reason and
+/// the optional expiry — decoupled from `claim-core`'s `Skip` so the deriver's input
+/// stays buildable from stored data (the store persists these fields, not a `Skip`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedSkip {
+    /// The author's justification (`skip.reason`).
+    pub reason: String,
+    /// The skip's expiry, if it declared one. `None` is an indefinite skip.
+    pub until: Option<Timestamp>,
+}
+
+/// A claim's `hub:` freshness hints, as the deriver reads them.
+///
+/// The frozen v1 hint set (HUB-IMPLEMENTATION.md §4.5): `recheck` cadence and `max-age`
+/// freshness window, both optional day counts. A plain struct so the store can build it
+/// from stored day counts and the parser-produced [`claim_core::Hub`] maps onto it
+/// directly (see [`ClaimEntry::from_claim`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HubHints {
+    /// The recheck cadence hint: how often the hub should re-check this claim. `None`
+    /// when the claim declares none.
+    pub recheck: Option<Days>,
+    /// The freshness-window hint: how long a passing check keeps the claim fresh. `None`
+    /// when the claim declares none; the config default (if any) then governs.
+    pub max_age: Option<Days>,
 }
 
 impl ClaimEntry {
+    /// A claim entry from already-derived facts, as the storage layer builds it.
+    ///
+    /// The `id` and `store` are the claim's identity; `checks` carries each check's
+    /// stored digest and skip in declared order; `hub` its freshness hints. The digests
+    /// must be the canonical [`crate::check_digest`] of the checks — the storage layer
+    /// gets them from registry sync, which computed them with that same function, so the
+    /// join keys match the ledger by construction.
+    #[must_use]
+    pub fn new(
+        store: impl Into<String>,
+        id: impl Into<String>,
+        checks: Vec<DerivedCheck>,
+        hub: HubHints,
+    ) -> Self {
+        Self {
+            store: store.into(),
+            id: id.into(),
+            checks,
+            hub,
+        }
+    }
+
+    /// A claim entry from a parsed [`Claim`], computing each check's digest.
+    ///
+    /// The convenience for a caller that holds the parsed claim (the deriver's own
+    /// tests, and any path that reads a store through `claim-core`): it computes each
+    /// check's [`crate::check_digest`] — the identical function the registry and ingest
+    /// use — extracts each check's skip, and maps the claim's `hub:` hints onto
+    /// [`HubHints`]. Using one digest function everywhere is what keeps a check's
+    /// identity the same across the registry, the ingest gate, and the deriver.
+    #[must_use]
+    pub fn from_claim(store: impl Into<String>, claim: &Claim) -> Self {
+        let checks = claim
+            .checks
+            .iter()
+            .map(|check| DerivedCheck {
+                digest: check_digest(check),
+                skip: check.skip.as_ref().map(|skip| DerivedSkip {
+                    reason: skip.reason.clone(),
+                    until: skip.until,
+                }),
+            })
+            .collect();
+        Self::new(
+            store,
+            claim.id.as_str().to_owned(),
+            checks,
+            HubHints {
+                recheck: claim.hub.recheck,
+                max_age: claim.hub.max_age,
+            },
+        )
+    }
+
     /// The claim's id string, as events reference it (`claim` on the envelope).
     #[must_use]
     pub fn id(&self) -> &str {
-        self.claim.id.as_str()
+        &self.id
     }
 }
 
@@ -153,9 +264,9 @@ impl DeriverConfig {
     ///
     /// `None` means no window applies — the claim never ages into stale by the
     /// clock (though it is still stale until it has ever passed).
-    fn effective_max_age(&self, claim: &Claim) -> Option<Days> {
+    fn effective_max_age(&self, hub: &HubHints) -> Option<Days> {
         self.max_age_override
-            .or(claim.hub.max_age)
+            .or(hub.max_age)
             .or(self.default_max_age)
     }
 }
@@ -170,8 +281,8 @@ impl DeriverConfig {
 /// it would ignore would be a false parallel with [`DeriverConfig::effective_max_age`]
 /// (which genuinely needs three sources). `None` means the claim declares no cadence
 /// and the deriver computes no due instant for it.
-fn effective_recheck(claim: &Claim) -> Option<Days> {
-    claim.hub.recheck
+fn effective_recheck(hub: &HubHints) -> Option<Days> {
+    hub.recheck
 }
 
 /// The derivation's provenance: the exact inputs a read model was computed from.
@@ -495,25 +606,22 @@ fn derive_claim(
     config: &DeriverConfig,
 ) -> ClaimStanding {
     let store = &entry.store;
-    let claim = &entry.claim;
 
-    // Each check's latest state, keyed by its content digest.
-    let states: Vec<CheckState> = claim
+    // Each check's latest state, keyed by its content digest. The digest is the
+    // registry's stored one (or, via `from_claim`, computed by the same
+    // `check_digest`), so a verdict lands only on the check whose definition it names.
+    let states: Vec<CheckState> = entry
         .checks
         .iter()
         .map(|check| CheckState {
             latest: latest
-                .get(&(
-                    store.clone(),
-                    claim.id.as_str().to_owned(),
-                    check_digest(check),
-                ))
+                .get(&(store.clone(), entry.id.clone(), check.digest.clone()))
                 .copied(),
         })
         .collect();
 
-    let max_age = config.effective_max_age(claim);
-    let recheck = effective_recheck(claim);
+    let max_age = config.effective_max_age(&entry.hub);
+    let recheck = effective_recheck(&entry.hub);
 
     // The freshness baseline: the instant every check last passed. A claim is only
     // as fresh as its *stalest* passing check, and only if every check has passed at
@@ -539,12 +647,12 @@ fn derive_claim(
         ),
     };
 
-    let skips = claim
+    let skips = entry
         .checks
         .iter()
         .filter_map(|check| {
             check.skip.as_ref().map(|skip| SkipAge {
-                check_digest: check_digest(check),
+                check_digest: check.digest.clone(),
                 reason: skip.reason.clone(),
                 until: skip.until,
             })
@@ -552,7 +660,7 @@ fn derive_claim(
         .collect();
 
     ClaimStanding {
-        id: claim.id.as_str().to_owned(),
+        id: entry.id.clone(),
         store: store.clone(),
         standing,
         verified_as_of,
@@ -776,10 +884,7 @@ mod tests {
             version: 1,
             claims: claims
                 .into_iter()
-                .map(|(store, claim)| ClaimEntry {
-                    store: store.into(),
-                    claim,
-                })
+                .map(|(store, claim)| ClaimEntry::from_claim(store, &claim))
                 .collect(),
         }
     }

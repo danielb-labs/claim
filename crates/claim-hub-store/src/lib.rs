@@ -32,6 +32,11 @@
 //! so a hub silently turning telemetry away is visible rather than quietly aging
 //! claims into stale (invariant #6, HUB.md §3).
 //!
+//! The [`snapshot`] module bridges the store to the deriver: [`registry_snapshot`] and
+//! [`ledger_events`] turn the stored registry and ledger into the pure
+//! [`claim_hub_core::derive`] inputs, so a read surface runs the real deriver over the
+//! real store (the hub-07 walking skeleton) without the deriver ever seeing SQL.
+//!
 //! The one implementation is [`SqliteStore`], over a single WAL-mode SQLite file —
 //! the data-ownership invariant made physical (export is `cp`, delete is `rm`) —
 //! implementing [`Ledger`], [`Registry`], [`Findings`], and [`Rejections`].
@@ -41,6 +46,7 @@ pub mod findings;
 pub mod ledger;
 pub mod registry;
 pub mod rejections;
+pub mod snapshot;
 pub mod sqlite;
 pub mod sync;
 
@@ -49,6 +55,7 @@ pub use findings::{Findings, SyncFinding};
 pub use ledger::{Appended, Ledger, Position, StoredEvent};
 pub use registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 pub use rejections::Rejections;
+pub use snapshot::{ledger_events, registry_snapshot};
 pub use sqlite::{SqliteStore, MIGRATOR};
 pub use sync::{
     spawn_interval_poll, sync_store, ConnectedStore, SyncOutcome, DEFAULT_BRANCH,

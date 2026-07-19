@@ -1,4 +1,4 @@
-//! Shared harness for the ingest-gate integration tests.
+//! Shared harness for the hub's integration tests (ingest and the walking skeleton).
 //!
 //! The whole point is a **deterministic, network-free** verification path: the tests
 //! sign their own OIDC id-tokens with a fixed RSA key and verify them against an
@@ -6,6 +6,12 @@
 //! reaching into real time — the app's clock and the JWKS source are both parameters
 //! (CLAUDE.md's determinism rule). A forged token is signed with a *different* key, so
 //! the signature genuinely fails against the injected set.
+//!
+//! Shared by more than one test binary (`ingest.rs` and `skeleton.rs`), each of which
+//! uses a subset of these helpers, so `#![allow(dead_code)]` keeps the binary that does
+//! not exercise a given helper from warning — the helper is live in the *other* binary.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -14,7 +20,6 @@ use axum::http::{Request, StatusCode};
 use claim_core::{Claim, Timestamp};
 use claim_hub::app::{AppState, Clock};
 use claim_hub::oidc::{JwksSource, OidcError, OidcVerifier};
-use claim_hub_core::check_digest;
 use claim_hub_store::{RegisteredClaim, Registry, SqliteStore};
 use http_body_util::BodyExt;
 use jsonwebtoken::jwk::JwkSet;
@@ -315,23 +320,13 @@ fn sign_body(body: &serde_json::Value, key_pem: &str) -> String {
     encode(&header, body, &key).expect("sign token")
 }
 
-/// Seed the registry with a claim parsed from `frontmatter`, so its check digests are
-/// stored and the ingest gate can resolve them by index. Returns the parsed claim (whose
-/// checks the caller uses to compute expected digests).
+/// Seed the registry with a claim parsed from `frontmatter`, so its check digests and
+/// `hub:` hints are stored and the ingest gate/deriver can read them. Returns the parsed
+/// claim (whose checks the caller uses to compute expected digests).
 pub async fn seed_claim(store: &SqliteStore, file: &str, frontmatter: &str) -> Claim {
     let text = format!("---\n{frontmatter}\n---\nStatement body.\n");
     let claim = claim_core::parse_claim_file(file, &text).expect("valid claim fixture");
-    let registered = RegisteredClaim {
-        id: claim.id.clone(),
-        statement: claim.statement.clone(),
-        supports: claim
-            .supports
-            .iter()
-            .map(|t| t.as_str().to_owned())
-            .collect(),
-        commit: "seedcommit".to_owned(),
-        check_digests: claim.checks.iter().map(check_digest).collect(),
-    };
+    let registered = RegisteredClaim::from_claim(&claim, "seedcommit");
     store
         .replace_store(TEST_STORE, &[registered])
         .await

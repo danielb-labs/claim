@@ -1,0 +1,25 @@
+-- The claim-level `hub:` freshness hints, persisted so the deriver honors a claim's
+-- OWN declared cadence — not just a hub-wide config default.
+--
+-- Why this must be stored: the deriver computes a claim's staleness from `max-age`
+-- (the freshness window) and its due-ness from `recheck` (the cadence). Registry sync
+-- parses the whole claim and has `claim.hub` in hand; without persisting it, a claim
+-- that declared `hub.max-age: 30d` would age only on the hub config's default window,
+-- and under no config default it would read `verified` FOREVER on one passing check —
+-- a stale fact showing green, the exact false-green invariant #6 forbids. Storing the
+-- hints beside `claims_at_tip` (one row per claim already) lets the deriver's
+-- `effective_max_age`/`effective_recheck` see the claim's own hint, with the hub config
+-- remaining the override (max_age_override) and fallback (default_max_age).
+--
+-- Stored as the canonical `<N>d` day-count TEXT — the exact spelling a claim file uses
+-- and `claim_core::Days` round-trips — so the value re-parses losslessly and a reader
+-- sees the author's own form. NULL means the claim declared no such hint (the common
+-- case); the deriver then falls back to config. Only `max-age` and `recheck` exist:
+-- the `hub:` key set is frozen at those two (HUB-IMPLEMENTATION.md §4.5), so a new key
+-- is a `claim-core` parser change first, and this schema grows with it, not ahead of it.
+--
+-- Rebuilt with the claim's snapshot: these columns live on `claims_at_tip`, so a
+-- snapshot replace for a store wipes and re-inserts them with the row — an edited or
+-- removed hint never lingers past the next sync.
+ALTER TABLE claims_at_tip ADD COLUMN hub_max_age TEXT; -- `<N>d`, or NULL if undeclared.
+ALTER TABLE claims_at_tip ADD COLUMN hub_recheck TEXT; -- `<N>d`, or NULL if undeclared.

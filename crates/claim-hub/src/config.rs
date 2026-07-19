@@ -62,6 +62,12 @@ pub struct Config {
     #[serde(default)]
     pub hub_overrides: HubOverrides,
 
+    /// The freshness knobs the deriver reads: a hub-wide default and override for a
+    /// claim's `hub.max-age` (HUB-IMPLEMENTATION.md §1.5). Mapped onto the deriver's
+    /// [`DeriverConfig`](claim_hub_core::DeriverConfig) via [`Config::deriver_config`].
+    #[serde(default)]
+    pub deriver: DeriverConfigToml,
+
     /// The read-auth policy for the API and MCP surfaces (hub-13). Defaults to the
     /// secure default (authed-everything); the shell serves only `/status`, which is
     /// unauthenticated health, so nothing enforces this yet.
@@ -119,6 +125,29 @@ pub struct ReadAuthConfig {
     pub open_reads: bool,
 }
 
+/// The deriver's freshness knobs, as the TOML file spells them.
+///
+/// The deriver ([`claim_hub_core::derive`]) needs a hub-wide default and override for a
+/// claim's `hub.max-age` (HUB-IMPLEMENTATION.md §1.5): `default_max_age` applies to a
+/// claim that declares no `max-age`, and `max_age_override` wins over a claim's own
+/// hint (the hub operator's word on cadence is final). Both are `<N>d` day-count strings
+/// — the same spelling a claim file uses — parsed into [`claim_core::Days`] by
+/// [`Config::deriver_config`], so a malformed value is a loud config error naming the
+/// field, never a silent fallback. Absent both, no window applies and a passing claim
+/// stays fresh forever (the CLI's stance: absent a window, the hub does not invent one).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeriverConfigToml {
+    /// The freshness window for a claim declaring no `hub.max-age`, as `<N>d`. `None`
+    /// leaves such a claim un-aged by the clock.
+    #[serde(default)]
+    pub default_max_age: Option<String>,
+    /// A hub-wide override applied to every claim regardless of its own `hub.max-age`,
+    /// as `<N>d`. `None` lets each claim's own hint (then the default) govern.
+    #[serde(default)]
+    pub max_age_override: Option<String>,
+}
+
 /// The default listen address: loopback on port 8080, so an unconfigured hub is not
 /// reachable off the host.
 fn default_listen() -> SocketAddr {
@@ -128,6 +157,21 @@ fn default_listen() -> SocketAddr {
 /// The default database file: `hub.db` beside the process's working directory.
 fn default_database_path() -> PathBuf {
     PathBuf::from("hub.db")
+}
+
+/// Parse an optional `<N>d` day-count config value into [`claim_core::Days`], naming the
+/// config field on failure.
+///
+/// `None` in, `None` out (the field was absent). A present-but-malformed value is a loud
+/// error framed with `field` so the operator sees which knob to fix — the deriver never
+/// falls back to a silent default when the operator wrote something the parser rejects.
+fn parse_days_field(field: &str, value: Option<&str>) -> anyhow::Result<Option<claim_core::Days>> {
+    value
+        .map(|raw| {
+            raw.parse::<claim_core::Days>()
+                .map_err(|source| anyhow::anyhow!("config `{field}`: {source}"))
+        })
+        .transpose()
 }
 
 impl Config {
@@ -185,6 +229,34 @@ impl Config {
         let mut config = Self::load(path)?;
         config.apply_env(&EnvVars::from_process())?;
         Ok(config)
+    }
+
+    /// Map the `[deriver]` section onto the deriver's
+    /// [`DeriverConfig`](claim_hub_core::DeriverConfig).
+    ///
+    /// The two `<N>d` strings are parsed into [`claim_core::Days`] here so a malformed
+    /// value fails loudly, naming the field — never a silent fallback that would age
+    /// claims on a window nobody set. Config is an input to `derive()` and its hash keys
+    /// the deriver's memo, so a change here invalidates cached answers like any other
+    /// input change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming `[deriver].default_max_age` or `[deriver].max_age_override`
+    /// when its value is not a valid `<N>d` day count.
+    pub fn deriver_config(&self) -> anyhow::Result<claim_hub_core::DeriverConfig> {
+        let default_max_age = parse_days_field(
+            "[deriver].default_max_age",
+            self.deriver.default_max_age.as_deref(),
+        )?;
+        let max_age_override = parse_days_field(
+            "[deriver].max_age_override",
+            self.deriver.max_age_override.as_deref(),
+        )?;
+        Ok(claim_hub_core::DeriverConfig {
+            default_max_age,
+            max_age_override,
+        })
     }
 
     /// Apply the environment overrides in `env`, failing loudly on a malformed value.
@@ -363,6 +435,43 @@ mod tests {
                 .get("payments/libfoo-pin")
                 .map(String::as_str),
             Some("max-age: 30d")
+        );
+    }
+
+    #[test]
+    fn an_absent_deriver_section_maps_to_no_windows() {
+        // No `[deriver]` section: the deriver applies no default and no override — a
+        // passing claim with no `hub.max-age` stays fresh forever, the CLI's stance.
+        let config = Config::from_toml("").unwrap();
+        let deriver = config.deriver_config().unwrap();
+        assert_eq!(deriver.default_max_age, None);
+        assert_eq!(deriver.max_age_override, None);
+    }
+
+    #[test]
+    fn a_deriver_section_parses_day_counts() {
+        let config = Config::from_toml(
+            r#"
+            [deriver]
+            default_max_age = "30d"
+            max_age_override = "7d"
+            "#,
+        )
+        .unwrap();
+        let deriver = config.deriver_config().unwrap();
+        assert_eq!(deriver.default_max_age, Some("30d".parse().unwrap()));
+        assert_eq!(deriver.max_age_override, Some("7d".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_malformed_deriver_window_names_the_field() {
+        // A bad day count is loud, naming which knob to fix — never a silent fallback
+        // that would age claims on a window nobody set.
+        let config = Config::from_toml("[deriver]\ndefault_max_age = \"soon\"\n").unwrap();
+        let err = config.deriver_config().unwrap_err();
+        assert!(
+            err.to_string().contains("[deriver].default_max_age"),
+            "names the field: {err}"
         );
     }
 }

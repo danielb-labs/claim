@@ -45,11 +45,8 @@ fn registry(version: u64, claims: Vec<Claim>) -> RegistrySnapshot {
     RegistrySnapshot {
         version,
         claims: claims
-            .into_iter()
-            .map(|claim| ClaimEntry {
-                store: "s".into(),
-                claim,
-            })
+            .iter()
+            .map(|claim| ClaimEntry::from_claim("s", claim))
             .collect(),
     }
 }

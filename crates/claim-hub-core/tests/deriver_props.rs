@@ -78,10 +78,7 @@ fn event_for_check(claim: &Claim, check_index: usize, verdict: Verdict, at: &str
 fn single_claim_registry(claim: Claim) -> RegistrySnapshot {
     RegistrySnapshot {
         version: 1,
-        claims: vec![ClaimEntry {
-            store: "s".into(),
-            claim,
-        }],
+        claims: vec![ClaimEntry::from_claim("s", &claim)],
     }
 }
 
