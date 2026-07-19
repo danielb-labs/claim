@@ -364,7 +364,15 @@ TOPICS (the page `claim docs <topic>` selects; default is the overview):
 The site is bundled into this binary, so it always matches the version you ran.
 `claim docs` writes it to a per-version cache directory and prints the path — only
 the path, on stdout, so `open \"$(claim docs)\"` composes. Pass `--open` to also
-launch a browser; on a box with no opener it still just prints the path and exits 0.";
+launch a browser; on a box with no opener it still just prints the path and exits 0.
+
+ENVIRONMENT:
+  CLAIM_DOCS_CACHE_DIR  Override the base directory the site is written under,
+                        ahead of the platform default ($XDG_CACHE_HOME or
+                        ~/.cache on Linux, ~/Library/Caches on macOS,
+                        %LOCALAPPDATA% on Windows). The content is reproducible
+                        from the binary, so relocating or losing this cache costs
+                        only a rewrite on the next run.";
 
 /// Arguments to `claim docs`: locate (or open) the version-locked documentation site.
 ///
