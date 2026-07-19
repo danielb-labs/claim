@@ -3,6 +3,7 @@
 Status: proposed (v2 direction). This note pins a decision reached in design
 discussion; it changes a golden invariant, so it is written down before any code
 moves. It supersedes the parts of `PRODUCT.md` it contradicts once accepted.
+The hub's own architecture, on this boundary, is designed in `HUB.md`.
 
 ## The problem
 
