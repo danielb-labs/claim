@@ -27,14 +27,20 @@
 //! records malformed files as [`SyncFinding`]s (invariant #6 — a nag, never a silent
 //! skip). [`sync::spawn_interval_poll`] is the v1 interval-poll trigger over that.
 //!
+//! The [`Rejections`] counter records how many ingests the gate refused: a rejected
+//! push writes no event (invariant #4) but is counted here and surfaced at `/status`,
+//! so a hub silently turning telemetry away is visible rather than quietly aging
+//! claims into stale (invariant #6, HUB.md §3).
+//!
 //! The one implementation is [`SqliteStore`], over a single WAL-mode SQLite file —
 //! the data-ownership invariant made physical (export is `cp`, delete is `rm`) —
-//! implementing [`Ledger`], [`Registry`], and [`Findings`].
+//! implementing [`Ledger`], [`Registry`], [`Findings`], and [`Rejections`].
 
 pub mod error;
 pub mod findings;
 pub mod ledger;
 pub mod registry;
+pub mod rejections;
 pub mod sqlite;
 pub mod sync;
 
@@ -42,6 +48,7 @@ pub use error::{Result, StoreError};
 pub use findings::{Findings, SyncFinding};
 pub use ledger::{Appended, Ledger, Position, StoredEvent};
 pub use registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
+pub use rejections::Rejections;
 pub use sqlite::{SqliteStore, MIGRATOR};
 pub use sync::{
     spawn_interval_poll, sync_store, ConnectedStore, SyncOutcome, DEFAULT_BRANCH,

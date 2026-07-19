@@ -36,9 +36,11 @@ pub struct RegistryVersion(pub i64);
 /// The `commit` is the sha the claim was read at, so the registry can never present
 /// a claim more current than the tip it snapshotted (HUB.md §2). The `supports`
 /// edges are the cross-store index the router keys on. This is the parsed claim's
-/// *stored* shape — statement and identity and edges — not the full
-/// [`claim_core::Claim`]: the check definitions live with the verdicts they produce,
-/// on the ledger's `check_digest`, not duplicated here.
+/// *stored* shape — statement, identity, edges, and each check's content digest — not
+/// the full [`claim_core::Claim`]: the check *definitions* live with the verdicts they
+/// produce on the ledger, but the ingest gate needs each check's digest by position to
+/// turn a positional CLI report into content-keyed events, so the digests are held here
+/// (see [`check_digests`](RegisteredClaim::check_digests)).
 ///
 /// Supports targets are held as plain strings, not `claim_core::SupportTarget`: that
 /// newtype is deliberately constructable only through the claim parser (its
@@ -58,6 +60,17 @@ pub struct RegisteredClaim {
     pub supports: Vec<String>,
     /// The commit sha this claim was read at.
     pub commit: String,
+    /// Each check's canonical content digest ([`claim_hub_core::check_digest`]), in the
+    /// claim's declared check order — so `check_digests[i]` is the identity of the
+    /// check the CLI report calls index `i`.
+    ///
+    /// Computed by registry sync from the parsed check definitions (hub-05 has them in
+    /// hand at parse time) and stored here so the ingest gate reads a check's identity
+    /// by position — a pure registry read, no re-parsing at the door. Empty for a claim
+    /// that declares no checks; the vector's length is the claim's check count, so an
+    /// out-of-range index at ingest is a claim the producer and the registry disagree
+    /// about, rejected rather than fabricated (invariant #6).
+    pub check_digests: Vec<String>,
 }
 
 /// One `supports` edge in the cross-store index: a claim and a target it justifies.
@@ -175,4 +188,24 @@ pub trait Registry {
         &self,
         target: &str,
     ) -> impl std::future::Future<Output = Result<Vec<SupportsEdge>>> + Send;
+
+    /// The content digest of the check at `index` of `claim` in `store`, or `None`
+    /// when the registry does not hold that check.
+    ///
+    /// This is the ingest gate's bridge from a CLI report's *positional* check result
+    /// to the check's stable content identity (issue #18): the report carries an index,
+    /// the ledger keys on the digest, and the registry — which parsed the check at sync
+    /// — holds the mapping. `None` is returned for a claim the registry has never synced
+    /// (or has retired), and for an `index` past the claim's declared check count. Both
+    /// are the "the registry does not know this check" case the ingest gate must reject
+    /// loudly rather than paper over: fabricating a digest would file a verdict under a
+    /// check identity no check has, and a wrong digest is worse than no verdict
+    /// (invariant #6). The caller distinguishes a `None` from an error — a `None` is a
+    /// legitimate "not synced," an error is an infrastructure fault.
+    fn check_digest(
+        &self,
+        store: &str,
+        claim: &ClaimId,
+        index: usize,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send;
 }

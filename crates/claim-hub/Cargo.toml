@@ -15,9 +15,14 @@ repository.workspace = true
 claim-hub-store = { path = "../claim-hub-store" }
 # The hub's domain types the store carries, named directly here so the shell shares
 # one set of honesty types with the crates below it; the `/status` handler reads the
-# `Ledger`/`Registry` traits through the store, and later handlers construct `Event`s
-# and read the wire types from this crate.
+# `Ledger`/`Registry` traits through the store, and the ingest gate constructs `Event`s,
+# reads the wire types, and caps evidence through this crate.
 claim-hub-core = { path = "../claim-hub-core" }
+# The shared honesty types the ingest gate names directly: `Timestamp` (each event's
+# `reported_at`, and the injectable ingest clock) and `ClaimId` (validating a report's
+# claim id before it keys a registry read). One `Verdict`/`Timestamp`/`ClaimId` across
+# the workspace, so the hub cannot disagree with the CLI about them.
+claim-core = { path = "../claim-core" }
 # The API framework (HUB-IMPLEMENTATION.md §1.3): tokio-team maintained,
 # tower-composable middleware so auth, tracing, and timeouts each become a testable
 # layer, and native async handlers. rmcp (a later item) mounts into this router, so
@@ -65,6 +70,31 @@ serde_json = { workspace = true }
 # field, a database that will not open) are surfaced with `anyhow`'s context chain,
 # the CLI binary's choice carried over.
 anyhow = { workspace = true }
+# JWT verification for the ingest gate's OIDC id-token check (HUB-IMPLEMENTATION.md
+# §1.7/§1.14): the standard, actively maintained Rust implementation. The trust root
+# of the whole ledger is this one place, so it is built directly on two auditable
+# dependencies (this plus `reqwest`) and a page of our own JWKS-cache code, not on a
+# low-adoption wrapper crate (§3 veto 5). `rust_crypto` selects the pure-Rust RustCrypto
+# backend for the JWT signature (RSA/SHA-2 — the same lineage as `claim-hub-core`'s
+# `sha2`). `use_pem` is deliberately *off*: the hub verifies against JWKS *components*
+# (RSA `n`/`e`), never a PEM, so the PEM/ASN.1 parser is not in the library; the `jwk`
+# module for `JwkSet`/`Jwk` is always available.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# The one HTTP client (HUB-IMPLEMENTATION.md §1.14): fetches the issuer's JWKS. rustls
+# (not the default native-tls) so the binary links no *system* OpenSSL — the single
+# static-binary story — with `webpki-roots` for a bundled CA trust store, so a stripped
+# container image needs no system certificate bundle to reach the JWKS endpoint. reqwest
+# 0.13's `rustls` feature carries the vendored, self-contained `aws-lc-rs` crypto backend
+# for the TLS handshake; that is a bundled library, not a system dependency, so the
+# no-system-OpenSSL goal holds (the JWT path itself stays pure-Rust via jsonwebtoken's
+# `rust_crypto`). Feature set is deliberately minimal: `rustls` + `webpki-roots` for
+# HTTPS and `json` to deserialize the JWKS response; no cookies, no blocking client, no
+# native-tls backend.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "webpki-roots",
+    "json",
+] }
 
 [dev-dependencies]
 # Drive the assembled axum app in-process via `tower::ServiceExt::oneshot` — no bound
@@ -83,9 +113,19 @@ tokio = { version = "1", default-features = false, features = [
 # Read `/status`'s response body in tests: `http-body-util`'s `BodyExt::collect`
 # drains the `axum::body::Body` the oneshot returns into bytes to assert on.
 http-body-util = "0.1"
-# The head-advance test builds a sample `Event` whose `verdict` is a
-# `claim_core::Verdict`; named directly so the test constructs the shared type.
-claim-core = { path = "../claim-core" }
+# The ingest tests read the appended events back through the store's `Ledger` trait
+# and populate the registry through `Registry`/its sync helpers; named directly so a
+# test constructs a `RegisteredClaim` and scans the ledger.
+claim-hub-store = { path = "../claim-hub-store" }
+# The ingest tests sign their own test OIDC id-tokens with an RSA private key
+# (`EncodingKey::from_rsa_pem`) so verification runs against a deterministic, injected
+# JWKS with no network. `use_pem` (off in the library, which verifies against JWK
+# components only) is enabled here so the test can build a signing key from a PEM;
+# `rust_crypto` matches the library's backend so features unify to one crypto provider.
+jsonwebtoken = { version = "10", default-features = false, features = [
+    "use_pem",
+    "rust_crypto",
+] }
 # Drive the real `claim-hub` binary to cover argument parsing and the env-override
 # path end-to-end (a bad `--config`/`-c`, an unrecognized arg, and `CLAIM_HUB_*`
 # variables set on the *spawned* process — deterministic, not the test's own env).

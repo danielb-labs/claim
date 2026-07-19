@@ -15,6 +15,7 @@ use crate::error::{Result, StoreError};
 use crate::findings::{Findings, SyncFinding};
 use crate::ledger::{Appended, Ledger, Position, StoredEvent};
 use crate::registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
+use crate::rejections::Rejections;
 use claim_core::{ClaimId, Timestamp, Verdict};
 use claim_hub_core::{CheckRef, Event, EventKind, Producer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -384,6 +385,28 @@ async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) 
             .execute(&mut **tx)
             .await?;
         }
+
+        // The per-check digests, keyed by the check's declared position, so the ingest
+        // gate maps a positional CLI report onto content identities (issue #18) without
+        // re-parsing. Cascades away with the claim on the next snapshot replace.
+        for (index, digest) in claim.check_digests.iter().enumerate() {
+            let check_index = i64::try_from(index).map_err(|_| StoreError::Corrupt {
+                context: "check index too large for the registry".to_owned(),
+                value: index.to_string(),
+            })?;
+            sqlx::query!(
+                r#"
+                INSERT INTO check_digests (store, claim_id, check_index, digest)
+                VALUES (?, ?, ?, ?)
+                "#,
+                store,
+                id,
+                check_index,
+                digest,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -484,11 +507,13 @@ impl Registry for SqliteStore {
         for row in rows {
             let id = parse_claim_id(&row.claim_id)?;
             let supports = self.supports_targets_of(store, &id).await?;
+            let check_digests = self.check_digests_of(store, &id).await?;
             claims.push(RegisteredClaim {
                 id,
                 statement: row.statement,
                 supports,
                 commit: row.commit_sha,
+                check_digests,
             });
         }
         Ok(claims)
@@ -512,11 +537,13 @@ impl Registry for SqliteStore {
             return Ok(None);
         };
         let supports = self.supports_targets_of(store, id).await?;
+        let check_digests = self.check_digests_of(store, id).await?;
         Ok(Some(RegisteredClaim {
             id: id.clone(),
             statement: row.statement,
             supports,
             commit: row.commit_sha,
+            check_digests,
         }))
     }
 
@@ -556,6 +583,73 @@ impl Registry for SqliteStore {
                 })
             })
             .collect()
+    }
+
+    async fn check_digest(
+        &self,
+        store: &str,
+        claim: &ClaimId,
+        index: usize,
+    ) -> Result<Option<String>> {
+        // A `usize` index that overflows `i64` cannot match any stored row (the write
+        // side rejects such indices), so it is a plain "not in the registry" — return
+        // `None`, letting the gate reject the push loudly rather than error.
+        let Ok(check_index) = i64::try_from(index) else {
+            return Ok(None);
+        };
+        let id = claim.as_str();
+        let row = sqlx::query!(
+            r#"
+            SELECT digest FROM check_digests
+            WHERE store = ? AND claim_id = ? AND check_index = ?
+            "#,
+            store,
+            id,
+            check_index,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.digest))
+    }
+}
+
+impl SqliteStore {
+    /// Every check digest for `id` in `store`, ordered by the check's declared index,
+    /// so the returned vector is `RegisteredClaim::check_digests` — `[i]` is the digest
+    /// of check `i`. An empty vector means the claim declares no checks (or is not at
+    /// tip).
+    async fn check_digests_of(&self, store: &str, id: &ClaimId) -> Result<Vec<String>> {
+        let id_str = id.as_str();
+        let rows = sqlx::query!(
+            r#"
+            SELECT digest FROM check_digests
+            WHERE store = ? AND claim_id = ?
+            ORDER BY check_index ASC
+            "#,
+            store,
+            id_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.digest).collect())
+    }
+}
+
+impl Rejections for SqliteStore {
+    async fn record_rejection(&self) -> Result<i64> {
+        let row = sqlx::query!(
+            "UPDATE ingest_rejections SET count = count + 1 WHERE id = 0 RETURNING count"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.count)
+    }
+
+    async fn rejection_count(&self) -> Result<i64> {
+        let row = sqlx::query!("SELECT count FROM ingest_rejections WHERE id = 0")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.count)
     }
 }
 

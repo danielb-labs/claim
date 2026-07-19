@@ -28,6 +28,8 @@
 
 pub mod app;
 pub mod config;
+pub mod ingest;
+pub mod oidc;
 pub mod status;
 
 pub use app::{build_app, AppState};
@@ -36,6 +38,7 @@ pub use status::Status;
 
 use anyhow::Context;
 use claim_hub_store::SqliteStore;
+use std::sync::Arc;
 
 /// Install the tracing subscriber the binary logs through.
 ///
@@ -60,10 +63,13 @@ pub fn init_tracing() {
 /// This is the boot path: it opens (creating if absent) the SQLite database at
 /// `config.database` via [`SqliteStore::open`], which runs the embedded migrations,
 /// so a hub pointed at an empty directory stands up its own schema on first boot
-/// (HUB-IMPLEMENTATION.md §1.13). It then binds `config.listen` and serves the
-/// router. A database that will not open, or an address that will not bind, is a
-/// loud boot failure naming the path or address — a hub that cannot serve says so
-/// rather than exiting silently.
+/// (HUB-IMPLEMENTATION.md §1.13). When the config carries an `[oidc]` section it builds
+/// the ingest gate's verifier, so `POST /ingest` is mounted; with no OIDC config the hub
+/// serves reads only and exposes no write path. It then binds
+/// `config.listen` and serves the router. A database that will not open, an OIDC trust
+/// anchor that cannot initialize, or an address that will not bind is a loud boot
+/// failure naming the fault — a hub that cannot serve says so rather than exiting
+/// silently.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let store = SqliteStore::open(&config.database).await.with_context(|| {
         format!(
@@ -71,7 +77,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             config.database.display()
         )
     })?;
-    let app = build_app(AppState { store });
+    let verifier = build_verifier(&config).context("configuring the ingest gate (OIDC)")?;
+    if verifier.is_none() {
+        tracing::warn!(
+            "no [oidc] config: the ingest gate is not mounted; the hub serves reads only"
+        );
+    }
+    let app = build_app(AppState::new(store, verifier));
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding the hub listener on `{}`", config.listen))?;
@@ -81,6 +93,47 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .await
         .context("serving the hub")?;
     Ok(())
+}
+
+/// Build the ingest gate's OIDC verifier from config, or `None` when no `[oidc]` section
+/// is present.
+///
+/// The verifier trusts the GitHub Actions issuer, the configured audience, and the
+/// connected-store repositories, resolving keys through an [`oidc::HttpJwksSource`] over
+/// the live GitHub Actions JWKS endpoint. Building the HTTP client can fail (a TLS-backend
+/// fault); that is a loud boot error, not a silent read-only degrade. A hub with no
+/// `[oidc]` section returns `None` — no ingest route is mounted.
+///
+/// # Errors
+///
+/// Returns an error if the JWKS HTTP source cannot be constructed.
+fn build_verifier(config: &Config) -> anyhow::Result<Option<oidc::SharedVerifier>> {
+    let Some(oidc_config) = &config.oidc else {
+        return Ok(None);
+    };
+    let source = oidc::HttpJwksSource::new(oidc::GITHUB_ACTIONS_JWKS_URL)
+        .map_err(|e| anyhow::anyhow!("building the JWKS HTTP client: {e}"))?;
+    // The connected-store repositories a token's `repository` claim must be one of. The
+    // config names stores as `github.com/owner/repo`; the token names `owner/repo`, so a
+    // config store id has its `github.com/` prefix stripped to match. A store id without
+    // that prefix is passed through unchanged (a non-GitHub forge, a later addition).
+    let repositories = oidc_config
+        .repositories
+        .iter()
+        .map(|store| {
+            store
+                .strip_prefix("github.com/")
+                .unwrap_or(store)
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let verifier = oidc::OidcVerifier::new(
+        oidc::GITHUB_ACTIONS_ISSUER,
+        &oidc_config.audience,
+        repositories,
+        source,
+    );
+    Ok(Some(Arc::new(verifier)))
 }
 
 /// Boot the hub from the config file at `config_path`: load config, wire tracing,

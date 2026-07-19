@@ -182,6 +182,39 @@ async fn syncs_standalone_and_embedded_claims_at_the_tip_sha() {
 }
 
 #[tokio::test]
+async fn sync_stores_each_claims_check_digests_for_the_ingest_gate() {
+    // Sync computes and stores each check's canonical digest, so the ingest gate reads a
+    // check's identity by position. The stored digest must equal what `check_digest`
+    // yields over the parsed check — the same digest the CLI's report will be keyed on.
+    use claim_core::parse_claim_file;
+    use claim_hub_core::check_digest;
+
+    let fixture = Fixture::new();
+    let body = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"grep -q x f\"\n  - kind: cmd\n    run: \"test -f g\"\n---\nStatement.\n";
+    fixture.write(".claims/pin.md", body);
+    fixture.commit("a two-check claim");
+
+    let (store, dir) = store().await;
+    sync_store(&store, &fixture.connected(), &mirror_root(&dir))
+        .await
+        .unwrap();
+
+    // The expected digests, computed independently from the same grammar.
+    let parsed = parse_claim_file(".claims/pin.md", body).unwrap();
+    let id = ClaimId::from_str("pin").unwrap();
+    for (index, check) in parsed.checks.iter().enumerate() {
+        assert_eq!(
+            store.check_digest(STORE_ID, &id, index).await.unwrap(),
+            Some(check_digest(check)),
+            "the stored digest at index {index} matches the canonical digest"
+        );
+    }
+    // And the claim reads its digests back in order.
+    let claim = store.claim(STORE_ID, &id).await.unwrap().unwrap();
+    assert_eq!(claim.check_digests.len(), 2);
+}
+
+#[tokio::test]
 async fn deleting_a_claim_retires_it_and_clears_both_supports_directions() {
     let fixture = Fixture::new();
     fixture.write(".claims/a.md", &claim_file("a", "A", &["decisions/shared"]));
@@ -444,6 +477,7 @@ async fn a_snapshot_write_is_atomic_so_a_failure_never_drops_a_findings_nag() {
         statement: id.to_owned(),
         supports: vec![],
         commit: "c1".to_owned(),
+        check_digests: Vec::new(),
     };
     let finding = |file: &str| SyncFinding {
         store: STORE_ID.to_owned(),
