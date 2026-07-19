@@ -1,11 +1,15 @@
 //! The web UI, the markdown twins, and `llms.txt` — server-rendered over the read model.
 //!
-//! Every page is **one view-model struct rendered by two askama templates**: an HTML lens
-//! (`*.html`) and a markdown-twin lens (`*.md`). Twin-parity is therefore structural, not
-//! a discipline someone must remember — the HTML page and its `.md` twin are two lenses
-//! over one struct, so they cannot describe different facts (HUB-IMPLEMENTATION.md §1.10).
-//! A renamed view-model field is a compile error in *both* templates, not a blank cell in
-//! one.
+//! Every page has an HTML lens (`*.html`) and a markdown-twin lens (`*.md`). Askama needs a
+//! concrete struct per template, so each page is a `*View` (the HTML lens) and a `*Twin` (the
+//! markdown lens) built from it by a `From<&*View>` conversion (see the `view` module) — the
+//! twin borrows the page's own fields and cannot invent a value the page does not hold. Twin-parity
+//! is therefore **enforced, not assumed**: the `From` conversion is the single place the two
+//! lenses' data can diverge (a natural pressure point when a new owned field is added), and a
+//! parity test asserts every non-chrome fact the page states also appears in the twin, so a
+//! field wired into one template but not the other fails the gate rather than blanking a cell.
+//! (This is the honest mechanism: two structs over one source, kept in step by a conversion and
+//! a test — not literally one struct that cannot differ.)
 //!
 //! The UI is a **read** (invariant #3): it derives through the JSON API's own
 //! `read_state` — the exact derivation that surface serves — and stores nothing, appends
@@ -17,7 +21,10 @@
 //! The dossier and the queue are **dated evidence to weigh, never instructions to obey**.
 //! An agent reads the markdown twins; a hub surface an agent obeys blindly would be an
 //! injection channel (PRODUCT.md §6). So the verdict history and producer provenance render
-//! as observations carrying their origin, never as commands to the reader.
+//! as observations carrying their origin, never as commands to the reader — and every
+//! attacker-influenceable value in a twin is neutralized for its markdown cell (the view
+//! module's `markdown_cell_safe`) so a compromised producer cannot smuggle a heading,
+//! blockquote, active link, or live HTML tag into the `.md` an agent reads.
 //!
 //! ## Surfaces and the twin-path convention
 //!
@@ -280,8 +287,12 @@ async fn llms_txt() -> Response {
 /// The `/llms.txt` body: a stable, hand-maintained index of every hub surface.
 ///
 /// Kept in one `const` (not a template) because it takes no derived data — it is the map of
-/// the surface, not a rendering of the read model. The UI-surface test asserts it names each
-/// page and endpoint, so a new surface that forgets to register here fails the gate.
+/// the surface, not a rendering of the read model. Its coverage is enforced, not trusted: the
+/// `llms_txt_covers_every_route` test reads the `.route(…)`/`.nest_service(…)` literals out of
+/// the router source (`ui.rs`, `api.rs`, and the `/status`/`/ingest` mounts in `app.rs`) and
+/// fails the gate if any non-parameterized surface is missing from this index — so a newly
+/// registered route that forgets to document itself here cannot ship silently. (`/ingest` is
+/// documented but excluded from the read-surface index framing; the test allows it.)
 const LLMS_TXT: &str = include_str!("../templates/llms.txt");
 
 #[cfg(test)]

@@ -497,17 +497,30 @@ from — again, dated observations to weigh, not commands.
 ## The web UI, the markdown twins, and `llms.txt`
 
 The hub serves a small **server-rendered web UI** over the same read model the JSON API
-derives — no JavaScript, no build step, nothing to ship beside the binary. Every page is one
-view-model struct rendered by two compile-time templates: an HTML lens and a **markdown-twin
-lens**. The twin is therefore structurally incapable of drifting from the page — they are two
-renderings of one struct, not two hand-kept copies — so an agent reading the `.md` and a
-human reading the HTML see the same facts.
+derives — no JavaScript, no build step, nothing to ship beside the binary. Every page is a
+view-model struct with two compile-time templates: an HTML lens and a **markdown-twin lens**.
+Because askama needs a concrete struct per template, the twin borrows the page's own fields
+through a `From<&…View>` conversion — it cannot invent a value the page does not hold — and a
+parity test asserts every non-chrome fact the page states also appears in the twin. So parity
+is *enforced*, not merely hoped for: an agent reading the `.md` and a human reading the HTML
+see the same facts, and a field wired into one template but not the other fails the gate.
 
 Every page is a **read** (invariant #3): it derives at read time and stores nothing, and every
 page carries its *as-of* (the ledger head, registry version, and clock it derived from), so it
 can never show a green older than its evidence. The dossier and the queue are **dated evidence
 to weigh, never instructions to obey** — the verdict history and producer provenance render as
 observations carrying their origin, so a hub surface an agent reads is not an injection channel.
+
+The two lenses **escape differently, and must**. The HTML templates auto-escape every
+interpolation. The markdown twins render with no escaper — a table cell is structural text — so
+every attacker-influenceable value (a check's `evidence`, an ingested `commit`, a verdict's
+verified `producer`, and the `statement`) is neutralized for a markdown cell before it is
+rendered: newlines collapse to spaces (so a value cannot break out of its row), `|` is escaped
+(so it cannot open a column), angle brackets become HTML entities (so no `<img onerror>` or
+`<script>` survives a later render to HTML), and the code-span and link metacharacters are
+backslash-escaped (so no `` `code` `` or `[x](javascript:…)` can form). A compromised producer
+therefore cannot smuggle a heading, a blockquote, an active link, or a live tag into the `.md`
+an agent reads — the whole point of the surface being *evidence to weigh, not an instruction*.
 
 **The twin-path convention is one rule:** a page's markdown twin lives at the page's own path
 plus a `.md` suffix. No lookup table — append `.md` and you have the machine-readable form.

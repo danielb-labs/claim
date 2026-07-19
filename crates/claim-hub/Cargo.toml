@@ -1,6 +1,6 @@
 [package]
 name = "claim-hub"
-description = "The hub binary: the axum application shell every later component mounts into. v1 ships config, the tower-layered router, /status, tracing, and boot; ingest, the API, MCP, and the UI arrive in later items."
+description = "The hub binary: the axum application shell every component mounts into. v1 ships config, the tower-layered router, boot and tracing, /status, the single ingest write path, the read API, and the web UI with its markdown twins and /llms.txt; the MCP surface arrives in a later item."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

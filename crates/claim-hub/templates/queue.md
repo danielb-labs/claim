@@ -11,7 +11,7 @@ The queue is empty: no claim is drifted, stale, or due right now.
 {%- else -%}
 | claim | store | standing | verified as of | stale at | due at |
 |---|---|---|---|---|---|
-{% for row in rows %}| [{{ row.id }}]({{ row.dossier_path }}.md) | {{ row.store }} | {{ row.standing_label }} | {% match row.verified_as_of %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} | {% match row.stale_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} | {% match row.due_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} |
+{% for row in rows %}| [{{ row.id }}]({{ row.dossier_twin_path }}) | {{ row.store }} | {{ row.standing_label }} | {% match row.verified_as_of %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} | {% match row.stale_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} | {% match row.due_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %} |
 {% endfor %}
 {{ rows.len() }} claim(s) in the queue.
 {%- endif %}

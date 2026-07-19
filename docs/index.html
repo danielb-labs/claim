@@ -370,8 +370,12 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     no JavaScript, no build step. Every page (the <a href="hub.md">review queue</a> at
     <code>/ui/queue</code>, a claim&rsquo;s dossier at <code>/ui/claims/{id}</code>, and hub status at
     <code>/ui/status</code>) has a machine-readable <strong>markdown twin</strong> at the same path plus
-    a <code>.md</code> suffix &mdash; one predictable rule, no lookup table. The page and its twin render
-    from a single view-model struct, so the two cannot describe different facts. <code>/llms.txt</code>
+    a <code>.md</code> suffix &mdash; one predictable rule, no lookup table. The twin borrows the page&rsquo;s
+    own fields through a <code>From</code> conversion and a parity test asserts every fact appears in both,
+    so the two lenses cannot describe different facts. The markdown twin is injection-safe: every
+    attacker-influenceable value (a check&rsquo;s evidence, an ingested commit, a verdict&rsquo;s producer, the
+    statement) is neutralized for its markdown cell, so a compromised producer cannot smuggle a heading,
+    active link, or live HTML tag into the <code>.md</code> an agent reads. <code>/llms.txt</code>
     indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
     to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.
     The hub MCP arrives in a later item over the same read model.</p>

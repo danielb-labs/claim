@@ -1,12 +1,29 @@
-//! The view models — one struct per page, each the single source both its HTML lens and
-//! its markdown twin render from.
+//! The view models — one `*View` per page (the HTML lens) plus its `*Twin` (the markdown
+//! lens), the twin derived from the view so both render one page's facts.
 //!
 //! A view model owns **display-ready data**: strings, small enums, and pre-formatted
 //! optionals, computed once from the read model in each view's `build`/`from_read`/`new`
 //! constructor. The templates only read fields and call zero-argument accessors, never
-//! re-derive — so the HTML and the markdown twin are provably two lenses over identical data
-//! (twin-parity by construction), and a renamed field breaks both templates at compile time
-//! rather than silently blanking one.
+//! re-derive.
+//!
+//! Twin-parity is enforced, not merely hoped for. Askama needs a concrete struct per
+//! template, so each page is a `*View` (the HTML lens) and a `*Twin` (the markdown lens)
+//! that **borrows the page's own fields** through a `From<&*View>` conversion — the twin
+//! cannot invent a value the page does not hold, and a new owned field on the view is a
+//! natural pressure point on that conversion. A parity test then asserts every rendered
+//! fact appears in both lenses, so a field wired into one template but not the other fails
+//! the gate rather than silently blanking a cell.
+//!
+//! The two lenses escape differently, and must. The HTML templates auto-escape every
+//! interpolation (askama's `.html` escaper), so the view exposes attacker-influenceable
+//! fields raw and lets the template neutralize them. The markdown twins carry
+//! `escape = "none"` — a markdown table cell is structural text askama must not touch — so
+//! the twin holds the same facts pre-neutralized by [`markdown_cell_safe`]: an
+//! attacker-controlled `evidence`, `producer`, `commit`, or `statement` cannot break the
+//! table, break out of its row, or emit active markup that would go live when the `.md` is
+//! rendered to HTML downstream (PRODUCT.md §6: a surface an agent reads must not be an
+//! injection channel). The HTML lens is never double-escaped, and the markdown lens is
+//! never left injectable — the two render the same underlying facts by construction.
 //!
 //! Nothing here reaches the store or the clock: a view model is built from an already-derived
 //! `ReadState`, so the module is a pure projection and the pages inherit the read's
@@ -69,10 +86,16 @@ pub(super) struct QueueRow {
     pub due_at: Option<String>,
     /// The path to this claim's dossier page (HTML), for the queue to link each row.
     pub dossier_path: String,
+    /// The path to this claim's dossier markdown twin (`dossier_path` + `.md`), precomputed so
+    /// the queue twin links a row without appending a suffix in the template — symmetric with
+    /// the dossier page's own `twin_path`.
+    pub dossier_twin_path: String,
 }
 
 impl QueueRow {
     fn from_standing(standing: &ClaimStanding) -> Self {
+        let dossier_path = format!("/ui/claims/{}", standing.id);
+        let dossier_twin_path = format!("{dossier_path}.md");
         Self {
             id: standing.id.clone(),
             store: standing.store.clone(),
@@ -81,7 +104,41 @@ impl QueueRow {
             verified_as_of: standing.verified_as_of.map(|t| t.to_string()),
             stale_at: standing.stale_at.map(|t| t.to_string()),
             due_at: standing.due_at.map(|t| t.to_string()),
-            dossier_path: format!("/ui/claims/{}", standing.id),
+            dossier_path,
+            dossier_twin_path,
+        }
+    }
+}
+
+/// One queue row rendered safe for a markdown table cell — the markdown lens of a [`QueueRow`],
+/// derived field-by-field through [`From`] so it holds the **same facts** as the HTML row.
+///
+/// The identity fields (`id`, `store`) pass through [`markdown_cell_safe`]: a live claim id and
+/// store are parser-validated and cannot today carry a table-breaking character, but the twin
+/// does not assume its source, so it defangs them anyway (defense-in-depth). The standing label,
+/// the freshness instants, and the twin path are derived-safe (a fixed enum phrase, RFC 3339
+/// timestamps, and a hub-built URL), so they render raw. The wire `standing` word the HTML row
+/// carries is a CSS-badge key, not a fact, so the twin — which has no badge — omits it.
+pub(super) struct QueueTwinRow {
+    pub id: String,
+    pub store: String,
+    pub standing_label: String,
+    pub verified_as_of: Option<String>,
+    pub stale_at: Option<String>,
+    pub due_at: Option<String>,
+    pub dossier_twin_path: String,
+}
+
+impl From<&QueueRow> for QueueTwinRow {
+    fn from(row: &QueueRow) -> Self {
+        Self {
+            id: markdown_cell_safe(&row.id),
+            store: markdown_cell_safe(&row.store),
+            standing_label: row.standing_label.clone(),
+            verified_as_of: row.verified_as_of.clone(),
+            stale_at: row.stale_at.clone(),
+            due_at: row.due_at.clone(),
+            dossier_twin_path: row.dossier_twin_path.clone(),
         }
     }
 }
@@ -102,14 +159,26 @@ pub(super) struct QueueView {
     pub as_of: AsOfView,
 }
 
-/// The markdown twin of the queue, rendering the **same** [`QueueView`] fields — the parity
-/// guarantee is that this and [`QueueView`] share one data struct, differing only in
-/// template.
+/// The markdown twin of the queue, rendering the **same** facts as [`QueueView`] through the
+/// markdown lens.
+///
+/// Built from the view by [`From`], so the twin cannot name a claim the page does not; its rows
+/// are [`QueueTwinRow`]s, each cell-safe for a markdown table (`escape = "none"`). A parity test
+/// asserts every queued claim in the HTML also appears here.
 #[derive(Template)]
 #[template(path = "queue.md", escape = "none")]
 pub(super) struct QueueTwin<'a> {
-    pub rows: &'a [QueueRow],
+    pub rows: Vec<QueueTwinRow>,
     pub as_of: &'a AsOfView,
+}
+
+impl<'a> From<&'a QueueView> for QueueTwin<'a> {
+    fn from(view: &'a QueueView) -> Self {
+        Self {
+            rows: view.rows.iter().map(QueueTwinRow::from).collect(),
+            as_of: &view.as_of,
+        }
+    }
 }
 
 impl QueueView {
@@ -138,14 +207,11 @@ impl QueueView {
         self.render()
     }
 
-    /// Render the markdown twin — the same fields, the markdown lens. The two renderers read
-    /// one `QueueView`, so they cannot diverge on content.
+    /// Render the markdown twin — the same facts, the markdown lens. The twin is built from
+    /// this view by [`From`], so it cannot diverge on content; its cells are neutralized for
+    /// markdown, so it cannot be an injection channel.
     pub(super) fn render_md(&self) -> Result<String, askama::Error> {
-        QueueTwin {
-            rows: &self.rows,
-            as_of: &self.as_of,
-        }
-        .render()
+        QueueTwin::from(self).render()
     }
 }
 
@@ -198,12 +264,64 @@ impl HistoryRow {
     }
 }
 
+/// One history row rendered safe for a markdown table cell — the markdown lens of a
+/// [`HistoryRow`], derived through [`From`] so it holds the **same** dated observation.
+///
+/// The attacker-influenceable fields are neutralized: `commit` (the producer-supplied OIDC
+/// `sha`), `evidence` (arbitrary check stdout from an ingested report, only size-capped), and
+/// `producer` (the verified OIDC token claims, recorded verbatim) all pass through
+/// [`markdown_cell_safe`], so none can break the table, escape its row, or emit active markup.
+/// The `seq`, `verdict` word, `check_index`, and `reported_at` are derived-safe (integers, a
+/// fixed enum word, and an RFC 3339 instant) and render raw.
+pub(super) struct HistoryTwinRow {
+    pub seq: String,
+    pub verdict: String,
+    pub check_index: String,
+    pub commit: String,
+    pub reported_at: String,
+    pub evidence: Option<String>,
+    pub producer: String,
+}
+
+impl From<&HistoryRow> for HistoryTwinRow {
+    fn from(row: &HistoryRow) -> Self {
+        Self {
+            seq: row.seq.clone(),
+            verdict: row.verdict.clone(),
+            check_index: row.check_index.clone(),
+            commit: markdown_cell_safe(&row.commit),
+            reported_at: row.reported_at.clone(),
+            evidence: row.evidence.as_deref().map(markdown_cell_safe),
+            producer: markdown_cell_safe(&row.producer),
+        }
+    }
+}
+
 /// One check of a claim by git reference: its declared index and content digest.
 pub(super) struct CheckRow {
     /// The check's zero-based declared position.
     pub index: String,
     /// The check's canonical content digest — the ledger's join key.
     pub digest: String,
+}
+
+/// One check row rendered safe for a markdown table cell — the markdown lens of a [`CheckRow`].
+///
+/// A digest is a hex content hash the hub computes, so it cannot carry a table-breaking
+/// character; it is defanged anyway so the twin makes no assumption about the value's source,
+/// keeping every twin cell uniformly neutralized.
+pub(super) struct CheckTwinRow {
+    pub index: String,
+    pub digest: String,
+}
+
+impl From<&CheckRow> for CheckTwinRow {
+    fn from(row: &CheckRow) -> Self {
+        Self {
+            index: row.index.clone(),
+            digest: markdown_cell_safe(&row.digest),
+        }
+    }
 }
 
 /// The claim dossier page: everything the org believes about one claim and how good that
@@ -251,23 +369,57 @@ pub(super) struct DossierView {
     pub twin_path: String,
 }
 
-/// The markdown twin of the dossier, rendering the **same** [`DossierView`] fields.
+/// The markdown twin of the dossier, rendering the **same** facts as [`DossierView`] through
+/// the markdown lens.
+///
+/// Built from the view by [`From`], so the twin cannot invent a fact the page does not hold.
+/// The `.md` templates carry `escape = "none"`, so every attacker-influenceable value is
+/// pre-neutralized for a markdown cell by [`markdown_cell_safe`]: the `statement` (rendered in
+/// a blockquote), the `commit` (the producer's OIDC `sha`), and every history row's `commit`,
+/// `evidence`, and `producer`. The `id`, `store`, and `supports` targets are parser-validated
+/// but neutralized too, so no twin field is left assuming its source is safe. The `standing`
+/// word, the standing label, the freshness instants, and the twin path are derived-safe and
+/// borrow the view unchanged.
 #[derive(Template)]
 #[template(path = "dossier.md", escape = "none")]
 pub(super) struct DossierTwin<'a> {
-    pub id: &'a str,
-    pub store: &'a str,
-    pub statement: &'a str,
+    pub id: String,
+    pub store: String,
+    pub statement: String,
     pub standing: &'a str,
     pub standing_label: &'a str,
     pub verified_as_of: &'a Option<String>,
     pub stale_at: &'a Option<String>,
     pub due_at: &'a Option<String>,
-    pub commit: &'a str,
-    pub checks: &'a [CheckRow],
-    pub supports: &'a [String],
-    pub history: &'a [HistoryRow],
+    pub commit: String,
+    pub checks: Vec<CheckTwinRow>,
+    pub supports: Vec<String>,
+    pub history: Vec<HistoryTwinRow>,
     pub as_of: &'a AsOfView,
+}
+
+impl<'a> From<&'a DossierView> for DossierTwin<'a> {
+    fn from(view: &'a DossierView) -> Self {
+        Self {
+            id: markdown_cell_safe(&view.id),
+            store: markdown_cell_safe(&view.store),
+            statement: markdown_cell_safe(&view.statement),
+            standing: &view.standing,
+            standing_label: &view.standing_label,
+            verified_as_of: &view.verified_as_of,
+            stale_at: &view.stale_at,
+            due_at: &view.due_at,
+            commit: markdown_cell_safe(&view.commit),
+            checks: view.checks.iter().map(CheckTwinRow::from).collect(),
+            supports: view
+                .supports
+                .iter()
+                .map(|t| markdown_cell_safe(t))
+                .collect(),
+            history: view.history.iter().map(HistoryTwinRow::from).collect(),
+            as_of: &view.as_of,
+        }
+    }
 }
 
 impl DossierView {
@@ -328,24 +480,10 @@ impl DossierView {
         self.render()
     }
 
-    /// Render the markdown twin from the same fields.
+    /// Render the markdown twin — the same facts as the page, neutralized for markdown cells.
+    /// The twin is built from this view by [`From`], so it cannot diverge on content.
     pub(super) fn render_md(&self) -> Result<String, askama::Error> {
-        DossierTwin {
-            id: &self.id,
-            store: &self.store,
-            statement: &self.statement,
-            standing: &self.standing,
-            standing_label: &self.standing_label,
-            verified_as_of: &self.verified_as_of,
-            stale_at: &self.stale_at,
-            due_at: &self.due_at,
-            commit: &self.commit,
-            checks: &self.checks,
-            supports: &self.supports,
-            history: &self.history,
-            as_of: &self.as_of,
-        }
-        .render()
+        DossierTwin::from(self).render()
     }
 }
 
@@ -373,7 +511,11 @@ pub(super) struct StatusView {
     pub as_of: AsOfView,
 }
 
-/// The markdown twin of the status page, rendering the **same** [`StatusView`] fields.
+/// The markdown twin of the status page, rendering the **same** facts as [`StatusView`].
+///
+/// Built from the view by [`From`], so the twin cannot diverge from the page. Every field is a
+/// hub-computed count or ledger position (integers and the as-of), never attacker input, so the
+/// twin borrows them unchanged — there is no untrusted value on this page to neutralize.
 #[derive(Template)]
 #[template(path = "status.md", escape = "none")]
 pub(super) struct StatusTwin<'a> {
@@ -382,6 +524,18 @@ pub(super) struct StatusTwin<'a> {
     pub rejection_count: &'a str,
     pub queued: &'a str,
     pub as_of: &'a AsOfView,
+}
+
+impl<'a> From<&'a StatusView> for StatusTwin<'a> {
+    fn from(view: &'a StatusView) -> Self {
+        Self {
+            ledger_head: &view.ledger_head,
+            registry_version: &view.registry_version,
+            rejection_count: &view.rejection_count,
+            queued: &view.queued,
+            as_of: &view.as_of,
+        }
+    }
 }
 
 impl StatusView {
@@ -407,16 +561,10 @@ impl StatusView {
         self.render()
     }
 
-    /// Render the markdown twin from the same fields.
+    /// Render the markdown twin — the same facts as the page. Built from this view by [`From`],
+    /// so it cannot diverge on content.
     pub(super) fn render_md(&self) -> Result<String, askama::Error> {
-        StatusTwin {
-            ledger_head: &self.ledger_head,
-            registry_version: &self.registry_version,
-            rejection_count: &self.rejection_count,
-            queued: &self.queued,
-            as_of: &self.as_of,
-        }
-        .render()
+        StatusTwin::from(self).render()
     }
 }
 
@@ -455,6 +603,59 @@ fn verdict_word(verdict: Verdict) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Neutralize an attacker-influenceable value so it is safe inside a `.md` twin, which renders
+/// with `escape = "none"` and interpolates the value into a table cell, a blockquote, a
+/// heading, or an inline code span — always mid-line, never at a line's start.
+///
+/// A value here can come from an ingested report (a check's `evidence`), an OIDC token (a
+/// `producer` value, the `commit`), or git (the `statement`). The twin cannot assume its
+/// source is trusted, so every such value is defanged before it is rendered. Without this, a
+/// hostile producer could break the table with `|`, break out of a row or block with a newline
+/// and emit real markdown (`### heading`, `> blockquote`, or `SYSTEM: …` prose), or smuggle
+/// active markup (`[x](javascript:…)`, `<img src=x onerror=…>`) that goes live when the `.md`
+/// is later rendered to HTML — turning a surface an agent reads into an injection channel
+/// (PRODUCT.md §6, invariant #4: a verdict is dated evidence to weigh, never an instruction).
+///
+/// The result stays on one physical line and stays legible (metacharacters are escaped or
+/// entity-encoded, never deleted wholesale):
+/// - CR and LF collapse to a single space, so the value can never reach a line start — which is
+///   both what keeps a table row intact and what makes the block-leading markers (`#`, `>`,
+///   `-`, `*`, `+`) inert: a value spliced mid-line cannot begin a heading, blockquote, or list.
+/// - `|` becomes `\|`, so it cannot open a new table column.
+/// - `<` and `>` become HTML entities, so no raw tag (`<img onerror>`, `<script>`) survives even
+///   after the `.md` is rendered to HTML.
+/// - The inline-active metacharacters `` ` `` (code span), `[` `]` `(` `)` (link syntax), and
+///   `\` (the escape char itself) are backslash-escaped, so no code span or link — and no
+///   `[x](javascript:…)` — can form from attacker input.
+///
+/// The block-leading markers are deliberately **not** escaped: collapsing newlines already
+/// denies the attacker a line start, so escaping a mid-word `-` or `#` would mangle benign text
+/// (`run-1`, a commit message) for no security gain.
+fn markdown_cell_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            // Collapse a newline (or lone CR) to a space: this is what keeps a value on one
+            // physical line, so it can neither end a table row nor reach a line start to begin a
+            // block construct.
+            '\r' | '\n' => out.push(' '),
+            // Entity-encode angle brackets so a raw HTML tag cannot survive a later render of
+            // the `.md` to HTML; markdown passes `<img …>`/`<script>` through verbatim.
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            // Backslash-escape the inline-active metacharacters: the table separator, code
+            // spans, link syntax, and the escape char. A backslash before an ASCII punctuation
+            // char is a markdown escape, rendering the literal char.
+            '|' | '`' | '[' | ']' | '(' | ')' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Format a verified producer block as a compact, deterministic `key=value` origin line.
 ///
 /// The producer is the verified identity behind a verdict (HUB.md §4). It is rendered as a
@@ -478,5 +679,65 @@ fn format_producer(producer: &serde_json::Map<String, serde_json::Value>) -> Str
         "(no producer identity)".to_owned()
     } else {
         parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::markdown_cell_safe;
+
+    #[test]
+    fn a_newline_collapses_to_a_space_so_the_value_cannot_reach_a_line_start() {
+        // The row/block break is the prompt-injection vector: a newline would let the tail
+        // render as markdown outside the cell. Both LF and a lone CR collapse.
+        assert_eq!(markdown_cell_safe("a\nb"), "a b");
+        assert_eq!(markdown_cell_safe("a\r\nb"), "a  b");
+        assert_eq!(markdown_cell_safe("a\rb"), "a b");
+        assert!(!markdown_cell_safe("### owned\nmalice").contains('\n'));
+    }
+
+    #[test]
+    fn a_pipe_is_escaped_so_it_cannot_open_a_column() {
+        assert_eq!(markdown_cell_safe("a|b"), "a\\|b");
+    }
+
+    #[test]
+    fn angle_brackets_become_entities_so_no_raw_tag_survives() {
+        // The `.md` may be rendered to HTML downstream; an entity cannot resurrect into a tag.
+        assert_eq!(
+            markdown_cell_safe("<img src=x onerror=alert(1)>"),
+            "&lt;img src=x onerror=alert\\(1\\)&gt;"
+        );
+        assert!(!markdown_cell_safe("<script>").contains('<'));
+    }
+
+    #[test]
+    fn link_and_code_metacharacters_are_escaped_so_no_active_link_forms() {
+        // The classic active-link payload cannot form a real link once the brackets and parens
+        // are escaped, so no `javascript:` href reaches a renderer.
+        let safe = markdown_cell_safe("[x](javascript:alert(1))");
+        assert_eq!(safe, "\\[x\\]\\(javascript:alert\\(1\\)\\)");
+        // A backtick cannot close an inline code span it is interpolated into.
+        assert_eq!(markdown_cell_safe("a`b"), "a\\`b");
+        // A backslash is escaped, so the attacker cannot pre-consume our escaping backslash.
+        assert_eq!(markdown_cell_safe("a\\|b"), "a\\\\\\|b");
+    }
+
+    #[test]
+    fn benign_text_stays_legible() {
+        // Readability is a requirement: an ordinary value passes through unchanged, and a
+        // mid-word hyphen or hash — inert mid-line — is not mangled.
+        assert_eq!(markdown_cell_safe("libfoo==4.2"), "libfoo==4.2");
+        assert_eq!(markdown_cell_safe("run-1"), "run-1");
+        assert_eq!(
+            markdown_cell_safe("repository=acme/payments run=run-1"),
+            "repository=acme/payments run=run-1"
+        );
+        assert_eq!(markdown_cell_safe("issue #42"), "issue #42");
+    }
+
+    #[test]
+    fn empty_input_is_empty_output() {
+        assert_eq!(markdown_cell_safe(""), "");
     }
 }
