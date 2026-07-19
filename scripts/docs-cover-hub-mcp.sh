@@ -16,6 +16,10 @@
 # database; reading the registered names from the one file that declares them is the same
 # coverage guarantee without booting a server — a tool cannot ship without a `#[tool(name)]`
 # line here, and this reads every such line.
+#
+# Scope: this proves coverage of `docs/hub.md` only. `docs/index.html` is out of scope here —
+# the hub MCP is documented in the hub topic doc, so that is the one file this backstop reads,
+# mirroring the CLI backstop (`docs-cover-cli.sh`), which likewise covers a single doc surface.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"

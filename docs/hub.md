@@ -502,7 +502,11 @@ so any MCP-capable agent can call them. It is **mounted in-process on the same a
 JSON API — one binary, one port (`/mcp`), one middleware stack — using rmcp's streamable-HTTP
 transport in stateless JSON mode (a tool call is one POST with a plain-JSON response; the
 2026-07 MCP spec makes the protocol stateless at the transport layer, which suits a hub behind
-a load balancer).
+a load balancer). `/mcp` accepts any `Host`, the same as `/api`: rmcp's default `Host`
+allow-list (a DNS-rebinding guard for browsers reaching a *localhost* app) is disabled on the
+mount, so a hub behind a load balancer reached at its own hostname works with no extra config
+— a real deployment needs nothing set here. Read auth (a later item) will gate `/mcp` and
+`/api` uniformly.
 
 Each tool is a **thin binding that returns the same JSON its API twin serves** — parity by
 construction: the tool and the HTTP endpoint call the one shared function that derives the
@@ -537,6 +541,10 @@ curl -s http://127.0.0.1:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
        "params":{"name":"dossier","arguments":{"id":"payments/libfoo-pin"}}}'
 ```
+
+`curl` sends a `Host` header derived from the URL, as every real HTTP client does; `/mcp`
+imposes no restriction on its value (any hostname is accepted, matching `/api`), so nothing
+special is needed here whether you address the hub at `127.0.0.1` or its public hostname.
 
 The tool's `structuredContent` is byte-identical to `GET /api/claims/payments/libfoo-pin/dossier`.
 Read auth over `/mcp` (and `/api`) arrives with read-auth (a later item); the tools are

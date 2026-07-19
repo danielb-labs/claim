@@ -29,9 +29,12 @@
 //! service — mounted onto the existing axum router with `Router::nest_service("/mcp", …)` by
 //! [`crate::build_app`]. The JSON API and the hub MCP are therefore one binary on one port
 //! and one middleware stack (HUB.md §5's "one substrate"). It runs in **stateless** mode
-//! (via [`StreamableHttpServerConfig::with_stateful_mode`]): the 2026-07 MCP spec makes
-//! the protocol stateless at the transport layer, which suits a hub that may sit behind a
-//! plain load balancer, and a read-only surface keeps no per-session state to lose.
+//! ([`StreamableHttpServerConfig::with_stateful_mode`] passed `false`, i.e. stateful off):
+//! the 2026-07 MCP spec makes the protocol stateless at the transport layer, which suits a
+//! hub that may sit behind a plain load balancer, and a read-only surface keeps no
+//! per-session state to lose. The transport's default `Host` allow-list is disabled so a
+//! load-balanced hub reachable at its own hostname is not blanket-`403`ed — see
+//! [`mcp_service`] for why that is safe here.
 //!
 //! The service builds a fresh [`HubMcp`] handler per request from the shared [`AppState`]
 //! (cheap: the state is a reference-counted pool plus `Arc`s), so no request sees another's
@@ -295,19 +298,30 @@ impl ServerHandler for HubMcp {
 /// [`HubMcp`] per request from the shared `state` (cheap and stateless), and runs in
 /// **stateless transport mode with plain JSON responses**:
 ///
-/// - Stateless ([`StreamableHttpServerConfig::with_stateful_mode`] off): the 2026-07 MCP
-///   spec makes the protocol stateless at the transport layer, so a hub behind a plain load
-///   balancer keeps no per-session store to lose, and a read-only surface has no session
-///   state worth keeping.
+/// - Stateless ([`StreamableHttpServerConfig::with_stateful_mode`] passed `false`): the
+///   2026-07 MCP spec makes the protocol stateless at the transport layer, so a hub behind a
+///   plain load balancer keeps no per-session store to lose, and a read-only surface has no
+///   session state worth keeping.
 /// - JSON responses ([`StreamableHttpServerConfig::with_json_response`] on): a
 ///   request/response read tool returns `Content-Type: application/json` directly, without
 ///   SSE framing (allowed by the Streamable HTTP spec) — the simplest thing for a client
 ///   that only calls tools and reads the result.
+/// - `Host` allow-list disabled ([`StreamableHttpServerConfig::disable_allowed_hosts`]): so
+///   `/mcp` matches `/api`'s exposure model instead of `403`ing every non-loopback `Host`.
 #[must_use]
 pub fn mcp_service(state: AppState) -> StreamableHttpService<HubMcp, LocalSessionManager> {
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        // rmcp defaults `allowed_hosts` to loopback only (`localhost`/`127.0.0.1`/`::1`) as a
+        // DNS-rebinding guard. That guard targets a *browser* reaching a server running on the
+        // user's own machine; it would blanket-`403` a real hub reached at its operator
+        // hostname behind a load balancer, on the whole `/mcp` surface. Disabling it gives
+        // `/mcp` the same Host exposure as `/api` (which imposes no such check) — the hub is a
+        // server-side service addressed at operator hostnames, not a localhost app — and
+        // read auth (hub-13) will gate both surfaces uniformly, so this is the exposure model
+        // the surfaces already share, not a protection dropped from one of them.
+        .disable_allowed_hosts();
     StreamableHttpService::new(
         move || Ok(HubMcp::new(state.clone())),
         Arc::new(LocalSessionManager::default()),

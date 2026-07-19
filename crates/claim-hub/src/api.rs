@@ -434,15 +434,13 @@ pub(crate) async fn standing_set_value(state: &AppState, want: Standing) -> Read
 /// body can only ever describe a claim as current-or-newer than the `as_of`, never as more
 /// verified than the standing, because the standing is the model's alone.
 pub(crate) async fn dossier_value(state: &AppState, read: &ReadState, id: &str) -> ReadResult {
-    let claim_id = id.parse::<ClaimId>().map_err(|error| {
-        ReadProblem::new(
-            StatusCode::BAD_REQUEST,
-            format!("`{id}` is not a valid claim id: {error}"),
-        )
-    })?;
-
-    // The standing locates the store: the read model is keyed by (store, id), so the first
-    // matching id fixes the store the rest of the dossier is read against.
+    // The model lookup gates first, so an id the model does not hold — whether malformed or
+    // simply unknown — is one uniform "no claim" `404`, the same answer the API path gives:
+    // there the dossier is only reached after the id already matched a claim, so a bad id
+    // falls through to the same not-found. Parsing the `ClaimId` before this would split a
+    // malformed id off into a `400` the API never returns, breaking parity for that case.
+    // The standing also locates the store: the read model is keyed by (store, id), so the
+    // first matching id fixes the store the rest of the dossier is read against.
     let Some(((store, _), standing)) = read.model.claims.iter().find(|((_, cid), _)| cid == id)
     else {
         return Err(ReadProblem::new(
@@ -453,6 +451,19 @@ pub(crate) async fn dossier_value(state: &AppState, read: &ReadState, id: &str) 
             ),
         ));
     };
+
+    // A registered claim's id is a valid `ClaimId` by construction (the registry only holds
+    // parsed claims), so this parse succeeds; a defensive failure maps to the same "no claim"
+    // `404` rather than a `400`, keeping the tool and the API in agreement on a bad id.
+    let claim_id = id.parse::<ClaimId>().map_err(|_| {
+        ReadProblem::new(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no claim `{id}` in the registry — it may not be synced yet, or it was retired \
+                 with no verdict history"
+            ),
+        )
+    })?;
 
     // The registry entry carries the git-referenced statement, check digests, commit, and
     // supports edges. A claim in the derived model but absent from the registry read is a

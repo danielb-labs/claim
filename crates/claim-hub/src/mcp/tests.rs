@@ -408,6 +408,57 @@ async fn an_unknown_claim_dossier_is_a_tool_error_not_a_fabricated_standing() {
 }
 
 #[tokio::test]
+async fn a_malformed_id_dossier_mirrors_the_api_as_no_claim_not_a_bad_id() {
+    // Parity on a bad id: a malformed id through the `dossier` tool answers the same "no
+    // claim" the API gives, not a divergent "not a valid claim id" 400. The API's dossier is
+    // only reached after the id already matched a claim, so a malformed id there falls to the
+    // same not-found; the tool gates on the model lookup first to agree. Never a fabricated
+    // standing either way (invariant #6).
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_corpus(&store).await;
+    let st = state(store);
+    let mcp = HubMcp::new(st.clone());
+
+    // An uppercase segment is not a valid `ClaimId` (ids are lowercase) yet is a valid URI
+    // path, so it reaches the handler on both surfaces rather than being rejected as a bad URI.
+    let bad_id = "payments/NotAValidId";
+    let api_status = app(st)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/claims/{bad_id}/dossier"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        api_status,
+        StatusCode::NOT_FOUND,
+        "the API treats a malformed id as no claim, not a 400"
+    );
+
+    let result = mcp
+        .dossier(Parameters(DossierArgs { id: bad_id.into() }))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a malformed id is a tool error, not a fabricated standing"
+    );
+    assert!(
+        result.structured_content.is_none(),
+        "no fabricated standing in structured content"
+    );
+    let text = text_of(&result);
+    assert!(
+        text.contains("no claim"),
+        "the reason mirrors the API's no-claim message, not a bad-id 400: {text}"
+    );
+}
+
+#[tokio::test]
 async fn a_retired_claim_dossier_is_a_tool_error_mirroring_the_api() {
     // A claim the ledger knows but the registry has dropped is retired: its dossier needs a
     // live statement, so both surfaces answer an honest error, never a green.

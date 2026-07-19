@@ -113,6 +113,10 @@ reqwest = { version = "0.13", default-features = false, features = [
 # `schemars` (rmcp derives each tool's input schema from the request type's `JsonSchema`).
 # No client, no auth, no child-process transport — the tools are thin read bindings over the
 # API's shared value functions, so nothing else of rmcp is pulled in.
+# One honest transitive cost: rmcp's `schemars` feature force-enables `schemars/chrono04`,
+# pulling `chrono` + `iana-time-zone` (and the windows tz crates) into a workspace that
+# deliberately standardized every timestamp on `jiff`. It is unused by hub code and not
+# droppable without patching rmcp — an accepted surface cost of the SDK.
 rmcp = { version = "2.2", default-features = false, features = [
     "server",
     "macros",

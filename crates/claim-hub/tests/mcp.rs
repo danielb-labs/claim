@@ -57,20 +57,27 @@ async fn app_with_seed() -> axum::Router {
     claim_hub::build_app(AppState::new(store, None).with_read_clock(read_clock))
 }
 
-/// POST an MCP JSON-RPC request body to the mounted `/mcp` and return the parsed response.
+/// POST an MCP JSON-RPC request body to the mounted `/mcp`, under `host`, and return the
+/// parsed response.
 ///
 /// The `Accept` header offers both JSON and SSE per the spec; the stateless-JSON transport
-/// answers with `application/json`, so the body parses directly. The `Host: localhost` header
-/// satisfies rmcp's DNS-rebinding protection (which rejects a request with no `Host`); a real
-/// HTTP client always sends one, so this is a test-shim, not a behavior of the mount.
-async fn mcp_post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+/// answers with `application/json`, so the body parses directly. `host` is the request's
+/// `Host` header: rmcp's default `allowed_hosts` DNS-rebinding guard is disabled on this
+/// mount (it would blanket-`403` a load-balanced hub reached at its own hostname), so both a
+/// loopback and a real operator hostname reach a tool — [`a_real_hostname_reaches_a_tool`]
+/// proves the non-loopback case that the default guard would have rejected.
+async fn mcp_post_as(
+    app: &axum::Router,
+    host: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
-                .header("Host", "localhost")
+                .header("Host", host)
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
                 .body(Body::from(body.to_string()))
@@ -82,6 +89,11 @@ async fn mcp_post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, s
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// POST an MCP request under a loopback `Host`, the ordinary case for the parity tests.
+async fn mcp_post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    mcp_post_as(app, "localhost", body).await
 }
 
 /// GET an API endpoint on the same app, for the transport-level parity check.
@@ -198,5 +210,36 @@ async fn an_unknown_claim_over_the_mount_is_a_tool_error_not_a_fabricated_standi
     assert!(
         text.contains("payments/ghost"),
         "the reason names it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_real_hostname_reaches_a_tool() {
+    // A load-balanced hub is reached at its own hostname, not `localhost`. rmcp's default
+    // `allowed_hosts` guard would `403` such a `Host` on the whole `/mcp` surface; the mount
+    // disables it so `/mcp` matches `/api`'s exposure model. This asserts a non-loopback
+    // `Host` reaches a tool (a real result, not a 403), so a real deployment works.
+    let app = app_with_seed().await;
+    let (status, body) = mcp_post_as(
+        &app,
+        "hub.acme.com",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "dossier", "arguments": { "id": "payments/pin" } }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-loopback Host is not 403ed on /mcp: {body}"
+    );
+    let structured = &body["result"]["structuredContent"];
+    let api = api_get(&app, "/api/claims/payments/pin/dossier").await;
+    assert_eq!(
+        structured, &api,
+        "the tool served its result under a real hostname: {body}"
     );
 }
