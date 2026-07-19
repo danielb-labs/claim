@@ -1,0 +1,28 @@
+---
+source: crates/claim-hub/src/api/tests.rs
+expression: json
+---
+{
+  "events": [
+    {
+      "check": {
+        "digest": "e80b6975747b9a9ee29749fb2d38c7e3c6aead0497b95c69d95485f64fd01f10",
+        "index": 0
+      },
+      "claim": "payments/pin",
+      "commit": "abc1234",
+      "evidence": "libfoo==4.2",
+      "kind": "verdict",
+      "producer": {
+        "repository": "acme/payments",
+        "run": "run-1"
+      },
+      "reported_at": "2026-07-18T00:00:00Z",
+      "seq": 1,
+      "store": "github.com/acme/payments",
+      "verdict": "held"
+    }
+  ],
+  "ledger_head": 1,
+  "next_cursor": 1
+}
