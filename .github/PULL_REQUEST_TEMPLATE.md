@@ -2,8 +2,8 @@
 CLAUDE.md is the full contract for how we build here; this template is the short
 version. Keep the PR scoped to one item — raise unrelated refactors separately. Keep
 every `## ` section below — a required CI check (pr-template) fails a PR whose body drops
-one — and write "None" where a section does not apply (as Golden invariants and New
-dependencies already show).
+one — and write "None" (or "None affected", as each section indicates) where a section
+does not apply.
 -->
 
 ## What & why

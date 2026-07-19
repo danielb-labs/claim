@@ -22,11 +22,14 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// A controlled template with three `## ` sections and some noise the parser must ignore:
-/// a top `#` title and a `###` subheading are not sections, and an HTML comment is not a
-/// heading. The script must derive exactly `["What & why", "How", "Notes"]`.
+/// A controlled template with three live `## ` sections and noise the parser must ignore:
+/// a top `#` title and a `###` subheading are not sections, and a `## ` line *inside* an
+/// HTML comment block is commented-out guidance, not a required section. The script must
+/// derive exactly `["What & why", "How", "Notes"]` — never `Commented`.
 fn template() -> &'static str {
-    "<!-- guidance comment, not a heading -->\n\
+    "<!-- guidance block\n\
+     ## Commented (inside a comment; not a required section)\n\
+     end guidance -->\n\
      # Title (not a section)\n\
      ## What & why\n\
      ### A subheading, not a section\n\
@@ -86,6 +89,35 @@ fn a_body_with_every_section_passes_with_exit_0() {
         run_with_body(dir.path(), &full_body()),
         0,
         "a body carrying every template section must pass"
+    );
+}
+
+#[test]
+fn a_body_with_crlf_line_endings_passes() {
+    // GitHub delivers `pull_request.body` with CRLF line endings for bodies authored or
+    // edited in the web UI — the common correctly-filled case. Every fixture above uses
+    // LF only, so without this the suite would be green against a script that fails on
+    // real GitHub input: each heading arrives as `## What & why\r` and a whole-line match
+    // never matches. The script strips CRs, so a correctly-filled CRLF body must pass.
+    let dir = skeleton(true);
+    let crlf_body = full_body().replace('\n', "\r\n");
+    assert_eq!(
+        run_with_body(dir.path(), &crlf_body),
+        0,
+        "a correctly-filled body with CRLF line endings must pass"
+    );
+}
+
+#[test]
+fn a_commented_out_section_is_not_required() {
+    // The template's `## Commented` heading sits inside an HTML comment block, so it is
+    // not a live section; a body carrying only the three real sections must pass. Guards
+    // against requiring guidance the rendered template never shows.
+    let dir = skeleton(true);
+    assert_eq!(
+        run_with_body(dir.path(), &full_body()),
+        0,
+        "a `## ` heading inside a comment block must not be required"
     );
 }
 

@@ -17,7 +17,10 @@
 #
 # The body comes from a file path argument ($1) or, absent that, stdin. An empty or
 # near-empty body has no section headers, so it fails with exit 1 (drift) — loudly, never
-# a silent pass.
+# a silent pass. Matching is line-ending agnostic: GitHub delivers web-UI bodies with
+# CRLF, so carriage returns are stripped before matching or the check would fail every
+# correctly-filled PR. A `## ` heading inside a template `<!-- ... -->` comment block is
+# commented-out guidance, not a required section, and is not derived.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,15 +44,44 @@ else
   body="$(cat)"
 fi
 
-# The required sections are the template's `## ` headings, verbatim after the marker.
-# `##` (a level-2 heading) is the section grammar the template uses; `#`/`###` are not
-# sections. Read into an array so a heading containing spaces stays one entry.
+# GitHub delivers `github.event.pull_request.body` with CRLF line endings for bodies
+# authored or edited in the web UI — the common, correctly-filled case. Left in, every
+# heading would be `## What & why\r`, which the whole-line `grep -qxF "## <section>"`
+# below never matches, and the check would fail the very PRs it should pass. Strip all
+# carriage returns from the body so matching is line-ending agnostic.
+body="${body//$'\r'/}"
+
+# The required sections are the template's `## ` headings, verbatim after the marker,
+# but never the ones inside an HTML comment block: the template comments guidance out
+# with `<!-- ... -->`, and a `## X` line inside such a block is not a live section, so
+# requiring it would demand a heading the rendered template never shows. `##` (a
+# level-2 heading) is the section grammar the template uses; `#`/`###` are not sections.
+# Read into an array so a heading containing spaces stays one entry; strip a trailing
+# CR and trailing whitespace so a CRLF- or trailing-space-saved template derives the
+# same clean names the body must match.
 required=()
+in_comment=0
 while IFS= read -r line; do
+  line="${line%$'\r'}"
+  # A `<!--` on this line opens a comment before any `## ` on the same line is read, so a
+  # single-line `<!-- ## X -->` is correctly skipped; a `-->` closes it after, so the
+  # next line is live again.
+  if [ "$in_comment" -eq 0 ]; then
+    case "$line" in
+      *"<!--"*) in_comment=1 ;;
+    esac
+  fi
+  if [ "$in_comment" -eq 0 ]; then
+    case "$line" in
+      "## "*)
+        name="${line#\#\# }"
+        name="${name%"${name##*[![:space:]]}"}"
+        required+=("$name")
+        ;;
+    esac
+  fi
   case "$line" in
-    "## "*)
-      required+=("${line#\#\# }")
-      ;;
+    *"-->"*) in_comment=0 ;;
   esac
 done <"$template"
 
