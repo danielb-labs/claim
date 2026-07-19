@@ -1,828 +1,846 @@
-# `claim` — existential risks and the approaches to each
+# The things that could sink `claim`, and the options for each
 
-Status: menu, not a plan. July 2026.
+Status: this is a menu, not a plan. July 2026.
 
-This document lays out the risks that could sink `claim` and, under each, the
-possible approaches to it. **Every approach listed under "Other possible
-approaches" is an option to weigh — none is currently being pursued.** The
-baseline under each risk is what the plan (PRODUCT.md, HUB.md, CLI-HUB-BOUNDARY.md)
-already does or intends; everything after it is drawn from four first-principles
-approach lists and the grounded research (`ADOPTION-RESEARCH.md`), and is marked
-not-currently-pursued with a one-line reason.
+Nothing here is decided. This document lists the problems that could kill `claim`.
+Under each problem it lists the options we could use to deal with it. For each
+problem there's a "current plan" — what we already intend to do. Everything after
+that, under "Other options," is just an option to think about. None of it is being
+built right now. Each one comes with a one-line reason it's not being built yet.
 
-`claim` in one line: bind a plain-language fact to an executable check, commit it
-to git; a stateless CLI reports `held`/`drifted`/`broken`; a per-org hub ingests
-those verdicts and derives staleness, due-ness, and drift routing.
+First, what `claim` is, in plain words. You take a fact written in plain English —
+say, "we pin library X to version 4.2 because a newer version has a bug." You attach
+a small command that can check whether that fact is still true. You commit both to
+git, the same way you commit code. Then a command-line tool runs the check and tells
+you one of three things: the fact still holds, the fact has drifted (it's no longer
+true), or the check broke (it couldn't run). A separate service we call the "hub"
+collects those results over time. The hub is the part that knows the history: which
+facts are going stale, which are overdue for a re-check, and who to tell when a fact
+breaks. The tool itself remembers nothing between runs.
 
-The risks, in order:
+Two words you'll see a lot:
 
-1. Duplicate / polluting claims.
-2. Getting agents and people to consult the relevant claims before acting, and
-   covering the crucial files.
-3. Knowing when to capture a claim, and covering the crucial files without minting
-   junk.
-4. Check discrimination — the tautology problem: ensuring a check actually fails
-   when the fact becomes false, not just passes forever.
+- A **check** is the small command attached to a fact. Running it tells us if the
+  fact is still true.
+- A **claim** is the fact plus its check, committed to git.
 
-Then a closing read on the business/category question, as framing.
+The four problems, in order:
 
-**Recurring ideas across risks.** The same few moves surface under more than one
-risk. Where they do, they are noted inline; collected here so the convergence is
-visible:
+1. Duplicate and junk claims piling up.
+2. Getting agents and people to actually look at the relevant claims before they
+   change code — and making sure the important files are covered.
+3. Knowing when a decision is worth recording as a claim — and covering the important
+   files without filling the list with junk.
+4. Making sure a check actually fails when the fact becomes false, instead of passing
+   forever no matter what.
 
-- **Key on the check's polarity/behavior, not its prose.** A check's `negate`
-  flag and exit semantics are machine-readable and unforgeable; a statement's
-  words are not. This underpins the twin-safe dedup approaches (Risk 1) and the
-  discrimination approaches (Risk 4).
-- **Blast-radius / reachability from the check's read-set.** Expanding a claim's
-  watch set to everything that can reach the files its check reads appears as a
-  coverage engine for consultation (Risk 2), a targeting engine for capture
-  (Risk 3), and a fault-injection basis for discrimination (Risk 4).
-- **Mutation-test the check.** Perturbing the world and requiring the check to go
-  red is the core of Risk 4, appears as behavioral-equivalence dedup in Risk 1,
-  and as a birth-gate strengthening in Risk 3.
-- **The hub over the whole corpus is the authority, not the local `claim add` gate.**
-  The hub's registry sync ingests every claim committed to git regardless of how it
-  was authored, so dedup and verification belong at the hub over the merged corpus,
-  not in a CLI gate; the stronger approaches under Risks 1 and 3 run there for that
-  reason.
+At the end there's a section on the business question. That's background, not a
+problem to solve.
 
----
+## A few ideas that show up in more than one place
 
-## Risk 1 — Duplicate / polluting claims
+The same handful of ideas keep coming back under different problems. Here they are up
+front so you can see the pattern.
 
-**The risk.** Two claims that assert the same or nearly the same fact both live in
-the corpus. They split ownership, double the nag, and — unlike a stale wiki — their
-checks do not force the redundancy into view: two near-duplicate checks both exit 0
-forever, so nothing notices they are redundant. The corpus rots by accretion, not
-by going false.
+- **Judge a check by what it does, not by how the fact is worded.** A check has a
+  clear yes/no behavior, and a flag that says whether it's checking for a thing being
+  present or absent. A computer can read that behavior exactly. It can't read the
+  meaning of an English sentence the same way, and worse, a sentence can be worded to
+  say anything. So the reliable signal is the check's behavior. This idea shows up in
+  finding duplicates (problem 1) and in making checks trustworthy (problem 4).
 
-**Why it's hard (the honest catch).** Two constraints any approach must survive:
+- **Watch every file that could affect a check, not just the files the check reads.**
+  A check reads some set of files. But a change far away can still make the fact
+  false. So one idea is to widen the net: watch not just the files a check reads, but
+  everything that connects to those files — everything that calls them, imports them,
+  or depends on them. This same idea helps with getting the fact in front of the agent
+  (problem 2), deciding which files matter (problem 3), and testing whether a check
+  really works (problem 4).
 
-- **The negation twin.** The most similar existing claim by embedding is often the
-  opposite fact ("X enabled" vs "X disabled"): antonyms occur in near-identical
-  contexts, so they land close in embedding space. High cosine is a good candidate
-  generator and a terrible merge decider; a careless reviewer merges two opposite
-  facts.
-- **Checks-don't-dedup.** Two claims that both pass green are never forced into
-  comparison by verification; redundancy is invisible to the runtime. Something
-  external must force the comparison.
+- **Break the world on purpose and check that the check notices.** Deliberately change
+  something that should make the fact false, then confirm the check turns red. If it
+  stays green, the check is worthless. This is the heart of problem 4. It also helps
+  spot duplicate checks (problem 1) and strengthen the moment a claim is created
+  (problem 3).
 
-Not a constraint, a placement principle: dedup belongs at the hub, over the synced
-registry, not in the CLI's `claim add` gate. The hub ingests every claim committed
-to git regardless of how it was authored, and the hub — not any local gate — is the
-authority for dedup and verification. Authoring a claim by hand-editing a file does
-not bypass the analysis; it only means the analysis lives where it should, at the
-hub over the whole corpus.
-- The research adds: no surveyed memory system has made purely automatic
-  consolidation trustworthy. Mem0's production audit found 97.8% junk, an 808-copy
-  feedback loop, and a regression to MD5-exact dedup that stored contradictory
-  facts. PR-gated writes are exactly the mitigation the literature recommends —
-  keep the human in the merge decision.
-
-**The current/baseline approach.** Suggest-at-write-time, human-decides-at-review.
-The plan already commits to: the **check-digest** (SHA-256 over each check's
-canonical definition — kind, run/instruction, negate, skip, normalized), which the
-hub computes to bucket verdicts and which doubles as a byte-identical-check dedup
-key; **suggest-at-write-time embedding candidates** decided by a human at PR review
-(the hub can suggest edges via semantic similarity, but suggestions land as PRs,
-never silent graph mutations — deferred); **canonicalization of equivalent
-world-facts** (designate one canonical instance, verify once, fan the verdict out —
-deferred, and explicitly not an ontology); **supersede-via-git** (`retire`/`amend`
-remove or rewrite, git history is the record of invalidation); and `contradicts`
-edges returning, if ever, as agent-suggested conflict detection. The honest catch
-the plan carries: the candidate generator only fires if the author authors through
-a path the hub sees, and the negation twin will be the top suggestion.
-
-**Other possible approaches** (not currently pursued):
-
-- **A. Content-addressed claim identity.** The claim's id is a hash of its
-  normalized fact-shape (statement key, canonical run, `negate`, sorted `supports`),
-  not a chosen slug; two claims that hash equal are the same file path, so an exact
-  duplicate is a git-level collision visible in the diff with no gate to bypass.
-  Domain: content-addressing / Merkle (git objects, IPFS, Nix). Handles the catch:
-  dedup happens at git-write, not at check time, so it survives the hand-commit
-  bypass; including `negate`/polarity in the hash makes the twin correctly two
-  distinct objects. Tradeoff: breaks the human-readable kebab-case `id` that
-  `supports:` and wiki-links point at, and hashing the statement risks
-  ontology-creep; only reaches exact-shape dupes. Differs from baseline: moves
-  dedup from the hub (after merge) into git (at merge, in the truth).
-
-- **B. Structural fact-key + nominal statement.** Separate a claim's structural
-  identity (what its check mechanically asserts — target paths, pattern, polarity)
-  from its nominal identity (the prose); dedup on the structural key, keep the prose
-  free, so `rg -q 'X' src/` and `grep -rq 'X' ./src` produce the same key. Domain:
-  nominal vs structural typing; database candidate keys. Handles the catch: the key
-  includes polarity, so twins get different keys even at cosine 0.98; a CI lint
-  drifts when two live claims share a key, catching the hand-committed case.
-  Tradeoff: parsing arbitrary shell into a canonical structural form is open-ended
-  and fragile — realistically a per-check-kind normalizer for a whitelist of shapes,
-  a research project; agent/human checks have no structural form to key on. Differs
-  from baseline: the digest is a syntactic hash (`rg` ≠ `grep`); this is a semantic
-  key that collapses equivalent-but-differently-written checks.
-
-- **C. Two-vector similarity: fact-vector AND polarity-vector.** Represent each
-  claim as two signals — what it is about, and which way it points — and call two
-  claims duplicates only when topic matches AND polarity matches; same-topic +
-  opposite-polarity is flagged as a *contradiction*, not a duplicate. Domain:
-  "Beyond Cosine Similarity" (arXiv 2601.13251); stance/sentiment decomposition.
-  Handles the catch: this is the approach designed for the twin — polarity is taken
-  from the check itself (`negate`, exit semantics), machine-readable and unforgeable,
-  so the twin becomes the highest-value output rather than a false merge; runs at
-  index time over hand-committed claims too. Tradeoff: the whole
-  embedding/suggestion layer is deferred to the hub, and polarity-from-check is clean
-  only for `cmd`+`negate` — agent-check polarity is buried in prose. Differs from
-  baseline: removes the twin from the human's plate by making polarity a separate,
-  check-derived axis, instead of leaning on the reviewer to catch it.
-
-- **D. Entity-resolution over the supports-graph.** Two claims are candidate
-  duplicates when they support the same decision anchor and read the same files —
-  resolve by edges and read-set, not statement similarity. Domain: knowledge-graph
-  entity resolution / record linkage (block on shared attributes, then match).
-  Handles the catch: same anchor + opposite polarity is "contradictory reasons for
-  one decision," a louder finding than duplicate; the join is over `supports` edges
-  the hub already indexes, no run needed, and edges are in frontmatter regardless of
-  how the file arrived. Tradeoff: depends on authors writing `supports` edges
-  (optional today) and on read-set tracing (deferred); a claim with no edges is
-  invisible, so it is a complement to text similarity, not a replacement. Differs
-  from baseline: dedups over graph position rather than prose or external-fact
-  equivalence, reusing the cross-repo routing index rather than a new embedding index.
-
-- **E. The check IS the dedup oracle: behavioral equivalence.** Two `cmd` checks are
-  duplicates iff they agree on every input; mine their read-sets, construct probe
-  states (including a staged red), and if two checks return identical verdicts across
-  all probes they are behaviorally equivalent. Domain: differential / property-based
-  equivalence checking. Handles the catch: this makes checks dedup by construction —
-  equivalence is defined by check behavior, the one thing `claim` can execute; a twin
-  returns opposite verdicts on the same staged world, so it can never be falsely
-  merged; runs at CI/registry time. Tradeoff: N² over staged states, only for cheap
-  deterministic `cmd` checks with stageable reds, and constructing valid probe states
-  automatically is unsolved in general — realistically a hub batch job over a
-  pre-filtered cluster. Differs from baseline: nothing in the plan uses check
-  *execution* as the dedup signal; the digest compares definitions, embeddings
-  compare prose. (Reuses the `--witness-cmd` staged-red machinery, tying dedup to
-  discriminating power — see Risk 4.)
-
-- **F. Supersession lattice via bi-temporal edges.** Do not dedup by deleting —
-  record a `supersedes: <id>` edge so the newer claim invalidates the older, which
-  becomes a tombstone that redirects; at most one claim per fact is live. Domain:
-  bi-temporal knowledge graphs (Zep/Graphiti `valid_at`/`invalid_at`); Stack Overflow
-  close-as-duplicate (redirect, never delete). Handles the catch: supersession is
-  directional and human-authored, so a twin is never auto-superseded; the edge is
-  frontmatter, indexed however the file arrived; a live claim whose fact-key matches
-  a tombstone is a loud finding. Tradeoff: solves the "I found a duplicate, now what?"
-  resolution step, not detection — it needs a detector (A–E) to fire first, and adds
-  an edge type (ontology the org must learn). Differs from baseline: the plan's
-  resolution is `retire` (delete the file, git is the record) with no forward pointer;
-  this keeps the reversible, navigable redirect the research shows is durable.
-
-- **G. Immune-system self/non-self: a claim must be provably distinct to be
-  admitted.** Invert the burden — instead of scanning for dupes after the fact, a
-  new claim must demonstrate it is not already covered: its check must distinguish it
-  from the nearest existing claim (a world-state where the two checks disagree) before
-  it is admitted. Domain: immune self/non-self discrimination; negative selection.
-  Handles the catch: admission requires a distinguishing input; no distinguishing
-  state means redundant, refused; a twin trivially has one, so it is correctly
-  admitted and flagged; enforced at CI over the registry, not only at `claim add`.
-  Tradeoff: finding a distinguishing probe automatically is the equivalence problem in
-  reverse and equally hard, and it raises authoring cost the pilot's <5-min guard
-  protects; a softer "warn on no-known-distinction" is viable sooner. Differs from
-  baseline: every planned mechanism is detect-then-suggest (post-hoc, advisory); this
-  is prevent-at-admission — the strongest structural stance, the highest friction.
-
-- **H. Canonical fact-URI namespace.** A world-fact gets one canonical URI
-  ("vendor:stripe/rate-limit"); every claim about it references the URI, so forty pins
-  on the same vendor limit are forty subscribers to one address. Domain: canonical
-  URIs / URNs (DOI, package coordinates, schema.org `@id`). Handles the catch: dedup
-  is by declared shared address, not inferred; two claims on one URI with opposite
-  assertions are a visible conflict at that address; the ref is frontmatter, indexed
-  at sync. Tradeoff: requires a governed namespace and authors agreeing on canonical
-  addresses — the ontology/governance cost the spec warns against; helps only world
-  facts, not repo-facts (the v1 wedge). Differs from baseline: makes canonicalization
-  author-declared and explicit rather than hub-inferred — nominal identity instead of
-  structural inference.
-
-- **I. Semantic/AST diff of statement + check.** Compare claims by tree-diff of their
-  structured content (parsed statement key phrases + parsed check AST), so
-  "near-duplicate" means "small structural edit distance" — interpretable and
-  twin-safe. Domain: semantic/AST diff (tree-sitter, GumTree, Fiberplane's `drift`).
-  Handles the catch: a negation is a large edit in the check AST (the polarity node
-  flips) even when it is a tiny prose edit, so AST distance separates twins that
-  cosine collapses; computed on definitions at index time. Tradeoff: same
-  check-parsing fragility as B, and it only reaches near-dups whose checks are
-  structurally close — two claims stating one fact with totally different check
-  strategies have distant ASTs and slip through. Differs from baseline: exact,
-  twin-aware, explainable, but narrower — a precision instrument where embeddings are
-  recall; best as the confirm step behind embedding candidates.
-
-- **J. CRDT-style convergent claim set.** Model the claim set as a CRDT keyed on
-  fact-identity so two agents independently authoring "the same" claim in parallel
-  branches merge into one on integration rather than producing two rows. Domain: CRDTs
-  / convergent replicated data types. Handles the catch: convergence is at merge time
-  on the fact-key (which includes polarity, so twins do not converge — they surface as
-  a concurrent conflict); hand-committed and CLI-authored claims merge identically.
-  Tradeoff: git's merge is line-based, not semantic — a real claim CRDT needs a custom
-  merge driver and a stable fact-key (A/B), and concurrent duplication is a narrow
-  slice (most dupes are authored months apart). Over-engineered for v1 scale. Differs
-  from baseline: the plan treats concurrent same-slug creation as a normal git conflict
-  for a human; this makes same-*fact* concurrent creation converge automatically.
-
-*Convergence note.* The approaches sort by the two catches: anything keyed on prose
-inherits the twin and needs a human backstop; anything needing a runtime comparison
-to happen inherits checks-don't-dedup. And dedup belongs at the hub over the synced
-registry — which sees every git-committed claim — not a local `claim add` gate. The
-approaches that route around all of this key on the check's machine-readable
-polarity/behavior (C, E) and run over the whole corpus at the hub.
+- **The hub is the real authority, not the tool's local gate.** The hub sees every
+  claim in git, no matter how it got there. Someone can hand-write a claim file and
+  commit it, skipping the tool entirely. So the serious work of finding duplicates and
+  verifying claims belongs at the hub, looking at all the claims together — not at a
+  local check the tool runs when you add a claim, which someone can bypass. The
+  stronger options under problems 1 and 3 run at the hub for this reason.
 
 ---
 
-## Risk 2 — Consulting the relevant claims before acting, and covering the crucial files
+## Problem 1 — Duplicate and junk claims
 
-**The risk.** An agent or human about to change code must reliably encounter the
-load-bearing facts governing what they touch, before acting on a stale assumption.
-The overriding objective is coverage of the *crucial* files — the load-bearing ones
-an agent will actually act on — not any file. A mechanism that covers every trivial
-file and misses the one load-bearing file has failed.
+**The problem.** Two claims end up saying the same thing. Now one fact has two owners
+and sends two reminders. And nothing catches it — both checks keep passing, so the
+tool never notices they're duplicates. Unlike a stale wiki page, which at least looks
+wrong when you read it, two duplicate checks both stay green forever. The list of
+claims just quietly fills with repeats. It doesn't rot by going false. It rots by
+piling up.
 
-**Why it's hard (the honest catch).** Three constraints:
+**Why this is hard.** Two traps any solution has to survive.
 
-- **Presence is not obedience.** A hook can inject a fact into context; the model can
-  still ignore it. Instruction-following degrades with load (68% accuracy at 500
-  instructions; <30% perfect compliance in agentic runs). Prompt-layer rules are
-  advisory by design.
-- **"The model decides to look" measurably fails.** MCP tools go uncalled (agents
-  used code mode only 6% of the time when both were available; some servers' tools
-  never called at all); agent-requested rules, `llms.txt`, and passive skills all
-  under-fire. Tool-selection reliability falls off a cliff past ~20 tools. The one
-  deterministic layer is harness hooks that inject context directly.
-- **The coverage gap.** The mechanism presumes a claim's `supports`/read-set names the
-  file being edited. The invalidating change routinely lands in a file no claim
-  mentions (the upload handler that reaches XmlParser eight months later, nowhere near
-  the exception file).
-- The research adds a cost the always-on approach pays: injecting more is not free.
-  LLM-generated always-on instruction files *reduced* task success ~3% and raised cost
-  20%+; compliance itself has a cost, and a big rules file is attention-diluted, not
-  skimmed. `llms.txt` has ~9% adoption and no measurable benefit — publishing a file
-  agents *could* read does nothing; something must put it in front of them.
+First, the opposite-fact trap. To find duplicates, the computer looks for claims
+worded similarly. It measures how close two pieces of text are in meaning (a standard
+technique: turn each sentence into a list of numbers and see how close the lists are).
+But "X is on" and "X is off" are worded almost the same. They're about the same thing;
+they just disagree. So the closest match to a new claim is often its exact opposite.
+That's fine for saying "hey, take a look at this one." It's dangerous if you then merge
+them — you'd be combining two claims that contradict each other.
 
-**The current/baseline approach.** Hooks execute the CLI; hub MCP as a fallback; the
-`supports` anchor as the mapping. Concretely the plan intends: **harness hooks** that
-run the CLI (a SessionStart digest plus a PreToolUse hook on Edit/Write that
-path-matches `supports`/read-set and injects only the matching facts) for deterministic
-*presence*; the **CLI as the retrieval primitive** everything calls (`claim list
---json`, `claim check --json` — greppable, works in every harness, what the hooks
-execute); a **small directive section in CLAUDE.md/AGENTS.md** advertising the CLI (not
-inlining the corpus); and the **hub MCP** (`context`, `dossier`, `drifts`, `due`,
-`search`) last, as a thin adapter for surfaces that cannot run a shell. The mapping is
-the `supports` anchor plus post-v1 read-set tracing. Shared property: the fact is
-*shown* to the agent as dated evidence to weigh, never as an order to obey; nothing
-blocks on it. The honest catch the plan carries: hooks are per-harness glue `claim`
-must build and maintain, presence is not obedience, and the mapping presumes the
-read-set names the edited file.
+Second, checks don't compare themselves. Two claims that both pass green are never
+forced to face each other. The tool runs each check, sees green, and moves on. Nothing
+makes it notice they're redundant. Something outside the normal run has to force the
+comparison.
 
-**Other possible approaches** (not currently pursued):
+One more point, about where this work should happen, not a trap. Finding duplicates
+belongs at the hub, looking at all the claims together. The hub sees every claim
+committed to git, however it was written. Hand-writing a claim file and committing it
+doesn't dodge the analysis — it just means the analysis has to live at the hub, where
+it sees everything, and not in a local gate the tool runs when you add a claim.
 
-*Group A — make a violated claim fail the change (obedience for free).*
+What the research adds: no memory system anyone studied has made fully automatic
+merging trustworthy. One AI-memory product checked its own stored memory and found
+almost all of it was junk, including a loop where the system kept re-saving its own
+recalled memories over and over. The safe pattern is to keep a human in the merge
+decision, reviewing it inside a pull request. (Details in `ADOPTION-RESEARCH.md`.)
 
-- **A1. Claim-as-build-error.** Compile the relevant claims' checks into the change's
-  own build/CI gate so a drifted load-bearing claim turns the change red, with the
-  statement and owner in the failure text. Domain: compilers / type systems. Handles
-  the catch: obedience is irrelevant — the agent cannot merge a red; covers exactly the
-  files the check reads. Tradeoff: this is the plan's *promote-to-a-real-test* end
-  state, and making blocking the default reintroduces the "author deletes the assertion
-  because no reason is attached" failure at scale and collides with invariant #6 (nag,
-  not block) — it belongs as a deliberate per-claim opt-in ratchet (`enforce: block`),
-  defaulting off. Differs from baseline: the plan never blocks (comment + standing
-  issue only); this makes a violated claim a hard gate. Same check, opposite lifecycle
-  position.
+**The current plan.** Suggest possible duplicates when a claim is written; let a human
+decide during review. Concretely:
 
-- **A2. Poka-yoke interlock at the edit site.** A PreToolUse hook that does not merely
-  inject the fact but *denies* the edit (hook `deny`) when the touched path is governed
-  by an unacknowledged claim, returning the fact as the denial reason. Domain: poka-yoke
-  / machine interlocks. Handles the catch: converts presence into "you may not proceed
-  until you have seen this"; the interlock fires only for load-bearing claims, so
-  friction concentrates on crucial files. Tradeoff: a hard block on the changer
-  (invariant #6 tension), per-harness and Claude-Code-specific, and an
-  acknowledgement gate the agent auto-clears is theatre. Differs from baseline: the
-  plan's hook informs; this withholds the tool until the fact is seen.
+- **A fingerprint of the check.** Take each check's exact definition and hash it into a
+  short fixed string. Two checks with the same definition get the same fingerprint, so
+  byte-for-byte identical checks are easy to spot.
+- **Suggest similar claims at write time.** The hub can point out claims that look
+  similar in meaning. But these only ever show up as suggestions in a pull request,
+  never as automatic changes to the list. (Not built yet.)
+- **Pick one official version of a shared world-fact.** If many claims are really about
+  the same outside fact, name one as the official one, check it once, and share the
+  result. (Not built yet, and deliberately not an attempt to build a formal vocabulary
+  of facts.)
+- **Replace via git.** To remove or rewrite a claim, use the existing `retire` and
+  `amend` commands. Git history is the record of what got replaced and when.
+- **Conflict edges**, if they ever come back, as an agent suggesting "these two claims
+  seem to disagree."
 
-- **A3. Reference monitor / policy engine on the change.** A mediation layer evaluates
-  the diff against a policy compiled from the claims ("no change may make a load-bearing
-  claim drift without an owner ack") and admits or rejects like an authorization
-  decision. Domain: reference monitors (complete mediation) / OPA / Kyverno. Handles the
-  catch: the monitor looks on every change, so coverage is a guarantee not a hope,
-  especially paired with blast-radius inference (B1). Tradeoff: a full policy layer is
-  enormous surface and a *new* required workflow — the adoption-killer the research flags
-  — and it re-centralizes decisions the plan keeps distributed to owners. Differs from
-  baseline: the plan has no evaluator that admits/rejects a change; verdicts are
-  telemetry, never a gate.
+The honest catch the plan carries: the suggestion only appears if the author writes
+the claim through a path the hub sees, and the opposite-fact trap means the top
+suggestion is often the exact contradiction of the new claim.
 
-- **A4. Effect/capability system.** Treat "editing a governed file" as a capability the
-  agent does not hold by default; grant it for the session only after the governing
-  claims are surfaced and (for high-stakes claims) acknowledged. Domain: capability
-  security / effect systems. Handles the catch: the model cannot skip the fact because
-  skipping it means never acquiring the capability to edit; capabilities mint per
-  load-bearing region, so trivial files carry no friction. Tradeoff: fights the harness's
-  own permission model, is per-harness, and only Claude Code's `deny` approximates it —
-  it is A2 with more machinery. Differs from baseline: the plan grants the fact alongside
-  full ambient edit authority; this withholds authority until the fact is honored.
+**Other options** (not being built):
 
-*Group B — close the coverage gap (the crucial fact reaches the agent even in an
-unwatched file).*
+- **Name each claim after what it checks, so exact copies collide.** Today a person
+  picks a name for a claim. Instead, build the name automatically from the fact and its
+  check. Then two claims that check the exact same thing get the exact same name, and
+  land on the exact same file. Git shows that as a conflict the moment you commit, so
+  you can't miss it, and there's no gate to bypass. Because the name includes whether
+  the check is looking for presence or absence, a fact and its opposite get different
+  names — they correctly stay separate. Example: two people both add "library X is
+  pinned to 4.2"; the auto-generated name is identical, so the second one collides with
+  the first in git. Downsides: the names become unreadable, other claims that point at
+  this one by name break, and it only catches exact copies, not near-copies.
 
-- **B1. Blast-radius reachability from the check's read-set.** Expand each claim's watch
-  set from "files the check reads" to "everything that can reach those files" — callers,
-  importers, transitive dependents — so a change three hops away still surfaces the fact.
-  Domain: static taint analysis / reverse call-graph reachability. Handles the catch: the
-  coverage gap *is* this — the change was reachable to the governed code but not in it;
-  reverse-reachability is the precise formalization of "could this change make the fact
-  false," and it feeds whichever delivery mechanism (hook/gate). It is the only approach
-  that would have caught the canonical upload-handler failure. Tradeoff: a correct reverse
-  call-graph is per-language, expensive, and never sound across dynamic dispatch /
-  reflection / FFI — an unsound graph that silently misses the crucial caller is worse
-  than an honest grep-the-whole-tree; ship it as an optimization over run-everything, not
-  as the floor. Differs from baseline: the read-set is files the check *reads*; this is
-  files that can *reach* what the check reads — a transitive closure the plan does not
-  compute. (Same reachability engine recurs in Risks 3 and 4.)
+- **Give each claim a machine-built identity from its check, and keep the wording
+  free.** Separate two things: what the check mechanically does (which files it looks
+  at, what pattern, present or absent) and the English wording. Match duplicates on the
+  mechanical part, and let the wording be whatever. Example: `rg -q 'X' src/` and
+  `grep -rq 'X' ./src` do the same thing, so they'd get the same mechanical identity
+  even though they're typed differently. Because the identity includes present-vs-absent,
+  a fact and its opposite stay separate even when worded almost identically. A CI check
+  can flag when two live claims share an identity, which catches the hand-committed
+  case too. Downside: turning an arbitrary shell command into a clean mechanical form
+  is genuinely hard and fragile — realistically you'd only handle a short list of known
+  command shapes, and checks that are questions for an agent or a human have no
+  mechanical form at all.
 
-- **B2. Learned file→fact association from drift history.** Learn which files, when
-  changed, have historically co-occurred with a claim drifting, and surface that claim on
-  future edits to those files even if no static edge connects them. Domain: change-coupling
-  / association-rule mining ("developers who touched X also broke Y"); recommenders.
-  Handles the catch: catches invalidating changes no static analysis links (config,
-  fixtures, indirect couplings), complementing B1's blind spots. Tradeoff: needs a drift
-  history that does not exist until the tool has run a long time (cold-start), it is
-  probabilistic (false associations are exactly the >10% noise that kills the channel),
-  and it re-introduces a statistical component into a deterministic product. Differs from
-  baseline: the plan's edges are declared or read-derived (deterministic); this adds a
-  learned, probabilistic edge kept out of v1.
+- **Compare two signals: what a claim is about, and which way it points.** Represent
+  each claim with two separate measurements — its topic, and its direction (is the
+  thing on or off, present or absent). Call two claims duplicates only when the topic
+  matches AND the direction matches. Same topic but opposite direction is flagged as a
+  contradiction, not a duplicate. Example: "feature X enabled" and "feature X disabled"
+  share a topic but point opposite ways, so this correctly calls them a contradiction
+  instead of merging them. The direction comes from the check itself, which the
+  computer can read exactly, so the opposite-fact trap turns into the most useful
+  output instead of a dangerous merge. Downside: the whole similarity layer is
+  deferred to the hub anyway, and reading the direction off a check is clean only for
+  simple commands — for checks that are questions to an agent, the direction is buried
+  in the wording.
 
-- **B3. Semantic-index reachability (embed the diff, retrieve the claim).** Embed the
-  changed hunks and retrieve the top-k claims whose statements are semantically nearest,
-  so a fact reaches the agent when the change is conceptually about the same thing,
-  regardless of path. Domain: RAG / semantic code search. Handles the catch:
-  path-independence — a prose-described change retrieves the relevant claim by meaning,
-  reaching the case where the invalidating file shares no token with the watch set.
-  Tradeoff: the same negation-trap and precision problems as dedup (antonyms co-locate;
-  high cosine is a good candidate generator, a bad decider) — as a coverage mechanism it
-  floods with near-misses, and flooding is context rot, the very thing that dilutes the
-  one crucial fact. Useful as a candidate generator behind a filter, never as the delivery
-  path. Differs from baseline: the plan matches on path (`supports`/read-set); this matches
-  on meaning, at a precision cost the plan avoids.
+- **Match duplicates by which decision they support and which files they read.** Two
+  claims are candidate duplicates when they back the same decision and read the same
+  files. Judge by those connections, not by wording. Example: two claims both support
+  the decision "keep the old XML parser" and both read the same parser file — likely
+  the same claim twice. If they support the same decision but point opposite ways,
+  that's "two contradictory reasons for one decision," which is a louder and more
+  useful finding than a plain duplicate. The links are already recorded in the claim
+  files, so this works no matter how a file got committed. Downside: it depends on
+  authors actually writing those "supports" links (optional today) and on tracking
+  which files a check reads (not built yet); a claim with no links is invisible to
+  this, so it's a supplement to wording-based matching, not a replacement.
 
-*Group C — make the fact structurally unavoidable rather than merely present.*
+- **Use the checks themselves to find duplicates: two checks that always agree are the
+  same check.** Two command-checks are duplicates if they give the same answer in
+  every situation. Figure out which files each reads, build a bunch of test worlds
+  (including one deliberately broken so the check should fail), and run both checks
+  against all of them. If they always give the same verdict, they're the same check in
+  practice. Example: two checks meant to confirm "no debug flag in the config" — run
+  both against a config with the flag and without it; if they agree every time, keep
+  one. A fact and its opposite give opposite verdicts on the same broken world, so they
+  can never be falsely merged. Downside: comparing every check against every other is a
+  lot of work, it only works for cheap, predictable command-checks where you can stage
+  a failure, and building valid test worlds automatically is an unsolved problem in
+  general — realistically a hub batch job over an already-narrowed group of suspects.
 
-- **C1. Pre-change read-back checklist.** Before a governed change, the agent must
-  *produce* — not merely receive — the governing facts and state how its change relates to
-  each, a challenge-and-response the change cannot proceed without. Domain: aviation /
-  surgical checklists (the item is read back, not just read). Handles the catch: making the
-  agent emit the fact is a far stronger signal of processing than silent injection; the
-  checklist is populated from the claims governing the touched region, so it lists only
-  crucial facts. Tradeoff: enforcing a genuine read-back (vs rubber-stamping "does not
-  affect") requires judging the agent's response, itself an unreliable LLM step, and it
-  adds latency to every governed edit; an unjudged checklist decays to theatre. Differs
-  from baseline: the plan pushes the fact and moves on; this makes the agent pull it back
-  through its own output.
+- **Don't delete duplicates — point the old one at the new one.** Instead of removing a
+  duplicate, record that the newer claim replaces the older one. The old one becomes a
+  signpost that redirects to the new one. At most one claim per fact is live at a time.
+  A person writes this link on purpose, so a fact and its opposite never get linked by
+  accident. Example: like closing a question as a duplicate on Stack Overflow — the old
+  page stays and points you to the canonical one, and nothing is lost. If a live claim
+  matches something already marked as replaced, that's a loud finding. Downside: this
+  solves "I found a duplicate, now what do I do about it" — it does not find duplicates
+  in the first place, so it still needs one of the detectors above to fire first. It
+  also adds a new link type the team has to learn.
 
-- **C2. Progressive disclosure keyed to the action.** Disclose nothing at session start
-  and the full governing fact at the instant of the governed action, so it arrives with
-  zero competition and maximal relevance, late in context where attention is best. Domain:
-  progressive disclosure (UI) + just-in-time context engineering. Handles the catch:
-  context rot and early-instruction bias are dilution effects of volume and position;
-  delivering one fact at the edit with nothing else competing is where a single instruction
-  is most followed. Tradeoff: this is the closest of all approaches to the plan (it *is* the
-  PreToolUse hook, disciplined), so its distinctness is marginal, and dropping the
-  SessionStart digest loses a useful surface — fold its "minimal, edit-scoped payload"
-  discipline into the planned hook rather than building it separately. Differs from
-  baseline: the plan injects a SessionStart digest *and* edit-time facts; this removes the
-  digest and injects one fact per action.
+- **A claim has to prove it's different before it's allowed in.** Flip the burden.
+  Instead of scanning for duplicates afterward, make every new claim prove it isn't
+  already covered before it's admitted. It has to show a situation where its check and
+  the nearest existing check would disagree. Example: adding "no calls to the old API"
+  when a similar claim exists — you must produce a world where one check passes and the
+  other fails; if you can't, the claim is redundant and refused. A fact's opposite
+  trivially has such a distinguishing situation, so it's correctly let in and flagged.
+  This runs in CI over all the claims, not only when you add one. Downsides: finding
+  that distinguishing situation automatically is just as hard as proving two checks are
+  identical, and it makes writing a claim slower — which fights the goal of keeping
+  authoring under five minutes. A gentler version ("warn when we can't tell them apart")
+  is doable sooner.
 
-- **C3. Feature-flag / ratchet gating of the change surface.** Gate whether an agent may
-  touch a governed region behind a per-region flag (off / warn / block) and ratchet regions
-  from warn→block only as their claims prove trustworthy, so enforcement grows with
-  confidence and never demands a full corpus. Domain: feature flags + gradual-typing
-  ratchets (Untracked→Lenient→Strict). Handles the catch: obedience is enforced only where a
-  region has earned it (its claims discriminate, low false-drift), dodging the
-  false-positive-fatigue death spiral of indiscriminate blocking; the ratchet aims at
-  load-bearing regions first. Tradeoff: presupposes both the blocking mechanism (Group A)
-  and a track-record signal (a mature verdict history), neither in v1 — it is the governance
-  layer over A1/A2. Differs from baseline: the plan has one non-blocking mode for all claims;
-  this is a per-region, confidence-graded enforcement ladder.
+- **Give each outside fact one official address, and have claims subscribe to it.** A
+  world-fact gets one canonical address, like `vendor:stripe/rate-limit`. Every claim
+  about it points at that address. Then forty claims about the same vendor limit are
+  forty subscribers to one address, obviously grouped. Example: instead of forty
+  separate claims about Stripe's rate limit, forty claims all reference the one Stripe
+  rate-limit address, so the duplication is visible at a glance. Two claims at the same
+  address that assert opposite things are an obvious conflict. Downside: this needs
+  someone to run and govern the list of official addresses, and authors to agree on
+  them — the kind of shared-vocabulary overhead the project wants to avoid. It also only
+  helps for outside-world facts, not facts about this repo's own code, which is the
+  first thing `claim` targets.
 
-*Convergence note.* B1 (blast-radius) attacks the coverage gap the other two catches are
-downstream of — a delivery mechanism can only deliver facts for files the mapping names.
-A1 is the strongest answer to presence-is-not-obedience but is a lifecycle escalation, not
-a consultation mechanism, and is the same promote-to-a-gate the plan already contemplates.
-C1 is the best near-term, low-infrastructure lever on obedience, buildable as a skill/hook
-over the CLI the plan already ships. None commits a verdict or stores status.
+- **Compare the structure of two claims, not just their wording.** Break each claim into
+  its structured parts — the key phrases of the statement, and the parsed structure of
+  the check — and compare those structures. "Near-duplicate" then means "a small edit
+  away." Example: flipping a check from "present" to "absent" is a big change in the
+  check's structure even though it's a tiny wording change, so this cleanly separates a
+  fact from its opposite. Downside: it has the same fragile check-parsing problem as
+  the mechanical-identity option above, and it only catches near-duplicates whose checks
+  are built similarly — two claims stating the same fact with totally different check
+  strategies look far apart and slip through. Best used as the careful confirming step
+  after a wording-based search suggests candidates.
+
+- **Merge duplicates automatically at git-merge time.** Model the whole set of claims so
+  that if two agents independently write "the same" claim on separate branches, the two
+  merge into one when the branches come together, instead of leaving two copies.
+  Example: two agents on two branches each add "library X is pinned to 4.2"; on merge
+  they collapse into a single claim rather than two. The merge keys on a fact identity
+  that includes direction, so a fact and its opposite do not merge — they show up as a
+  genuine conflict for a human. This handles the case where two people create the same
+  claim at the same time. Downsides: git's merge works line by line, not by meaning, so
+  this needs a custom merge tool and a stable fact identity (from one of the naming
+  options above). And same-time duplication is a narrow slice of the problem — most
+  duplicates are written months apart, not in parallel. Probably too much machinery for
+  where the product is now.
+
+*Sorting it out.* The options split by the two traps. Anything that keys on wording
+inherits the opposite-fact trap and needs a human as a backstop. Anything that needs
+the checks to actually be run and compared inherits "checks don't compare themselves."
+And all of this belongs at the hub, which sees every committed claim, not in a local
+gate you can bypass. The options that dodge all of this are the ones that key on the
+check's own behavior and run over all the claims at the hub.
 
 ---
 
-## Risk 3 — When to capture a claim, and covering the crucial files without minting junk
+## Problem 2 — Getting the relevant claims in front of whoever is about to change code
 
-**The risk.** A decision worth recording must become a claim at near-zero authoring
-cost, or the corpus never reaches the coverage its value depends on. Manual-capture
-knowledge tools rot (ADRs, wikis, Guru). The objective is coverage of the *crucial*
-files — the load-bearing decisions an agent will act on — without minting junk.
+**The problem.** An agent or a person is about to change some code. Before they act on a
+stale assumption, they need to reliably see the important facts that govern what they're
+touching. The thing that matters is covering the important files — the ones an agent
+will actually act on — not every file. A system that covers a hundred trivial files but
+misses the one load-bearing file has failed.
 
-**Why it's hard (the honest catch).** Three constraints:
+**Why this is hard.** Three traps.
 
-- **Preferences aren't checkable.** Most corrections ("don't use barrel imports here")
-  have no falsifiable check; forcing one mints a tautology.
-- **Incident/world facts often can't be re-staged.** The honest check would cost a
-  project to build; the cheap check verifies a proxy that drifts from the fact.
-- **Flooding is the same disease.** Hitting a coverage number by minting green-forever
-  checks re-creates the pollution problem (Mem0's 97.8%-junk audit).
-- The research adds the economics: ADRs fail at both ends — capture friction at decision
-  time and no mechanism noticing staleness — and the root cause is structural (the
-  cost/value imbalance of documenting rationale, Grudin's "capturer isn't the
-  beneficiary"). Every shipped 2025-26 system converged on *agent-proposes*, differing
-  only on QC. Revealed friction threshold for *authoring* is ~zero; people will *review*
-  a good draft inside a workflow they were already in (a PR). Propose/confirm works only
-  when proposals are scarce, high-precision, and machine-pre-validated (Dependabot's
-  CI-green PR, Sentry's failing-then-passing test); otherwise it is alert fatigue.
+First, showing a fact doesn't mean it gets obeyed. You can force a fact into the agent's
+context, but the model can still ignore it. As you pile on more instructions, models
+follow them less well. In tests, even the best models followed only about two-thirds of
+instructions when given five hundred at once, and rarely followed all of them perfectly
+in real multi-step runs. Rules in the prompt are advisory by design — the model may or
+may not act on them.
 
-**The current/baseline approach.** An exception-diff ratchet plus correction and incident
-triggers. The plan intends: an **exception-diff ratchet** (a new pin / suppression / skip /
-waiver in a diff demands a claim in the same PR — mechanical, false-positive-free about
-*whether* a decision happened, landing in the existing workflow); **correction moments**
-(a human corrects the machine — the highest-signal moment — the agent drafts statement +
-check and runs `claim add`, gated on whether a discriminating check is derivable, else
-routed to a plain rules file); and **incident/revert state-transitions** (capture when the
-cost of not-knowing was just paid, and a red state exists to write the check against). All
-are event triggers that fire when a decision happens. The honest catch the plan carries:
-the check an author actually writes verifies the *artifact*, not the *reason*, and stays
-green after the reason is moot — the tautology problem (Risk 4), which the birth gate does
-not prevent.
+Second, "let the model decide to look it up" reliably fails. When agents have to choose
+to call a tool to fetch information, they often just don't. In one test agents used the
+available tool only about 6% of the time. Optional rules, published reference files, and
+passive skills all fire far less than you'd hope. And once an agent has more than about
+twenty tools to pick from, its ability to pick the right one falls off a cliff. The one
+layer that always works is a harness hook — code the agent runtime runs automatically,
+which injects the fact directly whether the model asked for it or not.
 
-**Other possible approaches** (not currently pursued). These sit on a different axis from
-the planned triggers: they make the *absence* of a claim fail (A), identify *which* files
-are crucial independent of any triggering event (B), attack the tautology at the source (C),
-or make capture a byproduct of work already happening (D).
+Third, the coverage gap. All of this assumes a claim knows which file is being edited —
+that its links or its read-set name that file. But the change that makes a fact false
+often lands in a file no claim mentions. Example: a claim guards an XML parser, but the
+breaking change is in an upload handler that only reaches that parser eight months and
+several hops later, in a file nowhere near it. No claim is watching that file, so
+nothing fires.
+
+The research adds a cost the "always show everything" approach pays. Injecting more is
+not free. Machine-written always-on instruction files actually made tasks succeed about
+3% less often and cost 20% more. A big rules file isn't skimmed and acted on — it dilutes
+the model's attention and buries the one fact that mattered. And simply publishing a file
+that agents could read does nothing; something has to actively put it in front of them.
+
+**The current plan.** Use harness hooks to run the tool, fall back to the hub's tool
+interface, and use the "supports" links as the map from files to facts. Concretely:
+
+- **Harness hooks** that run the tool automatically. One runs at the start of a session
+  and shows a short digest. Another runs right before an edit, matches the file being
+  touched against each claim's links and read-set, and injects only the matching facts.
+  This guarantees the fact is present, without relying on the model to fetch it.
+- **The command-line tool as the one way to fetch claims.** Everything calls the same
+  tool (`claim list --json`, `claim check --json`). It's greppable, works in every
+  harness, and is exactly what the hooks run under the hood.
+- **A short pointer in `CLAUDE.md` / `AGENTS.md`** that tells the agent the tool exists —
+  without dumping all the claims into that file.
+- **The hub's tool interface last**, as a thin adapter for places that can't run a shell.
+
+The shared principle: the fact is shown to the agent as dated evidence to weigh, never as
+an order it must obey, and nothing is blocked. The honest catch: hooks are per-harness
+glue `claim` has to build and maintain, showing a fact doesn't force obedience, and it all
+assumes the read-set names the file being edited.
+
+**Other options** (not being built). They fall into three groups.
+
+*Group A — make breaking a claim actually fail the change (obedience for free).*
+
+- **Turn the relevant checks into part of the build, so a broken fact turns the change
+  red.** Compile the governing claims' checks into the change's own build or CI. If a
+  load-bearing claim has drifted, the change fails to build, with the fact and its owner
+  printed in the failure. Example: you edit the config that pins library X; the check
+  fails the build and says "library X pin is no longer valid — owner: Dana." Now obedience
+  is beside the point — the agent can't merge a red build, and it covers exactly the
+  files the check reads. Downside: this is the end state where a claim becomes a real
+  test, and making blocking the default brings back the failure where authors just delete
+  the assertion to make the red go away. It clashes with the principle of nagging rather
+  than blocking. It belongs as a deliberate opt-in per claim, off by default.
+
+- **Refuse the edit until the person has seen the fact.** A pre-edit hook that doesn't
+  just show the fact but refuses the edit when the file is governed by a claim the person
+  hasn't acknowledged, giving the fact as the reason for refusal. Example: you try to edit
+  the parser; the hook blocks the edit and says "you must acknowledge: this parser must
+  stay in sync with the schema." This turns "here's a fact" into "you may not proceed until
+  you've seen this," and it only fires for load-bearing claims, so the friction lands on
+  the files that matter. Downside: it's a hard block on the person making the change (clashes
+  with the nag-not-block principle), it's specific to one harness, and if the agent can just
+  auto-click "acknowledged," it's theater.
+
+- **A gatekeeper that checks every change against the claims and admits or rejects it.** A
+  layer that sits between the change and merging. It evaluates the change against a policy
+  built from the claims — "no change may break a load-bearing claim without the owner
+  acknowledging it" — and admits or rejects, like an access-control decision. Example: the
+  gatekeeper sees a diff that would drift a load-bearing claim, finds no owner acknowledgment,
+  and rejects it. Because it looks at every change, coverage is guaranteed rather than hoped
+  for — especially combined with the "watch everything that reaches these files" option below.
+  Downside: a full policy layer is a huge amount of surface and a brand-new required workflow,
+  which is exactly the kind of thing that kills adoption. It also re-centralizes decisions the
+  plan deliberately keeps with individual owners.
+
+- **Treat editing a governed file as a permission the agent doesn't have by default.** The
+  agent isn't allowed to edit a governed file until the governing claims have been shown to
+  it (and, for high-stakes claims, acknowledged); then it gets the permission for that session.
+  Example: the agent can't touch the auth module until it's been shown the claim "sessions must
+  expire in 24h," after which it's granted edit access. The model can't skip the fact, because
+  skipping it means never getting permission to edit, and permission is granted only for the
+  load-bearing regions, so trivial files carry no friction. Downside: it fights the harness's own
+  permission system, it's per-harness, and in practice only one harness's "deny" feature comes
+  close — it's really the "refuse the edit" option above with more machinery.
+
+*Group B — close the coverage gap, so the fact reaches the agent even when it's editing an
+unwatched file.*
+
+- **Watch everything that can reach the check's files, not just the files themselves.** Widen
+  each claim's watch set from "the files the check reads" to "everything that can reach those
+  files" — callers, importers, things that depend on them, several hops out. Then a change three
+  hops away still surfaces the fact. Example: the claim guards the XML parser; this widens its
+  watch set to include the distant upload handler that eventually reaches the parser, so editing
+  the handler surfaces the parser's claim. This is the one option that would have caught the
+  eight-months-later upload-handler case. Downside: building a correct "what reaches what" map is
+  per-language, expensive, and never fully reliable when code uses dynamic dispatch, reflection, or
+  foreign calls. A map that silently misses the one crucial caller is worse than honestly watching
+  the whole tree. Ship it as a speed-up over "just check everything," not as the floor.
+
+- **Learn which files, when changed, tend to break which claims — from history.** Watch the
+  history: which files, when edited, have in the past tended to coincide with a claim drifting.
+  Then surface that claim on future edits to those files, even when nothing structurally connects
+  them. Example: history shows that edits to a certain fixtures file have repeatedly preceded a
+  claim about parsing going red, so future edits to that fixtures file surface that claim. This
+  catches connections no structural analysis sees — config, fixtures, indirect couplings. Downside:
+  it needs a long history that doesn't exist until the tool has run a while (nothing to learn from
+  on day one), it's probabilistic, and false connections are exactly the kind of noise that makes
+  people mute the channel. It also adds a guessing component to a product that's otherwise
+  deterministic.
+
+- **Match the change to claims by meaning, not by file path.** Take the changed lines, measure
+  their meaning, and pull up the claims whose statements are closest in meaning — so a fact reaches
+  the agent when the change is conceptually about the same thing, regardless of which file it's in.
+  Example: a change reworks how dates are parsed; even in a file no claim names, this pulls up the
+  claim "all timestamps are stored in UTC" because it's about the same topic. Downside: it hits the
+  same opposite-fact trap and the same precision problems as duplicate-finding — opposites look
+  similar, and matching by meaning floods the agent with near-misses. Flooding is exactly the
+  attention-dilution that buries the one crucial fact. Useful only as a candidate generator behind a
+  filter, never as the delivery path.
+
+*Group C — make the fact impossible to skip, not just present.*
+
+- **Make the agent read the facts back before a governed change.** Before a governed change, the
+  agent must produce — not just receive — the governing facts and say how its change relates to each.
+  It can't proceed without answering. Example: before editing the payments module, the agent must
+  write out "the claims here are: refunds must be idempotent, and amounts are in cents; my change
+  affects neither" before it's allowed to continue. Making the agent say the fact back is a much
+  stronger sign it actually processed it than silently injecting it, and the checklist only lists the
+  facts governing the touched area, so it's just the crucial ones. Downside: judging whether the
+  agent really engaged (versus rubber-stamping "does not affect") needs another unreliable model step,
+  and it adds delay to every governed edit. An unjudged checklist rots into theater.
+
+- **Show nothing at the start and the full fact only at the exact moment of the action.** Disclose
+  nothing at session start. Deliver the full governing fact at the instant of the governed action, so
+  it arrives with nothing else competing and maximum relevance, late in the context where the model
+  pays the most attention. Example: no claims at session start; the moment the agent edits the rate
+  limiter, it gets exactly one fact — "this limit is shared with the vendor's; don't raise it past
+  1000/s." Downside: this is basically the pre-edit hook the plan already has, done with discipline, so
+  it's barely distinct — and dropping the session-start digest loses a useful surface. Better to fold
+  its "one minimal fact at the edit" discipline into the planned hook than to build it separately.
+
+- **Gate edits to a region behind a per-region switch, and tighten it only as the claims earn trust.**
+  For each region of code, a switch: off, warn, or block. Move a region from warn to block only once
+  its claims have proven trustworthy (they discriminate well, they rarely false-alarm). Enforcement
+  grows with confidence, and you never need to cover the whole codebase at once. Example: the auth
+  module's claims have a clean track record, so its switch goes to "block"; a noisy new module stays at
+  "warn" until its claims settle. Enforcement lands only where a region has earned it, dodging the
+  false-alarm fatigue that indiscriminate blocking causes, and the tightening aims at the load-bearing
+  regions first. Downside: it presumes both a blocking mechanism (Group A) and a track record (a mature
+  history of results), neither of which exists early on — it's the governance layer on top of the
+  blocking options.
+
+*Sorting it out.* Watching everything that reaches the files attacks the coverage gap that the other two
+traps sit downstream of — you can only deliver a fact for a file the map names. Turning a violated claim
+into a build error is the strongest answer to "present isn't obeyed," but it's really a promote-this-to-a-
+gate move, not a way to consult a claim, and the plan already contemplates it. Making the agent read the
+facts back is the best near-term, low-infrastructure lever on obedience, buildable as a small skill or hook
+over the tool the plan already ships. None of these store a result or a status.
+
+---
+
+## Problem 3 — Knowing when to record a claim, and covering the important files without minting junk
+
+**The problem.** A decision worth recording has to become a claim at almost zero effort, or the list of
+claims never grows big enough to be worth anything. Knowledge tools that rely on people to write things down
+by hand — architecture decision records, wikis, internal knowledge bases — all rot. The goal is to cover the
+important files — the load-bearing decisions an agent will act on — without minting junk.
+
+**Why this is hard.** Three traps.
+
+First, most corrections aren't checkable. Most of the time when someone corrects the machine ("don't use
+barrel imports here"), there's no way to write a command that could ever prove it true or false. Force a
+check onto it and you've minted a check that passes forever and means nothing.
+
+Second, some facts can't be re-staged to test. For incident facts and outside-world facts, the honest check
+would cost a whole project to build. So people write a cheap check that tests a stand-in for the real fact,
+and the stand-in drifts away from the fact it's supposed to represent.
+
+Third, chasing a coverage number brings back the junk problem. If you hit a coverage target by minting
+checks that are green forever, you've re-created the pollution from problem 1 (recall the AI-memory product
+that found almost all its stored memory was junk).
+
+The research adds the economics. Architecture decision records fail at both ends: they're a pain to write
+at decision time, and nothing ever notices when they go stale. The root cause is structural — the person who
+pays to document the reasoning isn't the person who benefits later, so it doesn't get done. Every recent
+system converged on the same answer: the agent proposes, a human confirms. The tolerable effort for
+authoring is about zero; people will review a good draft, but only inside a workflow they were already in,
+like a pull request. And propose-and-confirm only works when the proposals are rare, high-quality, and
+already machine-checked — otherwise it becomes alert fatigue people learn to ignore.
+
+**The current plan.** A ratchet on exception-diffs, plus triggers on corrections and incidents. Concretely:
+
+- **The exception-diff ratchet.** When a diff adds a new dependency pin, a suppression, a skip, or a
+  waiver, require a claim in the same pull request. This is mechanical and never wrong about *whether* a
+  decision happened, and it lands in the workflow the author is already in.
+- **Correction moments.** When a human corrects the machine — the highest-signal moment — the agent drafts a
+  statement and a check and runs `claim add`. This only proceeds if a real discriminating check can be
+  derived; if not, it's routed to a plain rules file instead.
+- **Incidents and reverts.** Capture a claim right after the cost of not-knowing was just paid, when a
+  broken state actually exists to write the check against.
+
+All three fire when a decision happens. The honest catch: the check the author actually writes tends to
+verify the artifact ("the manifest still says 4.2"), not the reason ("the upstream bug is still unfixed"),
+and it stays green after the reason is gone. That's the tautology problem (problem 4), which the birth gate
+doesn't prevent.
+
+**Other options** (not being built). These sit on a different axis from the planned triggers. Group A makes
+the *absence* of a claim fail. Group B figures out *which* files are important, independent of any triggering
+event. Group C attacks the always-green-check problem at its source. Group D makes capture a byproduct of
+work that was happening anyway.
 
 *Group A — make the absence of a claim fail.*
 
-- **A1. Crucial-file coverage gate ("claimfmt for decisions").** A repo-local lint that
-  fails CI when a file on a maintained crucial set has no claim covering it, the way
-  `# typed: false` blocks untyped new modules. Domain: gradual typing's grow-only ratchet;
-  Google Test Certified "no untested new code." Handles the catch: it never demands a
-  *check*, only that a crucial file be *accounted for* — including an explicit `none`-check
-  claim (dated, attributed, still degrading to a scheduled human look) or a waiver, so no
-  tautology is forced; it rewards accounting, not volume, so junk is bounded. Tradeoff:
-  needs the crucial-set definition (Group B) first, and a `none`-claim escape hatch risks
-  becoming a rubber-stamp — wants pilot data on whether `none` claims convert to real
-  checks. Differs from baseline: the plan fires on a *decision artifact appearing*; this
-  fires on a *crucial file lacking coverage*, closing the unwatched-file gap from the
-  coverage side.
+- **Fail CI when an important file has no claim covering it.** A repo-local lint that fails CI when a file on
+  a maintained list of important files has no claim covering it — the way some type systems refuse new code
+  that isn't typed. Example: a file is on the "important" list but no claim references it, so CI fails until
+  someone adds one (or explicitly waives it). It never demands a *check* — it only demands the file be
+  accounted for, including an explicit "no check here" claim (still dated, attributed, and still degrading to
+  a scheduled human look) or a waiver. So no tautology is forced, and it rewards accounting rather than
+  volume, which keeps junk bounded. Downside: it needs the list of important files (Group B) first, and the
+  "no check here" escape hatch risks becoming a rubber stamp — it wants pilot data on whether those convert
+  into real checks. Different from the plan: the plan fires when a decision *appears*; this fires when an
+  important file *lacks* coverage.
 
-- **A2. Orphaned-reason detector.** Walk `supports` edges the other way: find decision
-  artifacts pointed at by nothing (a Trivy suppression's `reason:`, an eslint-disable
-  description, a `# noqa` with text) and demand the reason be captured. Domain: double-entry
-  accounting (every entry needs a counter-entry). Handles the catch: fires only where an
-  artifact already carries half a decision, so the reason prose is already written
-  (near-zero authoring), and the set is finite and pre-existing (no flooding); suppressions
-  are load-bearing by construction. Tradeoff: format-specific parsers are maintenance
-  surface (the fragmentation problem cuts both ways); it is the ratchet's read-only cousin
-  and the ratchet ships first because it catches new ones at the cheapest moment. Differs
-  from baseline: the plan gates *new* suppressions at PR time; this harvests the *existing*
-  backlog — a one-time coverage jump the forward ratchet never reaches.
+- **Find reasons written down with nothing pointing at them, and demand they be captured.** Walk the
+  "supports" links backwards: find decision artifacts that nothing points at — a security-scan suppression
+  with a `reason:`, an eslint-disable with a description, a `# noqa` with text — and demand the reason be
+  captured as a claim. Example: a Trivy suppression says "ignoring CVE-1234, not reachable in our usage" and
+  no claim references it, so the tool demands one. It only fires where an artifact already carries half a
+  decision, so the reason prose is already written (near-zero effort), the set is finite and already exists
+  (no flooding), and suppressions are load-bearing by nature. Downside: parsers for each of these formats are
+  maintenance work, and it's the read-only cousin of the exception-diff ratchet — the ratchet ships first
+  because it catches new ones at the cheapest moment. Different from the plan: the plan gates *new*
+  suppressions; this harvests the *existing backlog*.
 
-- **A3. Load-bearing-comment escalation.** Detect comments asserting a falsifiable,
-  externally-breakable fact ("must stay in sync with", "assumes X is never null here") and
-  nag that the fact is unclaimed — the comment is a claim that forgot to bind a check.
-  Domain: auto-instrumentation (the signal is already emitted, just unwired). Handles the
-  catch: classify comments and escalate only the falsifiable ones (pure preferences
-  ignored), so no tautology is minted; the comment text seeds the statement. Tradeoff:
-  classification precision is unproven and false positives here are pure noise against the
-  ~10% fatigue ceiling; wants the crucial-set scoring first so it scans only crucial files.
-  Differs from baseline: the plan triggers on a *change*; this mines stationary prose
-  already in the repo for latent claims.
+- **Find comments that assert a breakable fact and nag that they aren't claims.** Detect comments that
+  assert a fact that could break from the outside — "must stay in sync with the schema," "assumes X is never
+  null here" — and nag that the fact isn't a claim. The comment is a claim that forgot to attach a check.
+  Example: a comment says "// keep this list in sync with config.yaml" and the tool flags it as an unclaimed
+  fact worth binding a check to. Only the breakable comments get escalated; pure preferences ("prefer short
+  functions") are ignored, so no tautology is minted, and the comment text seeds the statement. Downside:
+  telling breakable facts from preferences reliably is unproven, and false positives here are pure noise — it
+  wants the important-file scoring first so it only scans the important files. Different from the plan: the
+  plan triggers on a *change*; this mines prose already sitting in the repo.
 
-*Group B — identify which files are crucial, then drive coverage of those.* (None of these
-mint claims; they produce a ranked crucial set that Group A gates against and the triggers
-prioritize.)
+*Group B — figure out which files are important, then drive coverage of those.* (None of these mint claims.
+They produce a ranked list of important files that Group A gates against and the triggers prioritize.)
 
-- **B1. Blast-radius / criticality scoring from the dependency graph.** Rank files by how
-  much rests on them — reverse-dependency fan-in, importer count, import-graph centrality —
-  and declare the top stratum crucial. Domain: risk-based testing / criticality analysis;
-  the hub's own "most-depended-on claims" list applied to code. Handles the catch: scoring
-  mints nothing, so it can't produce a tautology — it only aims the other mechanisms; effort
-  concentrates on the ~5% of files most changes route through, so a small corpus covers a
-  large fraction of what agents act on. Tradeoff: cross-language import analysis is
-  language-specific work; the single-team wedge (CLAUDE.md/AGENTS.md) has a smaller,
-  hand-obvious crucial set, so scoring earns its keep only over real source trees. Differs
-  from baseline: the plan has *no file-targeting* — it fires wherever an artifact appears;
-  this decides *where coverage should exist* before any artifact appears. (Same engine as
-  Risk 2's B1.)
+- **Rank files by how much depends on them.** Rank files by how much rests on them — how many things import
+  them, how central they are in the dependency graph — and call the top slice important. Example: a core
+  auth module that three hundred files import ranks at the top; a one-off script ranks at the bottom. Ranking
+  mints nothing, so it can't create a tautology — it only aims the other mechanisms. Effort concentrates on
+  the roughly 5% of files most changes route through, so a small set of claims covers a large share of what
+  agents act on. Downside: analyzing imports across languages is language-specific work, and a single team's
+  small codebase has a short, obvious list of important files anyway — this earns its keep only over real,
+  large source trees. Different from the plan: the plan has no file targeting; this decides where coverage
+  *should* exist before any artifact appears.
 
-- **B2. Change-frequency × impact (churn-hotspot).** Rank by `commit_frequency ×
-  blast_radius` — files that change often *and* are depended on heavily are where a fact is
-  most likely to silently rot. Domain: risk-based prioritization (probability × impact);
-  Tornhill hotspots. Handles the catch: a ranking, mints nothing; targets the rot-likely
-  files, where a checked fact pays off most. Tradeoff: needs real history to be meaningful,
-  and adds a second signal to tune before B1's single signal is validated. Differs from
-  baseline: orthogonal — the plan is event-driven and history-blind; this is history-driven
-  and event-blind.
+- **Rank files by how often they change AND how much depends on them.** Rank by change frequency times how
+  much depends on the file — files that change a lot *and* are depended on heavily are where a fact is most
+  likely to quietly rot. Example: a config module that's edited every week and imported everywhere ranks
+  highest, because that's where a stale fact will bite. It's just a ranking, mints nothing, and targets the
+  rot-prone files where a checked fact pays off most. Downside: it needs real history to mean anything, and
+  it adds a second signal to tune before the simpler "how much depends on it" ranking is even validated.
+  Different from the plan: the plan is event-driven and ignores history; this is history-driven and ignores
+  events.
 
-- **B3. Bus-factor / knowledge-concentration targeting.** Rank by how few people understand
-  a file (single dominant author, low contributor count, long untouched by anyone active) —
-  the facts most likely to be *lost* rather than *broken*. Domain: bus-factor / knowledge-risk
-  analysis; the Grudin insight. Handles the catch: ranking only; surfaces the tacit facts in
-  one person's head that no diff will ever trigger, the category the event-driven plan can
-  never reach; low volume by nature, so it can't flood. Tradeoff: the capture step is a human
-  interview — high-friction and Grudin-violating (the expert pays) — so it needs the
-  agent-drafts-from-interview loop first, so the expert only reviews. Differs from baseline:
-  the plan captures *observed* decisions; this captures *unobserved tacit* ones from
-  people-signals git already records.
+- **Rank files by how few people understand them.** Rank by how few people understand a file — one dominant
+  author, few contributors, untouched for a long time by anyone still active. These hold the facts most
+  likely to be *lost* (the one person leaves) rather than *broken*. Example: a payments file only one
+  engineer has ever meaningfully touched, and they're about to change teams — capture what they know before
+  it's gone. It surfaces the tacit facts in one person's head that no diff will ever trigger, a category the
+  event-driven plan can never reach, and it's naturally low-volume so it can't flood. Downside: capturing
+  here means interviewing a human — high effort, and it's the expert who pays — so it needs the
+  agent-drafts-from-the-interview loop first, so the expert only has to review. Different from the plan: the
+  plan captures *observed* decisions; this captures *unobserved* knowledge from who-touched-what, which git
+  already records.
 
-*Group C — attack the tautology at the source (make the check discriminate).* (These compose
-with the plan's triggers rather than replacing them; the deeper catalog is Risk 4.)
+*Group C — attack the always-green-check problem at its source (make the check actually discriminate).*
+(These add to the plan's triggers rather than replacing them; the deeper list is problem 4.)
 
-- **C1. Mutation-gated birth.** At `claim add`, don't just require the check passes now;
-  require it *fails* against a machine-generated mutation of the world that should break the
-  fact. Domain: mutation testing + property-based testing. Handles the catch: the direct
-  answer to the tautology catch — it turns `--witness-cmd` from optional into a *generated*
-  signal (for `grep -q 'libfoo==4.2'`, mutate the manifest line in a scratch copy and confirm
-  the check flips to drifted); a tautology survives the mutation and is refused; preferences
-  that produce no discriminating check route to `none`/rules. Tradeoff: generating a
-  *meaningful* mutation is easy for line-in-a-file greps and hard in general, and can't run
-  against world/agent checks — a `cmd`-check tool, not universal, shipped opt-in first.
-  Differs from baseline: the birth gate proves a check *can pass*; this proves it *can fail* —
-  the missing half of the honesty invariant.
+- **At birth, require the check to fail against a broken version of the world.** When you run `claim add`,
+  don't just require the check passes now. Also require it *fails* against a machine-generated broken version
+  of the world that should break the fact. Example: for a check that greps for `libfoo==4.2` in the manifest,
+  the tool copies the repo, changes that line to `libfoo==4.3`, and confirms the check now reports drifted.
+  A green-forever check survives the break and gets refused; a preference with no discriminating check gets
+  routed to a rules file. Downside: generating a *meaningful* break is easy for "a line in a file" greps and
+  hard in general, and it can't run against outside-world or agent checks — a tool for command-checks, opt-in
+  first. Different from the plan: the birth gate proves a check *can pass*; this proves it *can fail* — the
+  missing half.
 
-- **C2. Check-template library keyed by decision kind.** Ship discriminating check templates
-  indexed by decision kind (CVE-not-applicable → reachability grep with `negate`; version-pin
-  → manifest assertion + upstream-issue-open probe; flaky-skip → `skip.unless` + `until`;
-  import-ban → reference-count grep with `negate`); the trigger fills in the blanks. Domain:
-  contract-first "the test is the spec"; Sentry's error→regression-test auto-draft. Handles
-  the catch: templates are pre-vetted for discriminating power once, so an author can't
-  accidentally write the tautological version; decision kinds with no discriminating template
-  (pure preference) route to rules/`none` instead of minting. Tradeoff: the template set must
-  be earned per decision kind from real examples — shipping speculative templates re-introduces
-  the guessing problem one layer up. Differs from baseline: the plan says *when* to capture;
-  this says *what check to write* once capturing.
+- **Ship a library of proven check templates, one per kind of decision.** Ship discriminating check templates
+  indexed by decision kind — CVE-not-applicable, version-pin, flaky-test-skip, banned-import — and the
+  trigger fills in the blanks. Example: for "we pin library X," the template is "assert the manifest line AND
+  probe that the upstream issue is still open," so the author can't accidentally write the green-forever
+  version. Decision kinds with no good template (pure preference) route to a rules file instead of minting a
+  junk check. Downside: the template set has to be earned from real examples per decision kind — shipping
+  guessed templates just moves the guessing problem up a level. Different from the plan: the plan says *when*
+  to capture; this says *what check to write* once you're capturing.
 
-- **C3. Discriminating-power ledger.** The hub flags a check that has *never* reported drifted
-  across its whole life despite the world changing around it — a tautology suspect, the way a
-  test with a 100% pass rate across churn is suspected of asserting nothing. Domain:
-  always-green-test smell + observability's "this alert never fired, is it wired up?". Handles
-  the catch: catches the tautologies the birth gate and templates missed, using signal only the
-  hub has (long-run verdict history vs registry churn on the read-set); never auto-deletes —
-  routes to a human with evidence. Tradeoff: a hub feature needing the ledger, registry, and
-  read-set tracing (deferred) plus a long history to be meaningful. Differs from baseline: the
-  plan is capture-side and one-shot; this is continuous corpus-health, catching tautologies that
-  slip past every birth-time gate. (Same idea as Risk 4's A10.)
+- **Have the hub flag checks that have never once gone red despite churn around them.** The hub flags a check
+  that has *never* reported drifted across its whole life, even though the files it reads keep changing around
+  it — a likely tautology, the way a test that passes 100% of the time across constant change is suspected of
+  testing nothing. Example: a check on a file that's been edited fifty times has never gone red once; the hub
+  flags it for a human to look at. It catches the tautologies the birth gate and templates missed, using
+  history only the hub has. It never auto-deletes — it routes to a human with the evidence. Downside: it needs
+  the hub, the history of results, and file-read tracking (not built yet), plus a long history to mean
+  anything. Different from the plan: the plan checks quality once, at capture; this is continuous, catching
+  tautologies that slip past every birth-time gate.
 
 *Group D — make capture a byproduct of work already happening.*
 
-- **D1. Session-diff distillation.** At the end of an agent session that touched crucial files,
-  the agent distills "what did I have to learn/assume to make this change correctly?" into
-  candidate claims — from its own session, since it just paid the discovery cost. Domain: data
-  provenance/lineage + Copilot Memory's "store a corrected version when reality contradicts."
-  Handles the catch: the agent proposes, a human confirms at PR time (scarce, pre-validated —
-  the only propose/confirm shape that survives); the agent runs the birth gate before proposing,
-  so preference-only learnings drop. Tradeoff: depends on the harness-hook integration and the
-  crucial-set scoping, and agent-drafted claims are trusted less by design — the confirm UX must
-  be excellent before it scales. Differs from baseline: the plan triggers on a specific artifact
-  class or a correction; this triggers on any crucial-file work session, capturing discovery that
-  never surfaced as a suppression or a correction.
+- **At the end of a session, have the agent distill what it had to learn into candidate claims.** When an
+  agent finishes a session that touched important files, have it distill "what did I have to learn or assume
+  to get this right?" into candidate claims — from its own session, since it just paid the cost of figuring
+  it out. Example: an agent that just fixed a timezone bug proposes "all stored timestamps are UTC; the API
+  layer converts on the way out." A human confirms at pull-request time (rare and pre-validated — the only
+  propose-and-confirm shape that survives), and the agent runs the birth gate before proposing, so
+  preference-only learnings drop out. Downside: it depends on the harness-hook integration and the
+  important-file scoping, and agent-drafted claims are trusted less by design — the confirm experience has to
+  be excellent before it scales. Different from the plan: the plan triggers on a specific artifact or a
+  correction; this triggers on any important-file work session, catching discoveries that never showed up as
+  a suppression or a correction.
 
-- **D2. Coverage as a first-class dashboard metric with an owner.** Make crucial-set coverage %
-  a visible, owned number on the hub dashboard, the way test-coverage or vuln-burn-down is, so a
-  team can run a bounded "cover our top-50 crucial files" campaign instead of hoping ambient
-  triggers add up. Domain: Vanta/Drata control-coverage burn-down; test-coverage ratchets. Handles
-  the catch: the *denominator is the crucial set* (Group B), not "all files," so 100% is small,
-  reachable, honest, and un-inflatable by minting on trivial files; each covering claim must pass
-  the birth gate to count. Tradeoff: a hub UI feature presuming the crucial-set scoring and a real
-  corpus, and making coverage a *target* risks Goodhart's law unless the quality gates (C1/C3) are
-  already strong. Differs from baseline: the plan is bottom-up and ambient; this is top-down and
-  bounded — the funded-project shape Swimm's pivot showed is where doc-coupling actually gets done.
+- **Make coverage a visible, owned number on a dashboard.** Make "percent of important files covered" a
+  visible, owned number on the hub dashboard, the way test coverage or vulnerability burn-down is, so a team
+  can run a bounded campaign — "cover our top 50 important files" — instead of hoping the ambient triggers
+  add up. Example: the dashboard shows "38 of your top 50 important files are covered," and a team drives it
+  to 50 as a project. The denominator is the *important set* (Group B), not "all files," so 100% is small,
+  reachable, honest, and can't be inflated by minting junk on trivial files. Each covering claim must pass
+  the birth gate to count. Downside: it's a hub UI feature that presumes the important-file scoring and a
+  real codebase, and making coverage a *target* invites gaming unless the quality gates above are already
+  strong. Different from the plan: the plan is bottom-up and ambient; this is top-down and bounded — the
+  funded-project shape where doc-coupling actually gets done.
 
-*Convergence note.* The research names the tautology (Group C / Risk 4), not too-few-claims, as
-the biggest threat: scaling coverage the naive way *is* the pollution problem. The strongest moves
-make coverage *safe to grow* (C1/C2), *aimed at the files that matter* (B1/A1), and *self-cleaning
-over time* (C3). All are distinct from the planned triggers on the same axis: the plan decides
-*when a decision is captured*; these decide *whether the check is worth anything*, *which files
-must be covered at all*, and *how the corpus stays honest as it grows*.
-
----
-
-## Risk 4 — Check discrimination (the tautology problem)
-
-**The risk.** The checks people write are tautological. They verify the artifact ("the
-manifest still says 4.2"), not the reason ("the upstream CJK bug is still unfixed"), and stay
-green forever after the reason is moot. `claim add`'s birth gate proves a check *can pass*; it
-does not prove the check *can fail when the fact becomes false*. The property `claim` needs is
-**discrimination**: the check goes red precisely when, and only when, the fact stops being true.
-The research flags this as the single biggest existential risk — solve it and `claim` is a
-painkiller; fail it and it is a better-engineered ADR, which history says rots.
-
-**Why it's hard (the honest catch).** The baseline signal, `--witness-cmd`, is an optional,
-author-supplied, single, at-authoring-time perturbation with four structural limits any approach
-must beat:
-
-1. **The author writes the counterfactual.** The same person who wrote a tautological check
-   writes the perturbation that "proves" it discriminates, and will write the one perturbation
-   their check happens to catch (`sed -i s/4.2/4.3/`), not the one that corresponds to the fact
-   actually becoming false (upstream shipping a fix). Witness proves *a* red exists, not that the
-   red *tracks the fact*.
-2. **One perturbation, one direction.** It tests a single point; it says nothing about the space
-   of ways the fact could go false, nor about false positives (does it stay green when the fact is
-   still true but the world moved?).
-3. **At authoring time only.** A check that discriminated at birth can decay into a tautology as
-   the code around it changes (the file it grepped is renamed; the assertion now matches nothing
-   and passes vacuously).
-4. **Advisory and unrecorded.** No downstream consumer knows whether a claim was witnessed, so the
-   corpus can't be filtered or weighted by discriminating power.
-
-The honest floor is a taxonomy every approach must respect. A recorded reason is one of:
-**CHECKABLE** (a discriminating check exists — the only bucket the core mechanism is for);
-**EXPIRABLE** (no discriminating check, but a natural clock — `skip.until`, which `claim` already
-has); or **PROSE** (a preference with no falsifiable observation — not a claim; belongs in a rules
-file). Discrimination machinery must be able to say "this reason cannot be made discriminating" and
-refuse to pretend — a tool that forces every reason into CHECKABLE manufactures the very
-tautologies it means to prevent.
-
-**The current/baseline approach.** `--witness-cmd`: an optional confidence signal. `claim add`
-creates a throwaway detached worktree at HEAD outside the repo, runs the author's `<cmd>` to mutate
-that isolated tree, runs the check there, and requires it reports `Drifted`. It is observed once,
-never recorded (a verdict is telemetry), and never a gate — a fact whose red can't be staged is
-verified by its passing check alone. Its promotion to mandatory would fix only limit #4 and weakly
-#1. Every approach below attacks at least one of #1–#3 in a way promotion cannot. All preserve the
-invariants: a Broken check under a perturbation is Broken, never a pass (#1); the tool owns
-negation, never `sh -c "! ..."` (#2); discrimination results are telemetry, reported via `--json`,
-never committed (#4).
-
-**Other possible approaches** (not currently pursued):
-
-- **A1. Mutation testing of the check.** Auto-generate a batch of world-perturbations and require
-  the check to catch a required fraction, reporting a survival set ("these 3 mutations left the
-  check green"). Domain: mutation testing (PIT, Stryker, `cargo-mutants`). Discrimination = mutation
-  score; a score of 0 is provably a tautology. Because the *tool* generates the mutants (from the
-  check's own read-set), it defeats author collusion (#1) and single-point coverage (#2). Slot:
-  CHECKABLE only; a near-zero score signals the reason is really EXPIRABLE or PROSE. Tradeoff:
-  generating *fact-relevant* mutants (not just any diff that makes a grep miss) needs to understand
-  what the fact means; a generic byte-mutator produces dismissible mutants and re-creates fatigue.
-  Differs from witness: a tool-generated batch the author can't cherry-pick, yielding a score, not a
-  single pass. (Same core as Risk 3's C1 and Risk 1's E.)
-
-- **A2. Metamorphic discrimination.** Instead of proving one red exists, assert a *relation*: if the
-  world changes toward "fact false," the verdict must move Held→Drifted; if it changes toward "more
-  clearly true," it must stay Held. Domain: metamorphic testing (compilers, ML — no single-output
-  oracle). A tautology has a constant response; a discriminating check has a monotone one. Slot:
-  CHECKABLE — the invariance arm ("stays Held when still true") is what nothing in `claim` currently
-  tests, catching the false-positive tautology (a check that reds on any change, Fiberplane's failure
-  mode). Tradeoff: requires authors to articulate a relation — more than "paste the command"; the
-  natural v2 of witness. Differs from witness: tests both directions and the invariance arm, not one
-  direction once.
-
-- **A3. Property-based / fuzzed world states.** Generate many world-states, label each with the
-  fact's ground truth from an independent oracle, and require the check's verdict to agree — a check
-  is discriminating iff no state disagrees. Domain: property-based testing (QuickCheck, `proptest`),
-  fuzzing with shrinking. Discrimination = agreement rate with an independent oracle; shrinking yields
-  the minimal world-change the check fails to notice. Slot: CHECKABLE with a cheap independent oracle
-  (strongest for structural facts like "no import of X" — generate trees with/without the import,
-  label by construction). Tradeoff: needs a per-fact-shape generator and oracle — real per-kind
-  machinery, worth it only for a few common structural shapes. Differs from witness: machine-generated
-  worlds with *independent* ground-truth labels, measuring a rate, not one author-authored pass.
-
-- **A4. Fault injection at check-run time.** Deliberately break the check's environment (rename its
-  target file, drop its binary, empty its input) and require the verdict is *not Held*. Domain: chaos
-  engineering / fault injection (Chaos Monkey, Jepsen). Targets a specific, common tautology: a check
-  that passes because it *matched nothing* (a grep with a typo, a `test -f` on a moved path). It is
-  invariant #1 (broken-never-passes) promoted from a runtime guarantee into an authoring-time audit of
-  the check itself. Slot: CHECKABLE, and the cheapest, most general, lowest-false-positive probe — it
-  needs no fact-specific oracle, only the check's own read-set. Tradeoff: depends on read-set tracing
-  (deferred) to know what to perturb. Differs from witness: perturbs toward "the check's inputs are
-  gone," a different axis, catching the vacuous-match tautology the author who wrote a vacuous grep
-  won't think to stage.
-
-- **A5. Continuous re-audit of discriminating power (witness-on-a-clock).** Re-prove discrimination
-  periodically, not just at birth, because a check that discriminated at authoring can rot as the code
-  drifts. Domain: regression testing / test-suite health monitoring (mutation score over time). Attacks
-  limit #3: a `grep -q 'foo' src/mod_a.rs` discriminates until `mod_a.rs` is renamed, after which it
-  matches nothing and passes vacuously; re-running the probe on the hub's cadence catches this decay and
-  routes it as its own drift ("this claim's check stopped being able to fail"). The CLI stays stateless
-  (`claim probe <id>` reports now, stores nothing); the hub schedules and remembers. Tradeoff: requires
-  the hub's scheduler and a probe (A1/A2/A4) to schedule — the composition layer over the others.
-  Differs from witness: a monitored, decaying property on a clock, not a one-shot at birth.
-
-- **A6. Adversarial discrimination.** An independent agent is tasked to find a world-state where the
-  fact is false but the check still reports Held; if it can, the check is not discriminating, and the
-  counterexample is the proof. Domain: red-teaming / adversarial ML (the "second agent instructed to
-  disprove the first"). Handles facts too semantic for mechanical mutation ("the CJK bug is still
-  unfixed") — the adversary reasons about what upstream shipping a fix would look like rather than
-  mutating bytes, and is independent of the author, defeating collusion (#1) even for judgment-shaped
-  facts. Slot: CHECKABLE, the semantic frontier; repeated failure to falsify signals PROSE. Tradeoff:
-  requires trusted, metered agent execution, and an adversary is non-deterministic — it can miss a real
-  hole or hallucinate one, needing the spot-audit apparatus (deferred). Differs from witness: an
-  adversary independent of the author searches for the perturbation, and can reason about semantic facts
-  no `sed` can perturb.
-
-- **A7. Falsifiability gate: refuse the unfalsifiable, route it to expiry/prose.** Before accepting a
-  check as discriminating, require the author to name the *falsifier* — the observable event that would
-  make the fact false — and if none can be named, refuse to file it as a CHECKABLE claim. Domain:
-  Popperian falsifiability. This is the *classifier* the taxonomy needs: a nameable falsifier ("upstream
-  closes the bug") unlocks the witness/mutation path; a date-only falsifier steers to `skip.until`; no
-  falsifier ("I prefer this style") refuses `add` and prints "this is a rule, not a claim." Slot: this
-  *is* the taxonomy, enforced at the front door — the cheapest and most important single intervention,
-  because most tautologies are PROSE/EXPIRABLE reasons forced into a check. Tradeoff: adds authoring
-  friction (the thing that kills adoption above ~5 min), and a clumsy version nags authors into writing
-  fake falsifiers, worse than nothing — needs calibration data first. Differs from witness: asks the
-  prior question ("could a check ever falsify this?") and routes the two-thirds of reasons that can't
-  to `skip`/prose; witness only refuses an unwitnessed red.
-
-- **A8. Formal / bounded-model discrimination.** For facts expressible over a formal artifact (an
-  import graph, a config schema, a type), *prove* the check equivalent to the fact via a bounded model
-  checker rather than sampling perturbations. Domain: bounded model checking / SMT (CBMC, Alloy, TLA+).
-  A proof of equivalence is the strongest possible discrimination guarantee — no surviving mutant exists
-  by construction, within the bound. Slot: CHECKABLE, the formal sub-slice — narrowest, highest-assurance.
-  Tradeoff: enormous machinery for a narrow slice; most `claim` facts (upstream behavior, vendor limits,
-  CJK rendering) have no formal model, and it contradicts the "thin shell over grep" ethos — conceivable
-  only as proven check *templates*, far future. Differs from witness: proves over a bounded space vs
-  sampling one point — a different assurance class entirely.
-
-- **A9. Discrimination via check-template provenance.** Ship a curated library of check templates each
-  proven or empirically shown to discriminate for a fact-shape (`import-absent`, `version-pinned`,
-  `upstream-issue-open`, `file-hash-stable`); a claim built from a template inherits proven discriminating
-  power, a claim built from raw shell is marked lower-trust and routed to the heavier probes. Domain:
-  vetted-primitive design (linters ship proven rules; crypto ships one audited AES). Moves trust from N
-  per-check audits to a handful of template audits, and makes the discriminating check the path of least
-  resistance. Slot: CHECKABLE — it *shrinks* the tautological region by making discrimination the easy
-  default. Tradeoff: requires knowing the common fact-shapes, which only a real corpus reveals; a premature
-  library codifies the wrong primitives, and it doesn't help novel facts. Differs from witness: prevents
-  the tautology up front by instantiating a pre-vetted check, rather than auditing an arbitrary one
-  post-hoc. (Same as Risk 3's C2.)
-
-- **A10. Discrimination as a corpus statistic (measure, don't guarantee).** Don't gate any single claim;
-  let the hub measure how often each check has *ever* changed verdict, and flag checks green for their
-  whole life despite churn on their read-set as suspected tautologies. Domain: observability / SLO
-  monitoring; always-green-test detection. Purely empirical, zero authoring cost: a check *provably* Held
-  on every run across changes to the files it reads is a strong statistical tautology signal without
-  perturbing anything — "revealed discrimination" from history rather than "designed discrimination" from a
-  probe. Slot: distinguishes mis-filed CHECKABLE (tautology) from correctly-filed CHECKABLE that simply
-  never got a chance to fire, by whether the read-set changed. Tradeoff: requires the hub, the verdict
-  stream, and read-set tracing (all deferred) plus a long history — a late-stage backstop, cold-start blind.
-  Differs from witness: an undesigned, over-time, observational inference, no perturbation, zero authoring
-  cost. (Same as Risk 3's C3.)
-
-*Convergence note.* No approach makes an unfalsifiable fact checkable — A1–A10 make a *checkable* fact's
-check provably discriminating, or *detect* that a check isn't. A7's routing (and the courage to say "this
-belongs in a rules file") is the only honest answer for PROSE, and `skip.until` for EXPIRABLE. The mechanical
-probes (A1, A4) are cheapest and most deterministic; the semantic ones (A6) reach facts no `sed` can perturb
-but cost determinism; A5/A10 add the over-time dimension the CLI can't hold.
+*Sorting it out.* The research says the biggest threat is the always-green-check problem (Group C / problem
+4), not having too few claims. Scaling coverage the naive way *is* the pollution problem. The strongest moves
+make coverage safe to grow (require the check to be able to fail; ship proven templates), aim it at the files
+that matter (rank by dependence; gate on coverage), and keep it honest over time (flag the never-red checks).
+All are distinct from the planned triggers: the plan decides *when* a decision is captured; these decide
+*whether the check is worth anything*, *which files must be covered at all*, and *how the list stays honest as
+it grows*.
 
 ---
 
-## The business / category read (framing, not a risk to solve)
+## Problem 4 — Making sure a check actually fails when the fact goes false
 
-This is context for weighing the risks above, drawn from the research. It is not a fifth risk.
+**The problem.** The checks people write tend to be hollow. They verify the artifact ("the manifest still
+says 4.2"), not the reason ("the upstream bug that made us pin it is still unfixed"), and they stay green
+forever after the reason is gone. When you add a claim, the tool proves the check *can pass* right now. It
+does not prove the check *can fail* when the fact becomes false. The property `claim` actually needs is this:
+the check goes red exactly when the fact stops being true, and stays green as long as it's true. The research
+calls this the single biggest threat to the whole product. Get it right and `claim` is a painkiller. Get it
+wrong and it's a fancier version of the architecture decision records that history shows rot.
 
-- **A funded adjacent category exists; `claim`'s exact niche is unclaimed.** "Agent memory /
-  agent-context infrastructure" is unambiguously funded as of mid-2026 — Mem0 ($24M), Cognee, Supermemory,
-  Letta/MemGPT, and the headline Engram ($98M at a $600M valuation, pitched on cutting agent token cost).
-  Coding-agent context infra is where the money is (Cursor/Anysphere ~$4B ARR; Glean $150M at $7.2B). But
-  every funded memory player reconciles *observed statements* (temporal invalidation, conflict resolution,
-  write-time schemas); **none verifies a fact against reality with an executable check.** The nearest funded
-  neighbors (Dosu, Unblocked) sell retrieval/doc-automation and bet retrieval makes explicit capture
-  unnecessary. So `claim` would define a sub-category adjacent to a hot funded one, not enter a crowded field.
-  Honest caveat: the dedicated competitor sweep didn't complete, so a stealth/OSS neighbor can't be fully
-  ruled out; the nearest named one, Fiberplane's `drift`, is a code-changed-near-this-doc detector, not a
-  fact-falsity checker.
+**Why this is hard.** The one signal the plan has for this — an optional "witness" command the author can
+supply to prove their check can go red — has four built-in weaknesses any solution has to beat.
 
-- **The problem has no category name yet.** "Context engineering" names the *practice* of curating a
-  context window; "context rot" means long-context degradation — neither names `claim`'s problem, *recorded
-  knowledge silently going false over time*. That is both an opportunity (define it) and a go-to-market cost
-  (teach the buyer the problem exists). The "CI for facts" / "Dependabot for facts" framing borrows a
-  category the buyer already understands.
+1. The author writes the fake-break themselves. The same person who wrote a hollow check writes the "proof"
+   that it works, and they'll write the one break their check happens to catch (change 4.2 to 4.3 in the
+   file), not the one that matches the fact actually going false (upstream shipping the fix). It proves *a*
+   red exists, not that the red tracks the fact.
 
-- **Protocol vs product.** Context conventions (AGENTS.md ~60k+ repos, MCP, `llms.txt`) are standardizing
-  and are largely un-monetizable by a third party — "publish a file agents can read" captures no value (the
-  `llms.txt` lesson). What is left to sell is the verification loop and the hub's derived intelligence — the
-  schedule, drift routing, cross-repo index. This favors the split the plan already commits to: an open
-  format + CLI (protocol-shaped, free, drives the coverage the value depends on) with a paid hub
-  (product-shaped, captures the over-time, cross-repo intelligence a stateless file can't hold).
+2. One break, one direction. It tests a single point. It says nothing about all the other ways the fact could
+   go false, and nothing about false alarms (does the check stay green when the fact is still true but the
+   code moved around it?).
+
+3. It's only tested once, at authoring time. A check that worked at birth can rot into a hollow one as the
+   code around it changes. Example: the check greps a file that later gets renamed; now it matches nothing and
+   passes vacuously, forever.
+
+4. It's advisory and unrecorded. Nothing downstream knows whether a claim was witnessed, so you can't filter
+   or rank the list by how well the checks discriminate.
+
+There's an honest floor here. Every recorded reason is one of three kinds:
+
+- **Checkable** — a check exists that can tell truth from falsehood. This is the only kind the core mechanism
+  is for.
+- **Expirable** — no discriminating check, but there's a natural clock. Use the existing "skip until this
+  date" feature.
+- **Just prose** — a preference with nothing observable to check. This isn't a claim at all. It belongs in a
+  plain rules file.
+
+Any machinery here has to be able to say "this reason can't be made into a real check" and refuse to pretend
+otherwise. A tool that forces every reason into "checkable" manufactures exactly the hollow checks it's
+supposed to prevent.
+
+**The current plan.** The witness command, as an optional confidence signal. When you add a claim, the tool
+makes a throwaway copy of the repo outside your working tree, runs the author's command to break something in
+that copy, runs the check there, and requires it reports drifted. It's observed once and never recorded (a
+result is telemetry, not something committed), and it's never a hard gate — a fact whose red can't be staged
+is verified by its passing check alone. Making the witness mandatory would fix only weakness 4 and weakly
+weakness 1. Every option below attacks at least one of weaknesses 1 through 3 in a way that just making the
+witness mandatory can't. All of them keep the invariants: a check that breaks under a perturbation counts as
+broken, never as a pass; the tool owns "is this the absence of a thing," never a shell's interpretation of
+`!`; and discrimination results are reported, never committed.
+
+**Other options** (not being built):
+
+- **Break the world many ways automatically and require the check to catch most of them.** Instead of one
+  author-written break, have the tool generate a batch of breaks (from the files the check reads) and require
+  the check to catch a required fraction. Report which ones slipped through. Example: for a check on a version
+  pin, the tool auto-generates twenty variations of the manifest; if the check catches only two, it's mostly
+  hollow, and you see the eighteen it missed. Because the tool generates the breaks, the author can't
+  cherry-pick the one their check catches, and it tests many points instead of one. A score near zero means the
+  reason is really expirable or just prose. Downside: generating breaks that actually correspond to the fact
+  (rather than any random change) requires understanding what the fact means; a dumb byte-flipper produces
+  dismissible breaks and re-creates fatigue. This is the same core idea as "use the check to fail against a
+  break at birth" (problem 3) and "two checks that always agree are duplicates" (problem 1).
+
+- **Test a relationship, not a single point: if the world moves toward false, the verdict must move toward
+  red.** Instead of proving one red exists, assert a relationship. If the world changes toward "fact false,"
+  the verdict must move from held to drifted. If it changes toward "even more clearly true," it must stay held.
+  Example: for "no debug logging in production config," adding more non-debug settings must keep it green, and
+  adding a debug setting must turn it red. A hollow check gives the same answer no matter what; a real check
+  responds in the right direction. This is the only thing that tests the "stays green when still true" side,
+  which catches the check that cries wolf on any change at all. Downside: it asks the author to describe a
+  relationship, which is more than "paste the command" — this is the natural next version of the witness.
+
+- **Generate many worlds, label each with an independent source of truth, and require the check to agree.**
+  Generate many versions of the world, label each one with the fact's real answer from an independent source,
+  and require the check's verdict to match every time. The check discriminates only if it never disagrees.
+  Example: for "no import of the old library," generate lots of code trees, some with the import and some
+  without — you know the answer by how you built each one — and require the check to get every one right;
+  shrinking finds the smallest change the check fails to notice. Downside: it needs a per-fact-shape generator
+  and an independent answer key, which is real machinery, worth building only for a few common structural
+  shapes.
+
+- **Deliberately break the check's own environment and require it not to pass.** Deliberately sabotage the
+  check's surroundings — rename the file it reads, remove the binary it calls, empty its input — and require
+  the verdict is anything but "held." Example: a check that greps a file for a pattern — rename that file; if
+  the check still says "held," it was passing because it matched nothing, which is a hollow check. This targets
+  a specific, common failure: a check that passes because it found nothing (a grep with a typo, a file-exists
+  test on a path that moved). It's the "broken never passes" invariant turned from a runtime guarantee into an
+  audit of the check itself. It's the cheapest, most general, lowest-false-alarm probe — it needs no
+  fact-specific answer key, just the check's own inputs. Downside: it needs file-read tracking (not built yet)
+  to know what to sabotage.
+
+- **Re-prove discrimination on a schedule, not just at birth.** Re-prove that a check can still fail
+  periodically, not just once at birth, because a check that worked at authoring time can rot as the code
+  drifts. Example: a check that greps `mod_a.rs` works until someone renames that file to `mod_b.rs`, after
+  which it matches nothing and passes vacuously; re-running the probe on the hub's schedule catches that decay
+  and routes it as its own kind of drift — "this claim's check can no longer fail." The tool stays stateless
+  (`claim probe <id>` reports now and stores nothing); the hub does the scheduling and remembering. Downside:
+  it needs the hub's scheduler and one of the probes above to schedule — it's the layer that runs the others
+  over time.
+
+- **Have an independent agent hunt for a world where the fact is false but the check still passes.** Task a
+  separate agent with finding a situation where the fact is false but the check still says "held." If it
+  finds one, the check doesn't discriminate, and that situation is the proof. Example: for "the upstream CJK
+  bug is still unfixed," the agent reasons about what an upstream fix would look like and finds that the check
+  would still pass after such a fix — so the check is hollow. It handles facts too meaning-heavy for
+  mechanical breaking, and it's independent of the author, so it defeats the author-writes-the-fake-break
+  problem even for judgment-shaped facts. Repeated failure to find a hole is a signal the fact is really just
+  prose. Downside: it needs trusted, metered agent runs, and an agent is non-deterministic — it can miss a
+  real hole or invent a fake one, so it needs a spot-audit apparatus (not built yet).
+
+- **Before accepting a check, make the author name what would make the fact false — and refuse if they
+  can't.** Before accepting a check as real, require the author to name the *falsifier* — the observable
+  event that would make the fact false. If they can't name one, refuse to file it as a real claim. Example:
+  "upstream closes the bug" is a nameable falsifier, so it goes down the check path; "I prefer this style" has
+  no falsifier, so `add` refuses and prints "this is a rule, not a claim." A date-only falsifier ("this is
+  fine until the next release") steers to "skip until" instead. This is the classifier the three-kind taxonomy
+  needs, enforced right at the front door — the cheapest and most important single move, because most hollow
+  checks are preferences or expirables forced into a check. Downside: it adds friction at authoring time (the
+  thing that kills adoption past about five minutes), and a clumsy version nags authors into writing fake
+  falsifiers, which is worse than nothing — it needs calibration data first.
+
+- **For facts over a formal structure, prove the check equals the fact.** For facts you can express over a
+  formal structure — an import graph, a config schema, a type — *prove* the check is equivalent to the fact
+  with a model checker, instead of sampling breaks. Example: for "nothing in this package imports the
+  networking module," prove over the import graph that the check catches every possible violation, so no
+  counterexample can exist within the bound. A proof is the strongest possible guarantee. Downside: it's
+  enormous machinery for a narrow slice — most `claim` facts (upstream behavior, vendor limits, how text
+  renders) have no formal model, and it clashes with the "thin shell over grep" spirit. Conceivable only as a
+  few proven templates, far in the future.
+
+- **Ship checks built from a vetted library, and trust those more than raw shell.** Ship a curated library of
+  check templates, each one proven or shown by experience to discriminate for a given fact-shape — import
+  absent, version pinned, upstream issue open, file hash stable. A claim built from a template inherits proven
+  discriminating power. A claim built from raw shell is marked lower-trust and sent to the heavier probes.
+  Example: a claim that uses the "import-absent" template is trusted; a claim someone wrote as a hand-rolled
+  grep is flagged for extra scrutiny. This moves trust from auditing thousands of individual checks to
+  auditing a handful of templates, and it makes the good check the easy path. Downside: it requires knowing
+  the common fact-shapes, which only a real body of claims reveals — a premature library encodes the wrong
+  primitives, and it doesn't help genuinely novel facts. This is the same idea as "ship a template library per
+  decision kind" in problem 3.
+
+- **Measure, don't guarantee: flag checks that have been green their whole life despite churn.** Don't gate
+  any single claim. Instead, let the hub measure how often each check has *ever* changed its verdict, and flag
+  the checks that have been green their entire life despite the files they read changing repeatedly. Example:
+  a check whose files have been edited a hundred times but that has never once gone red is flagged as a likely
+  tautology. It's purely observational and costs the author nothing — a check that's provably held on every
+  run across real change is a strong statistical tell without breaking anything on purpose. It tells apart a
+  real check that just never had a reason to fire (its files never changed) from a hollow one (its files
+  changed and it still never fired). Downside: it needs the hub, the history of verdicts, and file-read
+  tracking (all not built yet), plus a long history — a late-stage backstop, blind at the start. Same idea as
+  the "flag never-red checks" option in problem 3.
+
+*Sorting it out.* None of these makes an unprovable fact provable — they make a *checkable* fact's check
+provably able to fail, or they *detect* that a check can't. Naming the falsifier up front (and being willing
+to say "this belongs in a rules file") is the only honest answer for pure prose, and "skip until a date" is
+the answer for expirables. The mechanical probes (break the world; sabotage the check's inputs) are cheapest
+and most predictable. The reasoning agent reaches facts no mechanical break can touch, but costs
+predictability. Re-proving on a schedule and measuring over history add the time dimension the stateless tool
+can't hold by itself.
+
+---
+
+## The business question (background, not a problem to solve)
+
+This is context for weighing the problems above. It's not a fifth problem. All of it is from the research.
+
+- **A well-funded neighboring category exists, and `claim`'s exact spot is empty.** "Agent memory" — tools
+  that give AI agents a memory — is clearly a funded category as of mid-2026. Several companies have raised
+  money, including one headline raise of $98M. Coding-agent tooling in particular is where the big money is.
+  But every funded memory company does the same thing: it stores and reconciles things that were *said* — it
+  resolves conflicts, tracks what's newer, and so on. None of them verifies a fact against reality with a
+  command you can run. The nearest funded neighbors sell search and doc-automation, betting that good search
+  makes explicit capture unnecessary. So `claim` would be defining a small new category next to a hot funded
+  one, not fighting into a crowded field. Honest caveat: the competitor sweep didn't finish, so a quiet or
+  open-source neighbor can't be fully ruled out. The nearest one anyone named detects "code changed near this
+  doc," which is not the same as checking whether a fact is still true.
+
+- **The problem doesn't have a name yet.** "Context engineering" names the *practice* of curating what you
+  feed a model. "Context rot" means a model getting worse over a very long input. Neither names `claim`'s
+  problem — *recorded knowledge quietly going false over time*. That's both an opportunity (name it) and a
+  cost (you have to teach buyers the problem exists). The "CI for facts" or "Dependabot for facts" framing
+  helps, because it borrows a category buyers already understand.
+
+- **Protocol versus product.** The file conventions agents read (AGENTS.md, MCP, llms.txt) are standardizing,
+  and a third party can't really make money off them — "publish a file agents can read" captures no value.
+  What's left to sell is the verification loop and the hub's derived intelligence: the schedule, the drift
+  routing, the cross-repo index. That's exactly the split the plan already commits to — a free, open format
+  and CLI (which drives the coverage the value depends on) plus a paid hub (which captures the over-time,
+  cross-repo intelligence a stateless file can't hold).
 
 - **The wedge: painkiller, not vitamin.** The one funding-validated painkiller framing in 2026 is
-  agent-cost/agent-reliability — a stale CLAUDE.md fact is inherited every session and wastes agent runs, felt
-  by one person in week one. The compliance/audit wedge (CVE-waiver management) is plausible but unverified as
-  a market and means a process-adoption slog before value. The vitamin trap to avoid is "better organizational
-  knowledge / a second brain" — every manual-capture knowledge tool that sold this rotted.
+  agent-cost and agent-reliability. A stale fact in a CLAUDE.md file gets inherited every session and wastes
+  agent runs — one person feels that in week one. The compliance/audit angle (managing CVE waivers) is
+  plausible but unproven as a market, and selling to security means a slow process-adoption slog before
+  anyone sees value. The trap to avoid is selling "better organizational knowledge" or "a second brain" —
+  every hand-written knowledge tool that sold that framing rotted.
 
-- **The load-bearing empirical constraints for survival.** Precision, not recall, governs whether the nag
-  channel lives: above ~10% not-actioned drift alerts, engineers mute it (Google Tricorder disables an
-  analyzer past that; an "effective false positive" is defined by *human non-action*, not tool correctness).
-  Integrate at the PR/CI run, not a dashboard: Infer's fix rate went 0%→>70% moving batch→diff at the *same*
-  false-positive rate. Bootstrap by ratchet (new exceptions must carry a claim; grandfather the backlog;
-  coverage only grows), gating on a *passing check*, not mere presence (the CODEOWNERS caveat: enforcing a
-  review happens doesn't make the content correct).
+- **The hard empirical limits on survival.** Precision, not recall, decides whether the nag channel lives.
+  Once more than about 10% of drift alerts go un-acted-on, engineers mute the channel. (An "effective false
+  positive" is defined by a human not acting, not by whether the tool was technically right.) Integrate at
+  the pull-request or CI run, not a separate dashboard: one analysis tool's fix rate jumped from basically 0%
+  to over 70% purely by moving from a batch report to the diff, at the same false-positive rate. Bootstrap by
+  ratchet: new exceptions must carry a claim, the existing backlog is grandfathered, and coverage only grows.
+  And gate on a *passing check*, not mere presence — forcing a review to happen doesn't make the reviewed
+  content correct.
 
 - **The honest bottom line.** `claim` aims at a real, funding-validated problem from an angle nobody funded
   has taken (executable verification), with a wedge the market confirms and an architecture the historical
-  record endorses. Its survival turns on the one thing the design does not yet guarantee: **that the checks
-  people write discriminate** (Risk 4). The top adoption risks, in the research's order: (1) the
-  check-tautology problem, (2) false-positive fatigue above ~10%, (3) retrieval-obviates-capture, (4)
-  incumbent fast-follow (Copilot Memory's ship-and-verify-at-read design is one conceptual step from executable
-  verification), (5) coverage cold-start and the "who writes the check" friction. `claim`'s defensibility is
-  being executable, deterministic, git-committed, and PR-reviewed — narrower and harder to fake than
-  prompt-based re-check, but a harder sell and a smaller initial market than "memory for all agents."
+  record endorses. Its survival turns on the one thing the design doesn't yet guarantee: that the checks
+  people write actually fail when the fact goes false (problem 4). The top adoption risks, in the research's
+  order: (1) the hollow-check problem, (2) false-alarm fatigue above ~10%, (3) the bet that good search makes
+  explicit capture unnecessary, (4) a big incumbent fast-following (one major vendor's ship-and-verify-at-read
+  design is one step from executable verification), and (5) the cold-start coverage problem plus the "who
+  writes the check" friction. `claim`'s edge is being executable, deterministic, git-committed, and
+  PR-reviewed — harder to fake than a prompt-based re-check, but a harder sell and a smaller initial market
+  than "memory for all agents."
