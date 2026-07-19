@@ -356,6 +356,7 @@ Each enters the workspace with this one-line justification in its crate's
 | `askama` | Compile-time, type-checked templates embedded in the binary; text templates make the markdown twins one struct with two renderings. |
 | `rmcp` | The official MCP Rust SDK; owns protocol framing and the streamable-HTTP transport so the MCP surface stays a thin binding. |
 | `schemars` | Derives MCP tool input schemas from request types, as the CLI's MCP work already did. |
+| `sha2` | The canonical check-digest (hub-01): SHA-256 over a check's canonical definition, so a check's identity is collision-resistant and stable across CLI versions. Audited, pure-Rust RustCrypto; chosen over a non-cryptographic hash (unstable across versions/platforms, no collision resistance). |
 | `toml` | Deserializes the one config file; serde-native, tiny. |
 | `tracing`, `tracing-subscriber` | Structured spans through ingest → append → derive; the tokio-ecosystem standard. |
 
