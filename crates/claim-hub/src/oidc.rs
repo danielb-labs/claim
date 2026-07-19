@@ -10,9 +10,14 @@
 //! What "verify" means here, in order (each a distinct rejection):
 //!
 //! 1. **Signature** against the issuer's published JWKS. The token's `kid` selects the
-//!    key; an unknown `kid` triggers one JWKS refresh (keys rotate), and only then is
-//!    it rejected. A token signed by a key not in the issuer's set — a forgery — fails.
-//! 2. **`iss`** equals the configured issuer (`token.actions.githubusercontent.com`).
+//!    key; an unknown `kid` triggers a JWKS refresh (keys rotate), and only then is it
+//!    rejected. That refresh is **rate-limited** (`kid` is attacker-controlled and read
+//!    before the signature is checked, so an un-throttled fetch-per-unknown-kid is an
+//!    amplification vector) — see [`JwksCache`]. A token signed by a key not in the
+//!    issuer's set — a forgery — fails.
+//! 2. **`iss`** equals the configured issuer (`token.actions.githubusercontent.com`) and
+//!    is *present*: a token omitting `iss`/`aud`/`exp` is rejected, not waved through, so
+//!    the issuer/audience pinning is never hollow (`set_required_spec_claims`).
 //! 3. **`aud`** equals the hub's own configured audience. This is what stops a token
 //!    minted for *another* service from being replayed at this hub.
 //! 4. **`exp`** is in the future (validated by `jsonwebtoken` with a small leeway).
@@ -119,56 +124,110 @@ impl JwksSource for HttpJwksSource {
     }
 }
 
-/// A cache of the issuer's JWKS that refreshes on an unknown key id.
+/// A monotonic millisecond clock, injectable so the debounce is deterministic in tests.
+///
+/// The refresh debounce ([`JwksCache`]) compares "now" against the last successful fetch,
+/// so it needs a clock. A monotonic source (not wall-clock) is what a rate limit wants —
+/// a backward clock jump must not re-open the fetch window. Production reads a process
+/// monotonic instant; a test injects a counter it advances, so the debounce is tested
+/// without sleeping (CLAUDE.md's determinism rule).
+pub type MonotonicMillis = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The default refresh-debounce window: at most one JWKS refresh per this many
+/// milliseconds, however many novel `kid`s arrive.
+///
+/// GitHub rotates its Actions signing keys on the order of hours, so a 60-second floor
+/// between refreshes never blocks a legitimate rotation from healing (the next request
+/// after the window refreshes), while it caps the unauthenticated amplification a flood
+/// of forged tokens carrying novel `kid`s could otherwise drive: `kid` is read from the
+/// token header *before* signature verification, so without this an attacker chooses the
+/// hub's outbound JWKS request rate. One fetch per minute is a hard ceiling on that.
+const DEFAULT_REFRESH_DEBOUNCE_MS: u64 = 60_000;
+
+/// A cache of the issuer's JWKS that refreshes on an unknown key id, rate-limited.
 ///
 /// The issuer rotates signing keys, so a token can legitimately carry a `kid` the
 /// cached set does not yet have. The cache resolves a `kid` against its current set,
 /// and on a miss fetches once more before giving up — so key rotation heals without a
 /// redeploy, while a genuinely unknown key (a forgery) still fails after the refresh.
+///
+/// **The refresh is debounced** (a default 60-second window; see
+/// `DEFAULT_REFRESH_DEBOUNCE_MS`): because `kid` is attacker-controlled and read before
+/// the signature is checked, an un-throttled refresh-per-unknown-kid lets an
+/// unauthenticated flood of forged tokens drive the hub's outbound JWKS request rate — an
+/// amplification/DoS vector against the issuer and the hub. So a miss triggers a refresh
+/// at most once per window; within the window a novel `kid` is rejected against the
+/// cached set with no new fetch. Concurrent misses are single-flighted by the write lock:
+/// the first refreshes, the rest re-check the now-current set under the same lock rather
+/// than each firing their own fetch.
+///
 /// The set is behind an [`RwLock`]: reads (the common path) take the read lock; a
 /// refresh takes the write lock briefly. It starts empty and populates lazily on the
 /// first verification, so construction does no IO.
 pub struct JwksCache<S: JwksSource> {
     source: S,
     keys: RwLock<Option<JwkSet>>,
+    /// The monotonic ms of the last successful fetch, or `None` if never fetched. Behind
+    /// the same write lock discipline as `keys` (via `refresh_locked`), so the debounce
+    /// check and the fetch are atomic and concurrent misses coalesce.
+    last_fetch_ms: RwLock<Option<u64>>,
+    debounce_ms: u64,
+    clock: MonotonicMillis,
 }
 
 impl<S: JwksSource> JwksCache<S> {
-    /// A cache over `source`, initially empty (the first resolve fetches).
+    /// A cache over `source`, initially empty (the first resolve fetches), with the
+    /// default debounce window and a process-monotonic clock.
     pub fn new(source: S) -> Self {
+        // A process-relative monotonic clock: `Instant` since a fixed start, in ms. Never
+        // goes backward, and needs no wall-clock time.
+        let start = std::time::Instant::now();
+        let clock: MonotonicMillis =
+            Arc::new(move || start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        Self::with_debounce(source, DEFAULT_REFRESH_DEBOUNCE_MS, clock)
+    }
+
+    /// A cache with an explicit debounce window and clock, for tests that drive the
+    /// rate limit deterministically.
+    pub fn with_debounce(source: S, debounce_ms: u64, clock: MonotonicMillis) -> Self {
         Self {
             source,
             keys: RwLock::new(None),
+            last_fetch_ms: RwLock::new(None),
+            debounce_ms,
+            clock,
         }
     }
 
-    /// Resolve `kid` to a verifying [`DecodingKey`], refreshing the JWKS once on a miss.
+    /// Resolve `kid` to a verifying [`DecodingKey`], refreshing the JWKS once on a miss —
+    /// but no more than once per debounce window.
     ///
     /// Tries the cached set first; if the `kid` is absent (or the cache is empty), it
-    /// fetches a fresh set and tries again. A `kid` still absent after the refresh is
-    /// [`OidcError::UnknownKey`] — the caller treats that as an invalid token (no
-    /// published key signed it), not a transient fault. A fetch that itself fails is
-    /// [`OidcError::Fetch`], a transient inability to verify.
+    /// refreshes (subject to the debounce) and tries again. A `kid` still absent after
+    /// that is [`OidcError::UnknownKey`] — an invalid token (no published key signed it),
+    /// not a transient fault. A `kid` absent *and* the refresh suppressed by the debounce
+    /// is also `UnknownKey`: within the window the hub answers from the cache it has,
+    /// rather than fetching per forged token. A fetch that itself fails is
+    /// [`OidcError::Fetch`].
     ///
     /// # Errors
     ///
-    /// [`OidcError::UnknownKey`] if `kid` is not in the issuer's set even after a
-    /// refresh; [`OidcError::Fetch`] if the JWKS could not be fetched;
+    /// [`OidcError::UnknownKey`] if `kid` is not in the issuer's set (after any allowed
+    /// refresh); [`OidcError::Fetch`] if a fetch was attempted and failed;
     /// [`OidcError::Key`] if the matched JWK cannot be turned into a decoding key.
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, OidcError> {
-        // Populate the cache on first use (a lazy initial fetch), then try the cached
-        // set.
+        // Populate the cache on first use. The initial fetch is not debounced against
+        // "never" — a cold cache must fetch — but it does record the fetch time, so an
+        // immediately-following unknown-kid miss is debounced.
         if self.is_empty().await {
-            self.refresh().await?;
+            self.refresh_if_due(true).await?;
         }
         if let Some(key) = self.lookup(kid).await? {
             return Ok(key);
         }
-        // A *populated* cache that lacks the kid: refresh once (the key may have rotated
-        // in), then try again. Only an absent kid after this genuine refresh is an
-        // unknown-key rejection — so key rotation heals without a redeploy, while a
-        // forgery still fails.
-        self.refresh().await?;
+        // A populated cache lacking the kid: refresh at most once per window, then retry.
+        // If the window suppressed the refresh, the kid stays unknown — no fetch fired.
+        self.refresh_if_due(false).await?;
         self.lookup(kid)
             .await?
             .ok_or_else(|| OidcError::UnknownKey(kid.to_owned()))
@@ -179,11 +238,29 @@ impl<S: JwksSource> JwksCache<S> {
         self.keys.read().await.is_none()
     }
 
-    /// Fetch a fresh JWKS and store it.
-    async fn refresh(&self) -> Result<(), OidcError> {
+    /// Refresh the JWKS if the debounce window has elapsed since the last fetch (or if
+    /// `force`, used for the mandatory cold-cache initial fetch).
+    ///
+    /// Takes the `last_fetch_ms` write lock for the whole check-and-fetch, so concurrent
+    /// callers single-flight: the first inside the window fetches and stamps the time; a
+    /// second, now seeing a recent stamp, does not fetch again. A suppressed refresh is a
+    /// silent success (`Ok(())`) — the caller then re-checks the cache and, still missing
+    /// the kid, rejects it as unknown.
+    async fn refresh_if_due(&self, force: bool) -> Result<(), OidcError> {
+        let now = (self.clock)();
+        let mut last = self.last_fetch_ms.write().await;
+        if !force {
+            if let Some(prev) = *last {
+                if now.saturating_sub(prev) < self.debounce_ms {
+                    // Within the window: do not fetch. Bounds the outbound request rate a
+                    // flood of novel, attacker-chosen `kid`s can drive.
+                    return Ok(());
+                }
+            }
+        }
         let fresh = self.source.fetch().await?;
-        let mut guard = self.keys.write().await;
-        *guard = Some(fresh);
+        *self.keys.write().await = Some(fresh);
+        *last = Some(now);
         Ok(())
     }
 
@@ -235,11 +312,23 @@ impl<S: JwksSource> OidcVerifier<S> {
         repositories: impl IntoIterator<Item = String>,
         source: S,
     ) -> Self {
+        Self::with_cache(issuer, audience, repositories, JwksCache::new(source))
+    }
+
+    /// A verifier over a caller-built [`JwksCache`], so a test can supply a cache with a
+    /// controllable clock and debounce window to drive the refresh rate limit
+    /// deterministically. Production uses [`new`](OidcVerifier::new).
+    pub fn with_cache(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        repositories: impl IntoIterator<Item = String>,
+        cache: JwksCache<S>,
+    ) -> Self {
         Self {
             issuer: issuer.into(),
             audience: audience.into(),
             repositories: repositories.into_iter().collect(),
-            cache: JwksCache::new(source),
+            cache,
         }
     }
 
@@ -279,6 +368,14 @@ impl<S: JwksSource> OidcVerifier<S> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.audience.as_str()]);
+        // Require `iss` and `aud` to be *present*, not merely correct-when-present.
+        // `jsonwebtoken` rejects a present-but-wrong `iss`/`aud` but, by default, lets a
+        // token that OMITS them through — which would make the issuer/audience pinning
+        // hollow: a token minted with no `aud` at all would sail past `set_audience`.
+        // `exp` stays required (its default). Making all three required means a token
+        // missing any of them is a `MissingRequiredClaim` rejection, mapped by
+        // `reject_from_jwt`.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         // `exp` is validated by default (with jsonwebtoken's small leeway); `iat`/`nbf`
         // are validated when present. Nothing here disables those.
         let data = decode::<OidcClaims>(token, &key, &validation)
@@ -297,9 +394,12 @@ impl<S: JwksSource> OidcVerifier<S> {
 /// Map a `jsonwebtoken` decode error to the specific rejection reason it represents.
 ///
 /// The variants are separated so the producer's 4xx names exactly what failed — an
-/// expired token, a wrong audience, a wrong issuer, a bad signature — rather than a
-/// generic "invalid". Anything else (a missing required claim, a malformed structure)
-/// is a malformed token.
+/// expired token, a wrong audience, a wrong issuer, a bad signature, a required claim
+/// missing — rather than a generic "invalid". A token that *omits* `iss`/`aud`/`exp`
+/// surfaces here as `MissingRequiredClaim` (because [`OidcVerifier::verify`] marks all
+/// three required), which is a named `Malformed` rejection, not a silent pass — the fix
+/// that closes the hollow-pinning hole. Anything else (a malformed structure) is also a
+/// malformed token.
 fn reject_from_jwt(error: &jsonwebtoken::errors::Error) -> AuthReject {
     use jsonwebtoken::errors::ErrorKind;
     match error.kind() {
@@ -307,21 +407,33 @@ fn reject_from_jwt(error: &jsonwebtoken::errors::Error) -> AuthReject {
         ErrorKind::InvalidAudience => AuthReject::WrongAudience,
         ErrorKind::InvalidIssuer => AuthReject::WrongIssuer,
         ErrorKind::InvalidSignature => AuthReject::BadSignature,
+        ErrorKind::MissingRequiredClaim(claim) => {
+            AuthReject::Malformed(format!("token is missing the required `{claim}` claim"))
+        }
         other => AuthReject::Malformed(format!("token failed validation: {other:?}")),
     }
 }
 
 /// The standard and GitHub-specific claims the ingest gate reads from an OIDC token.
 ///
-/// Only the fields the gate *uses* are named — `repository` (the connected-store
-/// check, and the store id), `sha` (the commit an event records). Every other claim is
-/// still preserved verbatim in the producer block via [`VerifiedProducer`]; this struct
-/// is the typed read of the two the gate branches on. `#[serde(deny_unknown_fields)]`
-/// is deliberately **absent**: an OIDC token carries many standard claims (`iss`,
-/// `aud`, `exp`, `iat`, `nbf`, `sub`, `jti`, and GitHub's `workflow`, `ref`, `run_id`,
-/// `actor`, ...), and the gate reads only two — the rest are captured whole elsewhere.
+/// The gate *branches* on `repository` (the connected-store check, and the store id),
+/// `sha` (the commit an event records), and `run_id` (the dedup run). `iss` is a
+/// **required** field here as belt-and-suspenders over the `set_required_spec_claims`
+/// pinning in [`OidcVerifier::verify`]: a token that omits it fails to deserialize, so
+/// issuer presence is enforced at two layers, not one. (`aud` is enforced by
+/// `set_required_spec_claims` alone — its JWT value may be a string *or* an array, so
+/// typing it here would risk rejecting a valid array-`aud` token; the spec-claim check
+/// validates presence and value without constraining the shape.) Every other claim is
+/// preserved verbatim in the producer block via [`VerifiedProducer`].
+/// `#[serde(deny_unknown_fields)]` is deliberately **absent**: an OIDC token carries many
+/// standard claims (`aud`, `exp`, `iat`, `nbf`, `sub`, `jti`, and GitHub's `workflow`,
+/// `ref`, `actor`, ...), and the rest are captured whole in `rest`.
 #[derive(Debug, Clone, Deserialize)]
 struct OidcClaims {
+    /// The `iss` claim — required, so a token omitting the issuer never deserializes.
+    /// Recorded back into the producer block verbatim (it is pulled out of `rest` by
+    /// being named here).
+    iss: String,
     /// The `repository` claim (owner/repo), checked against the connected stores and
     /// mapped to the canonical store id.
     repository: String,
@@ -333,7 +445,7 @@ struct OidcClaims {
     #[serde(default)]
     run_id: Option<String>,
     /// Every other claim in the token, retained so the producer block is verbatim (the
-    /// trust judgment stays re-derivable, HUB.md §4). Flattened, so `iss`/`workflow`/
+    /// trust judgment stays re-derivable, HUB.md §4). Flattened, so `aud`/`workflow`/
     /// `ref`/... land here without being named above.
     #[serde(flatten)]
     rest: serde_json::Map<String, serde_json::Value>,
@@ -356,7 +468,7 @@ pub struct VerifiedProducer {
 impl VerifiedProducer {
     /// Build the verified producer from the decoded claims.
     ///
-    /// The `producer` block is every claim the token carried — the two named fields
+    /// The `producer` block is every claim the token carried — the named fields
     /// re-inserted beside the flattened rest — plus a `run` key set to the workflow run
     /// id, which is the name the storage layer's dedup key reads (HUB.md §2). Recording
     /// the claims whole keeps the trust judgment re-derivable (HUB.md §4); adding `run`
@@ -367,6 +479,9 @@ impl VerifiedProducer {
         let commit = claims.sha.clone();
 
         let mut block = claims.rest;
+        // `iss` and `repository` are named fields (pulled out of `rest`), so re-insert
+        // them to keep the block a verbatim record of every verified claim.
+        block.insert("iss".to_owned(), serde_json::Value::String(claims.iss));
         block.insert(
             "repository".to_owned(),
             serde_json::Value::String(claims.repository),
@@ -555,6 +670,7 @@ pub type SharedVerifier = Arc<dyn TokenVerifier>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn repository_maps_to_the_canonical_github_store_id() {
@@ -564,20 +680,140 @@ mod tests {
         );
     }
 
+    /// A JWKS source that always returns an empty set (so every `kid` misses) and counts
+    /// fetches — for the debounce tests, which assert the *number of outbound fetches*.
+    struct CountingEmptySource {
+        fetches: Arc<AtomicU64>,
+    }
+
+    impl JwksSource for CountingEmptySource {
+        async fn fetch(&self) -> Result<JwkSet, OidcError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::from_value(serde_json::json!({ "keys": [] })).unwrap())
+        }
+    }
+
+    /// A cache over a counting empty source, with an explicit debounce and a controllable
+    /// clock, plus a handle to the fetch counter and the clock's millis.
+    fn debounced_cache(
+        debounce_ms: u64,
+    ) -> (
+        JwksCache<CountingEmptySource>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let fetches = Arc::new(AtomicU64::new(0));
+        let now = Arc::new(AtomicU64::new(0));
+        let clock_now = now.clone();
+        let clock: MonotonicMillis = Arc::new(move || clock_now.load(Ordering::SeqCst));
+        let cache = JwksCache::with_debounce(
+            CountingEmptySource {
+                fetches: fetches.clone(),
+            },
+            debounce_ms,
+            clock,
+        );
+        (cache, fetches, now)
+    }
+
+    #[tokio::test]
+    async fn many_unknown_kids_in_one_window_fetch_at_most_once() {
+        // The amplification cap at the cache layer: the cold fetch populates once; every
+        // subsequent unknown-kid lookup within the window is answered from the cache with
+        // no new fetch, however many distinct kids arrive.
+        let (cache, fetches, _now) = debounced_cache(60_000);
+        for n in 0..100 {
+            let err = cache
+                .decoding_key(&format!("kid-{n}"))
+                .await
+                .expect_err("every kid is unknown against an empty set");
+            assert!(matches!(err, OidcError::UnknownKey(_)));
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "100 distinct unknown kids in one window drove exactly one fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_allowed_again_after_the_window_passes() {
+        // The debounce is a floor, not a permanent lock: once the window elapses, a miss is
+        // allowed to refresh again. Two windows → at most two fetches.
+        let (cache, fetches, now) = debounced_cache(1_000);
+        let _ = cache.decoding_key("a").await; // cold fetch (1)
+        let _ = cache.decoding_key("b").await; // within window: suppressed
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        now.store(1_001, Ordering::SeqCst); // past the window
+        let _ = cache.decoding_key("c").await; // refresh allowed (2)
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "a new window permits one more refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetch_failure_surfaces_and_does_not_poison_the_debounce() {
+        // A source whose first fetch fails: the cold fetch errors (a transient fault), and
+        // because it did not succeed the last-fetch time is not stamped, so the next
+        // attempt may fetch again rather than being wrongly debounced against a failure.
+        struct FailFirst {
+            calls: Arc<AtomicU64>,
+        }
+        impl JwksSource for FailFirst {
+            async fn fetch(&self) -> Result<JwkSet, OidcError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(OidcError::Fetch("boom".into()))
+                } else {
+                    Ok(serde_json::from_value(serde_json::json!({ "keys": [] })).unwrap())
+                }
+            }
+        }
+        let calls = Arc::new(AtomicU64::new(0));
+        let now = Arc::new(AtomicU64::new(0));
+        let clock: MonotonicMillis = Arc::new({
+            let now = now.clone();
+            move || now.load(Ordering::SeqCst)
+        });
+        let cache = JwksCache::with_debounce(
+            FailFirst {
+                calls: calls.clone(),
+            },
+            60_000,
+            clock,
+        );
+        // First: the cold fetch fails outright.
+        assert!(matches!(
+            cache.decoding_key("a").await,
+            Err(OidcError::Fetch(_))
+        ));
+        // Second: not debounced against the failure — it fetches again (now succeeds),
+        // then rejects the unknown kid against the empty set.
+        assert!(matches!(
+            cache.decoding_key("a").await,
+            Err(OidcError::UnknownKey(_))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a failed fetch did not lock out a retry"
+        );
+    }
+
     #[test]
     fn a_verified_producer_records_run_and_repository_verbatim() {
         // The producer block must carry the raw claims plus the `run` the dedup key
         // reads. Build the claims as they would decode and check the block.
         let mut rest = serde_json::Map::new();
         rest.insert(
-            "iss".to_owned(),
-            serde_json::Value::String(GITHUB_ACTIONS_ISSUER.to_owned()),
-        );
-        rest.insert(
             "workflow".to_owned(),
             serde_json::Value::String("verify".to_owned()),
         );
         let claims = OidcClaims {
+            iss: GITHUB_ACTIONS_ISSUER.to_owned(),
             repository: "acme/payments".to_owned(),
             sha: Some("8f2c0a1".to_owned()),
             run_id: Some("1234567890".to_owned()),
@@ -587,7 +823,7 @@ mod tests {
         assert_eq!(producer.store(), "github.com/acme/payments");
         assert_eq!(producer.commit(), Some("8f2c0a1"));
         let block = &producer.producer().0;
-        // The raw claims survive.
+        // The raw claims survive, including the named `iss` re-inserted verbatim.
         assert_eq!(block["iss"], serde_json::json!(GITHUB_ACTIONS_ISSUER));
         assert_eq!(block["workflow"], serde_json::json!("verify"));
         assert_eq!(block["repository"], serde_json::json!("acme/payments"));
@@ -602,6 +838,7 @@ mod tests {
         // run-less verdict downstream (invariant #6), rather than this layer inventing a
         // run.
         let claims = OidcClaims {
+            iss: GITHUB_ACTIONS_ISSUER.to_owned(),
             repository: "acme/payments".to_owned(),
             sha: Some("abc".to_owned()),
             run_id: None,

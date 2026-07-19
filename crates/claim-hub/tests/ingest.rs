@@ -77,6 +77,58 @@ async fn a_valid_token_and_envelope_appends_verbatim_and_returns_the_position() 
 }
 
 #[tokio::test]
+async fn a_skipped_check_before_a_run_check_files_the_verdict_under_the_right_digest() {
+    // The load-bearing correctness fix for issue #18: a two-check claim where check 0 is
+    // skipped and check 1 runs. The CLI compacts the skipped check out, so the report's
+    // `checks` holds only the survivor — at array offset 0, but declared index 1. The
+    // hub must key the digest on the *declared* index (1 → digest of check B), never on
+    // the array offset (0 → digest of check A). Keying by offset would file B's verdict
+    // under A's identity — the wrong-check failure the digest exists to prevent.
+    let two_check = "id: payments/two\nchecks:\n  - kind: cmd\n    run: \"true\"\n  - kind: cmd\n    run: \"false\"";
+    let (app, store) = app_with(TestJwksSource::with_signing_key()).await;
+    let claim = seed_claim(&store, ".claims/two.md", two_check).await;
+    let digest_a = check_digest(&claim.checks[0]);
+    let digest_b = check_digest(&claim.checks[1]);
+    assert_ne!(
+        digest_a, digest_b,
+        "the two checks have distinct identities"
+    );
+
+    // The report a skip-then-run claim produces: only the surviving check, declared
+    // index 1, drifted.
+    let token = sign_token(&TokenClaims::valid());
+    let body = serde_json::json!({
+        "status": "ok", "exit": 1, "checked": 1, "ran": 1, "skipped": 1,
+        "claims": [{
+            "id": "payments/two", "file": ".claims/two.md",
+            "checks": [{ "index": 1, "verdict": "drifted", "end": { "kind": "exited", "code": 1 }, "detail": "exit 1" }],
+            "skipped": [{ "index": 0, "reason": "parked" }],
+            "supports": [], "exit": 1
+        }],
+        "errors": []
+    })
+    .to_string();
+    let (status, json) = post_ingest(&app, Some(&token), &body).await;
+    assert_eq!(status, 200, "the push is accepted: {json}");
+
+    let events = store.scan_from(Position(0)).await.unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0].event;
+    assert_eq!(
+        event.check.index, 1,
+        "the declared index is recorded, not the offset"
+    );
+    assert_eq!(
+        event.check.digest, digest_b,
+        "the drift is filed under check B's identity (declared index 1), NOT check A's"
+    );
+    assert_ne!(
+        event.check.digest, digest_a,
+        "keying by array offset 0 would have mis-filed it under A — the bug this guards"
+    );
+}
+
+#[tokio::test]
 async fn a_forged_signature_is_rejected_4xx_and_appends_nothing() {
     // A token signed with the *wrong* key but presented under the published kid: its
     // signature does not verify against the JWKS's key. A forgery.
@@ -131,6 +183,50 @@ async fn a_wrong_audience_is_rejected_4xx_and_appends_nothing() {
     assert!(
         json["error"].as_str().unwrap().contains("audience"),
         "the reason names the audience: {json}"
+    );
+    assert_no_events(&store).await;
+    assert_eq!(get_status(&app).await["rejection_count"], 1);
+}
+
+#[tokio::test]
+async fn a_token_missing_its_issuer_is_rejected_not_silently_accepted() {
+    // Issuer pinning must not be hollow: `jsonwebtoken` rejects a present-but-wrong
+    // `iss` but, without required-spec-claims, would let a token that OMITS `iss`
+    // through. A real RS256-signed token with no `iss` claim must be rejected and
+    // counted, not accepted with the pinning silently skipped.
+    let (app, store) = app_with(TestJwksSource::with_signing_key()).await;
+    seed_claim(&store, ".claims/pin.md", PIN_CLAIM).await;
+
+    let token = sign_token_omitting("iss");
+    let body = one_check_report("payments/libfoo-pin", "held", None);
+    let (status, json) = post_ingest(&app, Some(&token), &body).await;
+
+    assert_eq!(status, 401, "a token with no issuer is rejected: {json}");
+    assert!(
+        json["error"].as_str().unwrap().contains("iss")
+            || json["error"].as_str().unwrap().contains("issuer"),
+        "the reason names the missing issuer: {json}"
+    );
+    assert_no_events(&store).await;
+    assert_eq!(get_status(&app).await["rejection_count"], 1);
+}
+
+#[tokio::test]
+async fn a_token_missing_its_audience_is_rejected_not_silently_accepted() {
+    // The same hole for audience: a token minted with no `aud` at all would sail past
+    // `set_audience` without required-spec-claims. It must be rejected and counted.
+    let (app, store) = app_with(TestJwksSource::with_signing_key()).await;
+    seed_claim(&store, ".claims/pin.md", PIN_CLAIM).await;
+
+    let token = sign_token_omitting("aud");
+    let body = one_check_report("payments/libfoo-pin", "held", None);
+    let (status, json) = post_ingest(&app, Some(&token), &body).await;
+
+    assert_eq!(status, 401, "a token with no audience is rejected: {json}");
+    assert!(
+        json["error"].as_str().unwrap().contains("aud")
+            || json["error"].as_str().unwrap().contains("audience"),
+        "the reason names the missing audience: {json}"
     );
     assert_no_events(&store).await;
     assert_eq!(get_status(&app).await["rejection_count"], 1);
@@ -219,12 +315,12 @@ async fn a_push_with_one_unknown_claim_appends_nothing_at_all() {
         "claims": [
             {
                 "id": "payments/libfoo-pin", "file": ".claims/pin.md",
-                "checks": [{ "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }],
+                "checks": [{ "index": 0, "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }],
                 "skipped": [], "supports": [], "exit": 0
             },
             {
                 "id": "payments/not-registered", "file": ".claims/x.md",
-                "checks": [{ "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }],
+                "checks": [{ "index": 0, "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }],
                 "skipped": [], "supports": [], "exit": 0
             }
         ],
@@ -310,51 +406,103 @@ async fn a_missing_bearer_token_is_401_but_not_a_counted_rejection() {
 }
 
 #[tokio::test]
-async fn the_jwks_cache_refreshes_once_on_an_unknown_kid_then_succeeds() {
-    // The first JWKS fetch returns an empty set (the token's kid is unknown), so the
-    // cache refreshes; the second fetch publishes the signing key, so verification then
-    // succeeds. This proves refresh-on-unknown-kid — and that a rotated key heals without
-    // a redeploy — with no network.
+async fn a_rotated_key_heals_on_a_refresh_once_the_debounce_window_has_passed() {
+    // Refresh-on-unknown-kid, now rate-limited. The first fetch returns an empty set (the
+    // kid is unknown); the *same request* cannot also refresh — that would be two fetches
+    // in one window, exactly the amplification the debounce caps — so it is rejected. Once
+    // the debounce window passes, the next request is allowed to refresh, the source now
+    // publishes the signing key, and verification succeeds. This proves both that a
+    // rotated key heals without a redeploy AND that the heal costs one fetch per window.
     let source = TestJwksSource::empty_then_signing_key();
     let fetches = source.clone();
-    let (app, store) = app_with(source).await;
+    let (app, store, jwks_clock) = app_with_jwks_clock(source).await;
     seed_claim(&store, ".claims/pin.md", PIN_CLAIM).await;
 
     let token = sign_token(&TokenClaims::valid());
     let body = one_check_report("payments/libfoo-pin", "held", None);
-    let (status, json) = post_ingest(&app, Some(&token), &body).await;
 
+    // Request 1 (t=0): cold fetch returns empty; the refresh-on-miss is within the same
+    // window as that cold fetch, so it is suppressed and the kid is rejected as unknown.
+    let (status1, _json1) = post_ingest(&app, Some(&token), &body).await;
     assert_eq!(
-        status, 200,
-        "verification succeeds after the refresh finds the rotated key: {json}"
+        status1, 401,
+        "within the window, the unknown kid is rejected"
     );
-    // Exactly two fetches: the initial (empty) resolve miss, then the refresh.
+    assert_eq!(
+        fetches.fetch_count(),
+        1,
+        "only the cold fetch fired, not a refresh"
+    );
+
+    // Advance past the debounce window: the next miss is now allowed to refresh.
+    jwks_clock.advance_ms(TEST_DEBOUNCE_MS + 1);
+
+    // Request 2: the refresh is due, fetches the (now-published) signing key, verifies.
+    let (status2, json2) = post_ingest(&app, Some(&token), &body).await;
+    assert_eq!(
+        status2, 200,
+        "after the window, the refresh heals the rotation: {json2}"
+    );
     assert_eq!(
         fetches.fetch_count(),
         2,
-        "one initial fetch, one refresh on the unknown kid"
+        "exactly one refresh, after the window"
     );
 
-    // A second, unrelated verify (a redelivery) reuses the now-populated cache: no
-    // further fetch, since the kid is known.
-    let (status2, _json2) = post_ingest(&app, Some(&token), &body).await;
-    assert_eq!(status2, 200);
+    // A third verify (a redelivery) reuses the now-populated cache: no further fetch.
+    let (status3, _json3) = post_ingest(&app, Some(&token), &body).await;
+    assert_eq!(status3, 200);
+    assert_eq!(fetches.fetch_count(), 2, "a known kid needs no fetch");
+}
+
+#[tokio::test]
+async fn many_distinct_unknown_kids_within_the_window_trigger_at_most_one_fetch() {
+    // The amplification cap: `kid` is attacker-controlled and read before signature
+    // verification, so without a debounce each novel kid forces an outbound JWKS fetch.
+    // Here the source always publishes the signing key, so the *first* request's cold
+    // fetch populates the cache; then a flood of requests bearing distinct unknown kids
+    // (forged tokens) arrives within the window. None may trigger a further fetch — the
+    // total outbound fetch count stays capped, regardless of how many novel kids arrive.
+    let source = TestJwksSource::with_signing_key();
+    let fetches = source.clone();
+    let (app, store, _jwks_clock) = app_with_jwks_clock(source).await;
+    seed_claim(&store, ".claims/pin.md", PIN_CLAIM).await;
+
+    // One legitimate request populates the cache (one cold fetch).
+    let good = sign_token(&TokenClaims::valid());
+    let body = one_check_report("payments/libfoo-pin", "held", None);
+    let (ok, _) = post_ingest(&app, Some(&good), &body).await;
+    assert_eq!(ok, 200);
     assert_eq!(
         fetches.fetch_count(),
-        2,
-        "the cache is reused; no extra fetch for a known kid"
+        1,
+        "the cold fetch populated the cache"
+    );
+
+    // A flood of forged tokens, each with a distinct, never-published kid, all inside the
+    // debounce window. Each is rejected — and, crucially, none drives a new fetch.
+    for n in 0..50 {
+        let forged = sign_token_with_kid(&TokenClaims::valid(), &format!("attacker-kid-{n}"));
+        let (status, _json) = post_ingest(&app, Some(&forged), &body).await;
+        assert_eq!(status, 401, "each forged unknown-kid token is rejected");
+    }
+    assert_eq!(
+        fetches.fetch_count(),
+        1,
+        "50 distinct unknown kids in one window triggered no additional fetch — the \
+         amplification vector is capped"
     );
 }
 
 #[tokio::test]
-async fn an_unknown_kid_that_never_resolves_is_rejected_after_one_refresh() {
-    // The source only ever returns an empty set: the token's kid is unknown even after a
-    // refresh, so it is a rejection (a forgery, or a key rotated fully out) — not an
-    // infinite refresh loop. Signed with the real key, so only the kid-not-published
-    // condition rejects it.
+async fn an_unknown_kid_that_never_resolves_is_rejected() {
+    // The source only ever returns an empty set: the token's kid is unknown, so it is a
+    // rejection (a forgery, or a key rotated fully out), not an infinite refresh loop.
+    // The cold fetch fires once; the same-window refresh is suppressed by the debounce, so
+    // exactly one fetch happens and the token is rejected.
     let source = TestJwksSource::sequence_of_empty();
     let fetches = source.clone();
-    let (app, store) = app_with(source).await;
+    let (app, store, _jwks_clock) = app_with_jwks_clock(source).await;
     seed_claim(&store, ".claims/pin.md", PIN_CLAIM).await;
 
     let token = sign_token(&TokenClaims::valid());
@@ -369,8 +517,11 @@ async fn an_unknown_kid_that_never_resolves_is_rejected_after_one_refresh() {
     );
     assert_no_events(&store).await;
     assert_eq!(get_status(&app).await["rejection_count"], 1);
-    // One initial fetch plus exactly one refresh, then it gives up — no loop.
-    assert_eq!(fetches.fetch_count(), 2, "one refresh, then reject");
+    assert_eq!(
+        fetches.fetch_count(),
+        1,
+        "one cold fetch; the same-window refresh is capped"
+    );
 }
 
 /// Assert the ledger is empty — a rejected push appended nothing (invariant #4).

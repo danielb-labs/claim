@@ -81,18 +81,26 @@ anyhow = { workspace = true }
 # module for `JwkSet`/`Jwk` is always available.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 # The one HTTP client (HUB-IMPLEMENTATION.md §1.14): fetches the issuer's JWKS. rustls
-# (not the default native-tls) so the binary links no *system* OpenSSL — the single
-# static-binary story — with `webpki-roots` for a bundled CA trust store, so a stripped
-# container image needs no system certificate bundle to reach the JWKS endpoint. reqwest
-# 0.13's `rustls` feature carries the vendored, self-contained `aws-lc-rs` crypto backend
-# for the TLS handshake; that is a bundled library, not a system dependency, so the
-# no-system-OpenSSL goal holds (the JWT path itself stays pure-Rust via jsonwebtoken's
-# `rust_crypto`). Feature set is deliberately minimal: `rustls` + `webpki-roots` for
-# HTTPS and `json` to deserialize the JWKS response; no cookies, no blocking client, no
-# native-tls backend.
+# (not the default native-tls) so the binary links no *system* OpenSSL. Two honest
+# caveats to record for a "single static binary, drops into any runner" project:
+#   1. reqwest 0.13's `rustls` feature pulls `aws-lc-rs` (via `aws-lc-sys`) as rustls's
+#      default crypto provider. It is a vendored, self-contained crypto library — not a
+#      system dependency, so the no-system-OpenSSL goal holds — BUT `aws-lc-sys` builds C
+#      and assembly, so the hub build now requires a C toolchain and `cmake` on the build
+#      host. That is a real build-time cost, not glossed: a musl/static release build must
+#      have them. (The JWT verification path itself stays pure-Rust via jsonwebtoken's
+#      `rust_crypto`; only the TLS handshake uses aws-lc-rs.)
+#   2. With the default client builder, reqwest 0.13's `rustls` uses the *platform*
+#      certificate verifier (`rustls-platform-verifier`, the OS trust store) to validate
+#      the JWKS endpoint's cert — NOT a crate-bundled root set. So the container image
+#      ships CA certs (as the packaging note already states); a scratch image with no CA
+#      bundle would fail to verify GitHub's public cert. This is standard, correct
+#      behavior for reaching a public HTTPS endpoint; it is documented here so the trust
+#      anchor for the JWKS fetch is not mistaken for a bundled one.
+# Feature set is deliberately minimal: `rustls` for HTTPS and `json` to deserialize the
+# JWKS response; no cookies, no blocking client, no native-tls backend.
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
-    "webpki-roots",
     "json",
 ] }
 

@@ -125,20 +125,55 @@ fn empty_jwks() -> JwkSet {
     serde_json::from_value(json!({ "keys": [] })).expect("valid empty JWKS")
 }
 
+/// A controllable monotonic-ms clock for the JWKS refresh debounce, so a test drives the
+/// rate limit without sleeping (CLAUDE.md's determinism rule). Starts at 0; `advance_ms`
+/// moves it forward.
+#[derive(Clone, Default)]
+pub struct TestClock(Arc<std::sync::atomic::AtomicU64>);
+
+impl TestClock {
+    /// Move the clock forward by `ms`.
+    pub fn advance_ms(&self, ms: u64) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The clock closure the `JwksCache` reads "now" through.
+    fn monotonic(&self) -> claim_hub::oidc::MonotonicMillis {
+        let inner = self.0.clone();
+        Arc::new(move || inner.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// The debounce window the tests use, in ms. Small and explicit so a test can step over
+/// it with one `advance_ms`; the production default is 60s.
+pub const TEST_DEBOUNCE_MS: u64 = 1_000;
+
 /// Build the app over a fresh in-memory store, verifying tokens against `source`, with a
-/// fixed clock. Returns the app, the store (to seed the registry and read the ledger),
-/// and the shared fetch counter.
+/// fixed event clock. Returns the app and the store. The JWKS refresh clock starts at 0
+/// and is never advanced here — fine for the tests that verify one token (a single cold
+/// fetch, no debounced refresh); the refresh tests use [`app_with_jwks_clock`].
 pub async fn app_with(source: TestJwksSource) -> (axum::Router, SqliteStore) {
+    let (app, store, _clock) = app_with_jwks_clock(source).await;
+    (app, store)
+}
+
+/// Like [`app_with`] but also returns the [`TestClock`] driving the JWKS refresh
+/// debounce, so a refresh test advances it past [`TEST_DEBOUNCE_MS`] to allow the next
+/// refresh.
+pub async fn app_with_jwks_clock(source: TestJwksSource) -> (axum::Router, SqliteStore, TestClock) {
     let store = SqliteStore::open_in_memory().await.unwrap();
-    let verifier = OidcVerifier::new(
+    let jwks_clock = TestClock::default();
+    let cache =
+        claim_hub::oidc::JwksCache::with_debounce(source, TEST_DEBOUNCE_MS, jwks_clock.monotonic());
+    let verifier = OidcVerifier::with_cache(
         TEST_ISSUER,
         TEST_AUDIENCE,
         [TEST_REPOSITORY.to_owned()],
-        source,
+        cache,
     );
     let clock: Clock = Arc::new(ingest_instant);
     let state = AppState::new(store.clone(), Some(Arc::new(verifier))).with_clock(clock);
-    (claim_hub::build_app(state), store)
+    (claim_hub::build_app(state), store, jwks_clock)
 }
 
 /// The fixed ingest instant, parsed — the deterministic clock's value.
@@ -194,10 +229,44 @@ pub fn sign_token_with_wrong_key(claims: &TokenClaims) -> String {
     sign_token_with(claims, WRONG_KEY_PEM)
 }
 
-fn sign_token_with(claims: &TokenClaims, key_pem: &str) -> String {
+/// Sign a valid token with the fixture key but **omit** a named claim (`iss` or `aud`),
+/// for the missing-claim tests. A genuinely RS256-signed token whose only defect is the
+/// absent claim, so it proves the gate rejects a missing `iss`/`aud` rather than letting
+/// hollow pinning through.
+pub fn sign_token_omitting(claim: &str) -> String {
+    let mut body = valid_body();
+    body.as_object_mut()
+        .unwrap()
+        .remove(claim)
+        .unwrap_or_else(|| panic!("`{claim}` was expected in the token body to remove"));
+    sign_body(&body, SIGNING_KEY_PEM)
+}
+
+/// The claim body of a valid GitHub Actions-shaped token, anchored to real time.
+fn valid_body() -> serde_json::Value {
+    let claims = TokenClaims::valid();
     // Real `now`: a JWT's exp is checked against the system clock inside `jsonwebtoken`,
     // which is not injectable, so the token's validity window is the one thing anchored
     // to real time. The recorded event timestamp stays deterministic (the app clock).
+    let iat = Timestamp::now().as_second();
+    let exp = iat + claims.ttl_secs;
+    json!({
+        "iss": claims.issuer,
+        "aud": claims.audience,
+        "iat": iat,
+        "exp": exp,
+        "repository": claims.repository,
+        "repository_owner": "acme",
+        "workflow": "verify",
+        "ref": "refs/heads/main",
+        "sha": claims.sha,
+        "run_id": claims.run_id,
+        "actor": "octocat",
+        "job_workflow_ref": "acme/payments/.github/workflows/verify.yml@refs/heads/main",
+    })
+}
+
+fn sign_token_with(claims: &TokenClaims, key_pem: &str) -> String {
     let iat = Timestamp::now().as_second();
     let exp = iat + claims.ttl_secs;
     let body = json!({
@@ -214,10 +283,36 @@ fn sign_token_with(claims: &TokenClaims, key_pem: &str) -> String {
         "actor": "octocat",
         "job_workflow_ref": "acme/payments/.github/workflows/verify.yml@refs/heads/main",
     });
+    sign_body(&body, key_pem)
+}
+
+/// Sign a valid token but present it under a caller-chosen `kid` in the header — for the
+/// amplification-cap test, where a flood of forged tokens carries distinct, never-
+/// published kids. Signed with the real key so the *only* defect is the unknown kid.
+pub fn sign_token_with_kid(claims: &TokenClaims, kid: &str) -> String {
+    let iat = Timestamp::now().as_second();
+    let exp = iat + claims.ttl_secs;
+    let body = json!({
+        "iss": claims.issuer,
+        "aud": claims.audience,
+        "iat": iat,
+        "exp": exp,
+        "repository": claims.repository,
+        "sha": claims.sha,
+        "run_id": claims.run_id,
+    });
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(kid.to_owned());
+    let key = EncodingKey::from_rsa_pem(SIGNING_KEY_PEM.as_bytes()).expect("valid RSA PEM");
+    encode(&header, &body, &key).expect("sign token")
+}
+
+/// Sign an arbitrary claim body with `key_pem` under [`TEST_KID`], RS256.
+fn sign_body(body: &serde_json::Value, key_pem: &str) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(TEST_KID.to_owned());
     let key = EncodingKey::from_rsa_pem(key_pem.as_bytes()).expect("valid RSA PEM");
-    encode(&header, &body, &key).expect("sign token")
+    encode(&header, body, &key).expect("sign token")
 }
 
 /// Seed the registry with a claim parsed from `frontmatter`, so its check digests are
@@ -284,9 +379,11 @@ pub async fn get_status(app: &axum::Router) -> serde_json::Value {
 }
 
 /// A minimal one-check `claim check --json` report body for `claim_id`, with the given
-/// verdict and optional evidence — what a producer would POST.
+/// verdict and optional evidence — what a producer would POST. The sole check is
+/// declared index 0.
 pub fn one_check_report(claim_id: &str, verdict: &str, evidence: Option<&str>) -> String {
     let mut check = json!({
+        "index": 0,
         "verdict": verdict,
         "end": { "kind": "exited", "code": if verdict == "held" { 0 } else { 1 } },
         "detail": "exit",

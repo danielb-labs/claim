@@ -132,11 +132,16 @@ proven by its OIDC token — and records that verified identity verbatim beside 
 verdict, so the trust judgment stays re-derivable. In order, it verifies:
 
 1. **Signature** against the issuer's published JWKS (fetched once and cached;
-   refreshed automatically when a token names a key id the cache does not yet hold, so
-   key rotation heals with no redeploy).
-2. **`iss`** is the GitHub Actions issuer.
+   refreshed when a token names a key id the cache does not yet hold, so key rotation
+   heals with no redeploy). That refresh is **rate-limited** — the key id is
+   attacker-controlled and read before the signature is checked, so an un-throttled
+   fetch-per-unknown-key would let a flood of forged tokens drive the hub's outbound
+   request rate; a refresh fires at most once per short window regardless.
+2. **`iss`** is present *and* the GitHub Actions issuer. A token that omits `iss`, `aud`,
+   or `exp` is rejected outright — the issuer/audience pinning is never hollow.
 3. **`aud`** is the hub's configured `audience` — this is what stops a token minted
-   for another service from being replayed here.
+   for another service from being replayed here. An empty configured `audience` is
+   refused at boot, so the gate never stands up with vacuous audience pinning.
 4. **`exp`** is in the future.
 5. **`repository`** is one of the configured connected `repositories`.
 

@@ -106,11 +106,26 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the JWKS HTTP source cannot be constructed.
+/// Returns an error if the JWKS HTTP source cannot be constructed, or if the configured
+/// `audience` (or the issuer) is empty — an empty audience would make audience pinning
+/// vacuous, so it is refused loudly at boot rather than silently accepting any token's
+/// `aud`.
 fn build_verifier(config: &Config) -> anyhow::Result<Option<oidc::SharedVerifier>> {
     let Some(oidc_config) = &config.oidc else {
         return Ok(None);
     };
+    // An empty audience or issuer would hollow out the pinning `verify` relies on, so
+    // refuse it at boot. The issuer is a compile-time constant (checked as belt-and-
+    // suspenders against a future edit), the audience is operator-supplied config.
+    anyhow::ensure!(
+        !oidc::GITHUB_ACTIONS_ISSUER.is_empty(),
+        "the OIDC issuer is empty; the ingest gate cannot pin the issuer"
+    );
+    anyhow::ensure!(
+        !oidc_config.audience.trim().is_empty(),
+        "config `[oidc].audience` is empty; set it to the hub's identifier so the ingest \
+         gate can pin a token's audience (an empty audience would accept any token's `aud`)"
+    );
     let source = oidc::HttpJwksSource::new(oidc::GITHUB_ACTIONS_JWKS_URL)
         .map_err(|e| anyhow::anyhow!("building the JWKS HTTP client: {e}"))?;
     // The connected-store repositories a token's `repository` claim must be one of. The
@@ -154,3 +169,58 @@ pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
 /// `hub.toml` in the working directory: the self-host default, so `claim-hub` in a
 /// data directory finds its config with no argument.
 pub const DEFAULT_CONFIG_PATH: &str = "hub.toml";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `SharedVerifier` (an `Arc<dyn TokenVerifier>`) is not `Debug`, so these assert on
+    // the outcome via `match`/`is_ok` rather than `unwrap`/`unwrap_err`, which would need
+    // the `Ok` type to be `Debug`.
+
+    #[test]
+    fn no_oidc_section_builds_no_verifier() {
+        // A hub with no `[oidc]` config has no ingest gate, so no verifier — the route
+        // is unmounted, reads still serve.
+        let config = Config::from_toml("").unwrap();
+        match build_verifier(&config) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("no [oidc] should yield no verifier"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_valid_oidc_section_builds_a_verifier() {
+        let config = Config::from_toml(
+            "[oidc]\naudience = \"https://hub.acme.example\"\nrepositories = [\"acme/payments\"]\n",
+        )
+        .unwrap();
+        match build_verifier(&config) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("a valid [oidc] should yield a verifier"),
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_audience_fails_the_boot_loudly() {
+        // An empty audience would make audience pinning vacuous (any token's `aud` would
+        // pass), so boot refuses it naming the field, rather than standing up a gate that
+        // accepts anything.
+        let config = Config::from_toml("[oidc]\naudience = \"\"\n").unwrap();
+        let Err(err) = build_verifier(&config) else {
+            panic!("an empty audience must fail the boot");
+        };
+        assert!(
+            err.to_string().contains("audience"),
+            "the boot error names the empty audience: {err}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_audience_is_also_refused() {
+        let config = Config::from_toml("[oidc]\naudience = \"   \"\n").unwrap();
+        assert!(build_verifier(&config).is_err());
+    }
+}

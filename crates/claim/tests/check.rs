@@ -393,6 +393,10 @@ fn check_json_shape_is_stable() {
     let claims = v["claims"].as_array().unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0]["id"], "pin");
+    assert_eq!(
+        claims[0]["checks"][0]["index"], 0,
+        "the sole check's declared index"
+    );
     assert_eq!(claims[0]["checks"][0]["verdict"], "held");
     // The structured ProcessEnd is present alongside the human `detail`, so an
     // agent branches on structure, not prose.
@@ -632,10 +636,20 @@ fn a_skip_does_not_mask_a_sibling_checks_drift() {
         checks[0]["verdict"], "drifted",
         "the sibling drift surfaced"
     );
+    // The surviving check is at array offset 0 but its *declared* index is 1: the skip
+    // that preceded it (declared index 0) compacted it out of `checks`. A consumer
+    // keying a verdict on a check's identity (the hub) must read this declared index,
+    // not the array offset — filing the drift under check 0's identity would be the
+    // wrong-check failure #18 exists to prevent.
     assert_eq!(
-        claim["skipped"].as_array().unwrap().len(),
-        1,
-        "the skipped check is reported separately"
+        checks[0]["index"], 1,
+        "the survivor reports declared index 1, not array offset 0"
+    );
+    let skipped = claim["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "the skipped check is reported separately");
+    assert_eq!(
+        skipped[0]["index"], 0,
+        "the skipped check is declared index 0"
     );
     assert_eq!(v["exit"], 1, "the overall exit reflects the sibling drift");
 }

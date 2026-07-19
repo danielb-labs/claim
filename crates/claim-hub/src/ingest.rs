@@ -218,12 +218,19 @@ enum BuildError {
 /// Turn a validated report and a verified producer into the events to append.
 ///
 /// One event per check result across every claim. For each, the check's *identity* — the
-/// digest the ledger keys on — is read from the registry by (store, claim, index), since
-/// the report carries only the positional index (issue #18). A claim the registry has not
-/// synced, or a check index past what the registry holds, is a [`BuildError::Rejected`]:
-/// the hub refuses to fabricate a check identity, because a wrong digest would file a
-/// verdict under the wrong check (invariant #6). Evidence is capped here, and the
-/// verified producer/store/commit are stamped onto every event.
+/// digest the ledger keys on — is read from the registry by (store, claim, **declared
+/// index**), where the declared index is the `index` the CLI stamped onto each result
+/// (issue #18). It is emphatically **not** the result's position in the report's `checks`
+/// array: that array is compacted past skipped checks, so for a claim `[A (skipped), B]`
+/// the array holds only `B` at offset 0 while `B`'s declared index is 1 — keying by
+/// offset would file `B`'s verdict under `A`'s identity, the exact wrong-identity failure
+/// #18 exists to prevent. The digest is always computed hub-side from the registry; only
+/// the index is taken from the wire.
+///
+/// A claim the registry has not synced, or a declared index past what the registry holds,
+/// is a [`BuildError::Rejected`]: the hub refuses to fabricate a check identity, because a
+/// wrong digest would file a verdict under the wrong check (invariant #6). Evidence is
+/// capped here, and the verified producer/store/commit are stamped onto every event.
 ///
 /// Skipped checks in the report carry no verdict (a skip is not a pass), so they produce
 /// no event — they are surfaced by the CLI, not ingested as telemetry.
@@ -251,7 +258,11 @@ async fn build_events(
             ))
         })?;
 
-        for (index, check) in claim.checks.iter().enumerate() {
+        for check in &claim.checks {
+            // The check's *declared* index, carried on the result — never its position in
+            // this (compacted) array. This is the load-bearing fix for skip-then-run
+            // claims (issue #18).
+            let index = check.index;
             let digest = match state.store.check_digest(store, &claim_id, index).await {
                 Ok(Some(digest)) => digest,
                 Ok(None) => {

@@ -148,7 +148,87 @@ fn real_claim_check_json_parses_into_the_hub_wire_types() {
         .find(|c| c.id == "pin")
         .expect("the pin claim is in the report");
     assert_eq!(claim_result.checks.len(), 1);
+    assert_eq!(
+        claim_result.checks[0].index, 0,
+        "the sole check's declared index"
+    );
     assert_eq!(claim_result.checks[0].verdict, Verdict::Held);
     // The process end carried its discriminator through the permissive wire type.
     assert_eq!(claim_result.checks[0].end.kind, "exited");
+}
+
+#[test]
+fn a_skip_before_a_run_check_carries_the_surviving_checks_declared_index() {
+    // The load-bearing end-to-end proof for issue #18: when a skip precedes a run
+    // check, the CLI compacts the skipped check out of `checks`, so the surviving
+    // check sits at array offset 0 but must report declared index 1 — which is what
+    // the hub keys its digest on. This runs the real binary and reads its real
+    // `--json`, so it fails if the CLI ever stops emitting the declared index.
+    let store = skip_then_run_store();
+
+    let output = claim(store.path())
+        .args(["check", "--json"])
+        .output()
+        .expect("run claim check --json");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 report");
+
+    let report = CheckReport::from_json(stdout.as_bytes())
+        .unwrap_or_else(|e| panic!("parse the CLI's --json: {e}\n{stdout}"));
+    let claim_result = report
+        .claims
+        .iter()
+        .find(|c| c.id == "mixed")
+        .expect("the mixed claim is in the report");
+
+    // The skipped check (declared index 0) is out of `checks` and in `skipped`.
+    assert_eq!(
+        claim_result.checks.len(),
+        1,
+        "only the run check bears a verdict"
+    );
+    assert_eq!(
+        claim_result.skipped.len(),
+        1,
+        "the skipped check is reported separately"
+    );
+    assert_eq!(
+        claim_result.skipped[0].index, 0,
+        "the skip is declared check 0"
+    );
+    // The surviving check is at array offset 0 but declared index 1 — the whole point.
+    assert_eq!(
+        claim_result.checks[0].index, 1,
+        "the run check's declared index is 1, not its array offset 0"
+    );
+    assert_eq!(claim_result.checks[0].verdict, Verdict::Drifted);
+}
+
+/// A store with one claim whose first check is skipped and whose second check drifts,
+/// so `claim check --json` compacts the skipped check out and the survivor's declared
+/// index (1) differs from its array offset (0).
+fn skip_then_run_store() -> TempDir {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path();
+
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Contract Test"]);
+    git(root, &["config", "user.email", "contract@example.com"]);
+    std::fs::write(root.join("seed"), "x\n").unwrap();
+    git(root, &["add", "seed"]);
+    git(root, &["commit", "-q", "-m", "initial"]);
+
+    let init = claim(root).arg("init").output().expect("run claim init");
+    assert!(init.status.success(), "claim init failed");
+
+    std::fs::create_dir_all(root.join(".claims")).unwrap();
+    // First check is skipped (a declared skip with a reason); second check drifts
+    // (`false` exits 1). The report's `checks` will hold only the second, at offset 0,
+    // with declared index 1.
+    std::fs::write(
+        root.join(".claims/mixed.md"),
+        "---\nid: mixed\nchecks:\n  - kind: cmd\n    run: \"true\"\n    skip:\n      reason: parked\n  - kind: cmd\n    run: \"false\"\n---\nOne skipped, one drifts.\n",
+    )
+    .unwrap();
+
+    dir
 }

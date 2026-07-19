@@ -68,12 +68,16 @@ pub struct ClaimResult {
     pub id: String,
     /// The claim file's path relative to the store root.
     pub file: String,
-    /// Each check's verdict, in the claim's declared order. The positional index
-    /// into this list is the `check.index` the hub records; the check's *identity*
-    /// is the digest the hub computes from the registry definition, not from here.
+    /// The verdict-bearing check results — **compacted**, not one per declared check: a
+    /// check whose skip was in force is omitted here and appears in
+    /// [`skipped`](ClaimResult::skipped) instead. So a result's position in this array is
+    /// **not** the check's declared position once a skip precedes a run check. The
+    /// declared position each result belongs to is carried on the result itself
+    /// ([`CheckResult::index`]); the hub keys a verdict's check identity by that declared
+    /// index against the registry, never by the array offset.
     pub checks: Vec<CheckResult>,
     /// Checks whose declared skip suppressed this run: reported, never a pass, and
-    /// carrying no verdict.
+    /// carrying no verdict. Each carries its own declared [`SkippedCheck::index`].
     pub skipped: Vec<SkippedCheck>,
     /// Each `supports` target's resolution.
     pub supports: Vec<SupportResult>,
@@ -88,6 +92,15 @@ pub struct ClaimResult {
 /// interpreted two ways. `end` is captured permissively (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CheckResult {
+    /// The check's zero-based position in the claim's **declared** check list — the key
+    /// the hub resolves a check's content digest by (issue #18). It is deliberately
+    /// **required**, not `#[serde(default)]`: the array these results sit in is compacted
+    /// past skipped checks, so a missing index is not a benign forward-compat gap but an
+    /// unkeyable verdict. An older CLI that does not emit `index` (its report predates the
+    /// field) is rejected naming the field — a loud refusal, never a verdict silently
+    /// filed under check 0's identity (invariant #6, #18). This is the one required field
+    /// the wire type gained; the module docs' forward-compat stance holds for every other.
+    pub index: usize,
     /// The verdict the check reported.
     pub verdict: Verdict,
     /// The structured process end, preserved verbatim as a tagged value. Not
@@ -133,6 +146,13 @@ pub struct ProcessEndWire {
 /// silent, and carrying no verdict — a skip is not a pass.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SkippedCheck {
+    /// The check's zero-based position in the claim's **declared** check list. Unlike
+    /// [`CheckResult::index`], this is `#[serde(default)]`: a skipped check produces no
+    /// event, so the ingest gate never keys anything on it, and an older CLI's report
+    /// that omits it must still parse (invariant #6). It is carried for a surface that
+    /// wants to name exactly which declared check was skipped.
+    #[serde(default)]
+    pub index: usize,
     /// The author's justification, from the claim's `skip.reason`.
     pub reason: String,
     /// The skip's expiry, if it declared one (RFC 3339). Absent for an indefinite
@@ -202,7 +222,7 @@ mod tests {
               "id": "pin",
               "file": ".claims/pin.md",
               "checks": [
-                { "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }
+                { "index": 0, "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }
               ],
               "skipped": [],
               "supports": [],
@@ -219,6 +239,7 @@ mod tests {
         assert_eq!(report.exit, 0);
         assert_eq!(report.claims.len(), 1);
         let check = &report.claims[0].checks[0];
+        assert_eq!(check.index, 0);
         assert_eq!(check.verdict, Verdict::Held);
         assert_eq!(check.end.kind, "exited");
         assert_eq!(check.end.payload["code"], serde_json::json!(0));
@@ -334,12 +355,55 @@ mod tests {
           "status": "ok", "exit": 1, "checked": 1, "ran": 1, "skipped": 0,
           "claims": [{
             "id": "pin", "file": ".claims/pin.md",
-            "checks": [{ "verdict": "drifted", "end": { "kind": "exited", "code": 1 }, "detail": "exit 1" }],
+            "checks": [{ "index": 0, "verdict": "drifted", "end": { "kind": "exited", "code": 1 }, "detail": "exit 1" }],
             "skipped": [], "supports": [], "exit": 1
           }],
           "errors": []
         }"#;
         let report = CheckReport::from_json(json.as_bytes()).unwrap();
         assert_eq!(report.claims[0].checks[0].verdict, Verdict::Drifted);
+    }
+
+    #[test]
+    fn a_check_result_carries_its_declared_index() {
+        // The declared index is what the hub keys a check's identity on, so it must
+        // survive parsing. A compacted `checks` array from a skip-then-run claim: the
+        // surviving result carries declared index 1, not its array offset 0.
+        let json = r#"{
+          "status": "ok", "exit": 1, "checked": 1, "ran": 1, "skipped": 1,
+          "claims": [{
+            "id": "pin", "file": ".claims/pin.md",
+            "checks": [{ "index": 1, "verdict": "drifted", "end": { "kind": "exited", "code": 1 }, "detail": "exit 1" }],
+            "skipped": [{ "index": 0, "reason": "parked" }], "supports": [], "exit": 1
+          }],
+          "errors": []
+        }"#;
+        let report = CheckReport::from_json(json.as_bytes()).unwrap();
+        assert_eq!(
+            report.claims[0].checks[0].index, 1,
+            "the surviving check's declared index is 1, not its array offset 0"
+        );
+        assert_eq!(report.claims[0].skipped[0].index, 0);
+    }
+
+    #[test]
+    fn a_check_result_missing_its_index_is_rejected() {
+        // `index` is the one required field the wire CheckResult gained: it is not
+        // `#[serde(default)]`, so a report from a CLI predating the field is rejected
+        // rather than have every check silently key to index 0 (invariant #6, #18).
+        let json = r#"{
+          "status": "ok", "exit": 0, "checked": 1, "ran": 1, "skipped": 0,
+          "claims": [{
+            "id": "pin", "file": ".claims/pin.md",
+            "checks": [{ "verdict": "held", "end": { "kind": "exited", "code": 0 }, "detail": "exit 0" }],
+            "skipped": [], "supports": [], "exit": 0
+          }],
+          "errors": []
+        }"#;
+        let err = CheckReport::from_json(json.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("index"),
+            "a check with no declared index is rejected naming it: {err}"
+        );
     }
 }
