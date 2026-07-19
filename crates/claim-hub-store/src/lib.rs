@@ -21,18 +21,29 @@
 //! The [`Registry`] is derived data: [`Registry::replace_store`] wipes a store's
 //! snapshot and re-inserts it (a claim absent at the new tip is retired), and a
 //! version counter advances per sync so the deriver's memo can key on it. The git
-//! mirror and `claim-core` parsing that *feed* a snapshot are a later item (hub-05);
-//! this crate stores what it is given.
+//! mirror and `claim-core` parsing that *feed* a snapshot live in [`sync`] (hub-05):
+//! [`sync::sync_store`] mirrors a connected store, reads its tip through
+//! `claim-store`'s loader plus the embedded-block grammar, snapshots the registry, and
+//! records malformed files as [`SyncFinding`]s (invariant #6 — a nag, never a silent
+//! skip). [`sync::spawn_interval_poll`] is the v1 interval-poll trigger over that.
 //!
 //! The one implementation is [`SqliteStore`], over a single WAL-mode SQLite file —
-//! the data-ownership invariant made physical (export is `cp`, delete is `rm`).
+//! the data-ownership invariant made physical (export is `cp`, delete is `rm`) —
+//! implementing [`Ledger`], [`Registry`], and [`Findings`].
 
 pub mod error;
+pub mod findings;
 pub mod ledger;
 pub mod registry;
 pub mod sqlite;
+pub mod sync;
 
 pub use error::{Result, StoreError};
+pub use findings::{Findings, SyncFinding};
 pub use ledger::{Appended, Ledger, Position, StoredEvent};
 pub use registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 pub use sqlite::{SqliteStore, MIGRATOR};
+pub use sync::{
+    spawn_interval_poll, sync_store, ConnectedStore, SyncOutcome, DEFAULT_BRANCH,
+    EMBEDDED_HOST_FILES,
+};

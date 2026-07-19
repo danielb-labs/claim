@@ -15,6 +15,11 @@ claim-hub-core = { path = "../claim-hub-core" }
 # The registry keys on `ClaimId` and the ledger columns are typed against the
 # `Verdict`/`Timestamp` re-exports; one set of domain types across the workspace.
 claim-core = { path = "../claim-core" }
+# Registry sync reuses `claim-store`'s store discovery and claim loading over a tip
+# checkout (`discover` + `Store::load_all`) rather than reimplementing the `.claims/`
+# walk and the parse-error-as-finding degradation — one grammar and one loader across
+# every front door (HUB-IMPLEMENTATION.md §1.6). The sync module is the only user.
+claim-store = { path = "../claim-store" }
 # Async SQL with compile-time-checked queries against the actual schema and
 # migrations embedded in the binary via `sqlx::migrate!`, so the hub creates and
 # upgrades its own database from an empty file with no external tooling. One crate
@@ -32,9 +37,17 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
 ] }
 # The async runtime the store's `async` trait methods run on, and axum/rmcp's shared
-# substrate; already justified for the workspace in item 07. Only the runtime and
-# the `#[tokio::test]`/`#[tokio::main]` macros are needed here.
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# substrate; already justified for the workspace in item 07. `rt` is the runtime and
+# `macros` the `#[tokio::test]`/`#[tokio::main]` macros; `time` drives the registry
+# sync's interval-poll trigger (`tokio::time::interval`, HUB-IMPLEMENTATION.md §1.6);
+# `rt-multi-thread` lets `spawn_blocking` run a sync's blocking git + parse work off
+# the reactor without stalling it.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
 # The enum<->TEXT column conversions are generic over serde's `Serialize`/
 # `DeserializeOwned`, so the stored string form of a `Verdict`/`EventKind` is the
 # shared type's own JSON spelling and cannot drift from it.
@@ -52,5 +65,12 @@ thiserror = { workspace = true }
 # fresh temp path, exercises the store, and drops it — no shared state, no network.
 # Part of the approved integration-test stack (CLAUDE.md).
 tempfile = "3"
-# The trait methods are async; the tests drive them on a real runtime.
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# The trait methods are async; the tests drive them on a real runtime. `time` and
+# `rt-multi-thread` let the sync tests exercise the interval-poll driver and its
+# `spawn_blocking` git work; `macros` is `#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
