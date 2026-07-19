@@ -6,7 +6,7 @@ checks:
 supports:
   - docs/index.html
   - crates/claim/src/cli.rs
-  - "CLAUDE.md#same branch"
+  - "CLAUDE.md#Docs ship with the behavior they describe"
 hub:
   max-age: 180d
 ---

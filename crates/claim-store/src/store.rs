@@ -3,9 +3,9 @@
 //! A store is a `.claims/` directory holding claim files (`.claims/**/*.md`).
 //! There is no committed verdict log: a verdict is telemetry the hub stores, not
 //! source (see `docs/design/CLI-HUB-BOUNDARY.md`), so the store holds only the
-//! claims themselves. This module owns the questions every consumer — the CLI's
-//! read/verify verbs — shares, so they are answered in exactly one place, ready to
-//! back another consumer unchanged:
+//! claims themselves. This module owns the questions the CLI's read/verify verbs
+//! share — where the store is, what its claims are — so they are answered in exactly
+//! one place and no verb can drift from another:
 //!
 //! - **Where is the store?** [`discover`] walks up from a starting directory to
 //!   the nearest ancestor containing a `.claims/`, the same way git finds `.git/`.
@@ -210,7 +210,7 @@ impl Store {
 ///
 /// Returns [`StoreError::NoStore`] when no `.claims/` is found within the
 /// boundary. That variant is the single, machine-recognizable "run `claim init`"
-/// signal both binaries branch on — the classification lives here, at the one
+/// signal the CLI branches on — the classification lives here, at the one
 /// discovery point, not re-derived per consumer.
 pub fn discover(start: &Path) -> Result<Store, StoreError> {
     for dir in start.ancestors() {
