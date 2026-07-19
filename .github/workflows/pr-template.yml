@@ -1,0 +1,40 @@
+# Enforce the PR template. GitHub only pre-fills .github/PULL_REQUEST_TEMPLATE.md; it
+# never enforces it, and a PR opened with an explicit body (`gh pr create --body ...`)
+# bypasses it silently. This lane closes that gap: it writes the PR body to a file and
+# runs scripts/check-pr-body.sh, which fails (non-zero) when the body drops a template
+# section, naming each missing one in the log.
+#
+# The check's stable name is `pr-template` (job id below), so it can be added to main's
+# branch ruleset as a required check.
+
+name: pr-template
+
+# Re-run whenever the body could change: on open, on an edit to the body, on reopen, and
+# on new pushes (synchronize) so a required check stays present on every head commit.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+# Least privilege: read the checked-out tree to reach the script and the template. No
+# write scope — the check only reads the body GitHub already gives it in the event.
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-template-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Write the body to a file with the env-var quoted so an empty body yields an empty
+      # file (not a crash) and a body with shell metacharacters is never interpreted. The
+      # script treats an empty body as a fail (no section headers -> exit 1), never a pass.
+      - name: Check PR body against the template
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          ./scripts/check-pr-body.sh "$RUNNER_TEMP/pr-body.md"
