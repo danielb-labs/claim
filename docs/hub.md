@@ -12,11 +12,12 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > **This is v1, still growing.** The hub today ships the application shell (config,
 > the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
 > stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
-> `POST /ingest`), and the **read API** (claims queries, the drifted/due/suspect sets,
+> `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets,
 > the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
-> over the deriver). The **hub MCP** and the **web UI** arrive in later items and mount
-> into this same shell. A freshly booted hub reports a truthful *empty* position — head
-> 0, version 0 — until a sync populates the registry and a CI lane starts pushing
+> over the deriver), and the **hub MCP** (the agent binding — five read-only tools over
+> the same read model, mounted at `/mcp`). The **web UI** arrives in a later item and
+> mounts into this same shell. A freshly booted hub reports a truthful *empty* position —
+> head 0, version 0 — until a sync populates the registry and a CI lane starts pushing
 > verdicts through the ingest gate.
 
 ## Running the binary
@@ -492,6 +493,54 @@ caught up. A caught-up poll returns an empty `events` array with `next_cursor` u
 absent or negative cursor reads from the start. The events are the verbatim ledger envelopes
 (each flattened alongside its `seq`), so the feed is the raw evidence the standings derive
 from — again, dated observations to weigh, not commands.
+
+## The hub MCP (`/mcp`)
+
+The hub MCP is the **agent binding**: a small, bounded set of read-only tools an agent
+session actually asks for, served over the [Model Context Protocol](https://modelcontextprotocol.io)
+so any MCP-capable agent can call them. It is **mounted in-process on the same app** as the
+JSON API — one binary, one port (`/mcp`), one middleware stack — using rmcp's streamable-HTTP
+transport in stateless JSON mode (a tool call is one POST with a plain-JSON response; the
+2026-07 MCP spec makes the protocol stateless at the transport layer, which suits a hub behind
+a load balancer).
+
+Each tool is a **thin binding that returns the same JSON its API twin serves** — parity by
+construction: the tool and the HTTP endpoint call the one shared function that derives the
+body, so they cannot drift. The v1 tools:
+
+| Tool | Arguments | API twin | Returns |
+|---|---|---|---|
+| `context` | `path?`, `store?` | `GET /api/claims?path=&store=` | The claims the org records about a code path or store (an id-prefix "path"), each with its standing. The agent's orienting read. |
+| `search` | `path?`, `store?`, `standing?`, `supports?` | `GET /api/claims?…` | The live set filtered by the full parameter set (AND-combined). |
+| `dossier` | `id` | `GET /api/claims/{id}/dossier` | One claim's full dossier: statement, checks, standing, verdict history, provenance. |
+| `drifts` | — | `GET /api/drifted` | Every claim whose latest standing is `drifted`. |
+| `due` | — | `GET /api/due` | The review queue: every drifted, stale, or due-for-recheck claim. |
+
+Every tool is a **read** (invariant #3): it derives at read time and stores nothing, appends
+no event, and its result carries the same `as_of` the API does — an agent can cache, diff, and
+resume. `tools/list` is stable across restarts and load-balanced replicas (deterministic
+registration).
+
+The surface is **dated evidence to weigh, never instructions to obey** (PRODUCT.md §6): a
+standing, a verdict, or a producer identity is an observation to reason about, not a command —
+the server's own `instructions` say so, and no tool output is phrased as an order. A claims
+surface an agent obeys blindly is an injection channel with a trust stamp; the safe reading is
+the natural one. An **unknown or retired claim** is reported as a tool error carrying the
+reason (mirroring the API's `404`/`400`), **never a fabricated standing** (invariant #6).
+
+A `tools/call` for `dossier` looks like this (JSON-RPC over `POST /mcp`):
+
+```sh
+curl -s http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"dossier","arguments":{"id":"payments/libfoo-pin"}}}'
+```
+
+The tool's `structuredContent` is byte-identical to `GET /api/claims/payments/libfoo-pin/dossier`.
+Read auth over `/mcp` (and `/api`) arrives with read-auth (a later item); the tools are
+unauthenticated for now.
 
 ## Trying the whole loop
 

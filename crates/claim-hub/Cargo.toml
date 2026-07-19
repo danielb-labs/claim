@@ -103,6 +103,28 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",
 ] }
+# The official MCP Rust SDK (HUB-IMPLEMENTATION.md §1.10/§1.14, hub-09): owns the MCP
+# protocol framing and the streamable-HTTP transport, mounted as a tower service into the
+# existing axum router — so the JSON API and the hub MCP are one process on one port and one
+# middleware stack (HUB.md §5's "one substrate"). Feature set is minimal and deliberate:
+# `server` + `macros` (the `#[tool_router]`/`#[tool]` derivation the tools use),
+# `transport-streamable-http-server` (the axum-mountable `StreamableHttpService`, run in
+# stateless mode to suit a hub behind a plain load balancer per the 2026-07 MCP spec), and
+# `schemars` (rmcp derives each tool's input schema from the request type's `JsonSchema`).
+# No client, no auth, no child-process transport — the tools are thin read bindings over the
+# API's shared value functions, so nothing else of rmcp is pulled in.
+rmcp = { version = "2.2", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "schemars",
+] }
+# rmcp derives each MCP tool's input schema from its request type's `JsonSchema` impl
+# (HUB-IMPLEMENTATION.md §1.14): the tool argument structs `#[derive(JsonSchema)]`, and the
+# derived schema is what `tools/list` publishes and the snapshot tests pin. Named directly so
+# the derive is in scope; the version matches the one rmcp re-exports, so one `schemars` is in
+# the tree.
+schemars = "1"
 
 [dev-dependencies]
 # Drive the assembled axum app in-process via `tower::ServiceExt::oneshot` — no bound
