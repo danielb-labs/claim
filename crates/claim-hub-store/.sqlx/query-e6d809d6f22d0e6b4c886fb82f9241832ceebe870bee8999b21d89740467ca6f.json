@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT seq AS \"seq!: i64\" FROM events\n            WHERE dedup_run = ? AND claim_id = ? AND check_digest = ?\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e6d809d6f22d0e6b4c886fb82f9241832ceebe870bee8999b21d89740467ca6f"
+}

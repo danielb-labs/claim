@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO events\n                (kind, claim_id, check_index, check_digest, verdict,\n                 evidence, \"commit\", store, producer, reported_at, dedup_run)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ON CONFLICT (dedup_run, claim_id, check_digest) DO NOTHING\n            RETURNING seq AS \"seq!: i64\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e3084a2b3319d57c912325a6c639b70e7c8accff16b4e4d9a5e8ee6310e3234d"
+}

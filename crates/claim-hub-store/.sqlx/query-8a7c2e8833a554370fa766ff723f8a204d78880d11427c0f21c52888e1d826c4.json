@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM claims_at_tip WHERE store = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "8a7c2e8833a554370fa766ff723f8a204d78880d11427c0f21c52888e1d826c4"
+}
