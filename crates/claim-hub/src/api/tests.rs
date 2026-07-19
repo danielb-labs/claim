@@ -471,6 +471,97 @@ async fn the_suspect_set_is_empty_until_the_propagation_rule_lands() {
     assert_eq!(json["as_of"]["clock"], READ_NOW);
 }
 
+// ---- GET /api/skips (the ranked skip queue) ----
+
+/// A claim with two skipped `cmd` checks — one lapsed as of `READ_NOW`, one not — plus a
+/// second store's claim with an indefinite skip, so the ranking spans stores and orders
+/// lapsed → nearer-expiry → indefinite.
+async fn seed_skip_corpus(store: &SqliteStore) {
+    seed(
+        store,
+        PAYMENTS,
+        ".claims/parked.md",
+        "id: payments/parked\nchecks:\n  \
+         - kind: cmd\n    run: \"a\"\n    \
+         skip:\n      reason: lapsed one\n      until: 2026-01-01\n  \
+         - kind: cmd\n    run: \"b\"\n    \
+         skip:\n      reason: not-yet-lapsed one\n      until: 2027-06-01",
+    )
+    .await;
+    seed(
+        store,
+        BILLING,
+        ".claims/muted.md",
+        "id: billing/muted\nchecks:\n  \
+         - kind: cmd\n    run: \"c\"\n    skip:\n      reason: indefinite one",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_skips_set_is_ranked_lapsed_first_then_by_until() {
+    // The ranking: a lapsed `until` outranks a nearer un-lapsed one, and an indefinite skip
+    // sorts last — the projection's whole rule, over the store's real persisted skips.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_skip_corpus(&store).await;
+    let (status, json) = get(&app(store), "/api/skips").await;
+    assert_eq!(status, StatusCode::OK);
+    let skips = json["skips"].as_array().unwrap();
+    assert_eq!(skips.len(), 3, "three skips across two stores: {json}");
+    // Lapsed first (its until has passed READ_NOW), then the not-yet-lapsed bounded skip,
+    // then the indefinite one.
+    assert_eq!(skips[0]["reason"], "lapsed one");
+    assert_eq!(skips[0]["lapsed"], true);
+    assert_eq!(skips[1]["reason"], "not-yet-lapsed one");
+    assert_eq!(skips[1]["lapsed"], false);
+    assert_eq!(skips[2]["reason"], "indefinite one");
+    assert_eq!(skips[2]["lapsed"], false);
+    // The indefinite skip has no `until` field (omitted, not null).
+    assert!(
+        skips[2].get("until").is_none(),
+        "an indefinite skip omits until: {json}"
+    );
+    assert_eq!(json["as_of"]["clock"], READ_NOW, "carries its as-of");
+}
+
+#[tokio::test]
+async fn an_empty_skip_set_is_an_empty_array_not_a_fabricated_value() {
+    // A store with no skips returns an honest empty array with a truthful as-of, never a
+    // fabricated entry (invariant #6).
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_corpus(&store).await; // no skips in the filter corpus
+    let (status, json) = get(&app(store), "/api/skips").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["skips"].as_array().unwrap().len(), 0);
+    assert_eq!(json["as_of"]["clock"], READ_NOW);
+}
+
+#[tokio::test]
+async fn a_skip_never_changes_a_claims_standing() {
+    // Invariant #4: a skip is queue data, not a verdict. A claim whose only checks are
+    // skipped derives `stale` (never verified), and reading /api/skips does not fold the
+    // skip into the standing — the standing at /api/claims is exactly what it would be
+    // without the skip-ranking surface.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_skip_corpus(&store).await;
+    let app = app(store);
+    // The skip surface lists the skips.
+    let (_s, skips) = get(&app, "/api/skips").await;
+    assert_eq!(skips["skips"].as_array().unwrap().len(), 3);
+    // The standing surface reads the all-skipped claim as stale, never verified — the skip
+    // did not manufacture a green.
+    let (status, standing) = get(&app, "/api/claims/payments/parked").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        standing["standing"], "stale",
+        "an all-skipped claim is stale, never verified: {standing}"
+    );
+    assert!(
+        standing.get("verified_as_of").is_none_or(|v| v.is_null()),
+        "no fabricated verified-as-of: {standing}"
+    );
+}
+
 // ---- The dossier ----
 
 #[tokio::test]
@@ -1124,5 +1215,15 @@ async fn snapshot_drifted_empty_set() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     seed_snapshot_corpus(&store).await;
     let (_status, json) = get(&app(store), "/api/drifted").await;
+    insta::assert_json_snapshot!(json);
+}
+
+#[tokio::test]
+async fn snapshot_skips_set() {
+    // The ranked skip queue's shape: lapsed first, then by until, indefinite last, each with
+    // its lapsed flag and the set's shared as-of. Fixed digests/timestamps keep it stable.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_skip_corpus(&store).await;
+    let (_status, json) = get(&app(store), "/api/skips").await;
     insta::assert_json_snapshot!(json);
 }

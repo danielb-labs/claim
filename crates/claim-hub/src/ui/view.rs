@@ -31,7 +31,7 @@
 
 use askama::Template;
 use claim_core::Verdict;
-use claim_hub_core::{AsOf, ClaimStanding, Standing};
+use claim_hub_core::{rank_skips, AsOf, ClaimStanding, RankedSkip, Standing};
 
 use crate::api::ReadState;
 use claim_hub_store::RegisteredClaim;
@@ -143,18 +143,109 @@ impl From<&QueueRow> for QueueTwinRow {
     }
 }
 
+/// One skipped check as a row in the review queue's ranked skip section: the claim and check
+/// it mutes, the reason, its expiry, and whether it has lapsed.
+///
+/// A skip is an acknowledged, bounded debt a human weighs, never a verdict (invariant #4): the
+/// row states what was deliberately not run and how urgent that debt is, for a look. The rows
+/// are the deriver's one pure ranking ([`rank_skips`]), so the queue's ordering matches the
+/// API's `/api/skips` and the MCP's `skips` tool by construction. `lapsed` keys the HTML badge
+/// and the twin's prose so the loudest debts stand out.
+pub(super) struct SkipRow {
+    /// The claim the skip is declared on (the namespaced handle).
+    pub claim: String,
+    /// The store the claim lives in.
+    pub store: String,
+    /// The digest of the check the skip mutes, so the row names the exact check.
+    pub check_digest: String,
+    /// The author's justification for the skip.
+    pub reason: String,
+    /// The skip's expiry (RFC 3339), or `None` for an indefinite skip.
+    pub until: Option<String>,
+    /// Whether the skip has lapsed as of the read clock — the deferred check is due again.
+    pub lapsed: bool,
+    /// A short human phrase for the skip's urgency, for the HTML badge and the twin's prose.
+    pub lapsed_label: String,
+    /// The path to this claim's dossier page (HTML), so the row links the skip to its claim.
+    pub dossier_path: String,
+    /// The path to this claim's dossier markdown twin, precomputed so the queue twin links a
+    /// row without appending a suffix in the template.
+    pub dossier_twin_path: String,
+}
+
+impl SkipRow {
+    fn from_ranked(skip: &RankedSkip) -> Self {
+        let dossier_path = format!("/ui/claims/{}", skip.claim);
+        let dossier_twin_path = format!("{dossier_path}.md");
+        Self {
+            claim: skip.claim.clone(),
+            store: skip.store.clone(),
+            check_digest: skip.check_digest.clone(),
+            reason: skip.reason.clone(),
+            until: skip.until.map(|t| t.to_string()),
+            lapsed: skip.lapsed,
+            lapsed_label: if skip.lapsed {
+                "lapsed — the deferred check is due again".to_owned()
+            } else {
+                "within window".to_owned()
+            },
+            dossier_path,
+            dossier_twin_path,
+        }
+    }
+}
+
+/// One skip row rendered safe for a markdown table cell — the markdown lens of a [`SkipRow`],
+/// derived through [`From`] so it holds the **same** ranked skip.
+///
+/// The identity fields (`claim`, `store`, `check_digest`) and the author-supplied `reason`
+/// pass through [`markdown_cell_safe`]: the `reason` is authored text from the claim file, so
+/// it is defanged so a hostile reason cannot break the table or inject markup; the identity
+/// fields are parser-validated but defanged anyway (defense-in-depth). The `lapsed_label`, the
+/// `until` timestamp, and the twin path are derived-safe and render raw. The `lapsed` boolean
+/// the HTML row uses to key a badge is a display key, not a fact the twin needs, so — like the
+/// wire `standing` word on a queue row — the twin omits it and states the same urgency in its
+/// label.
+pub(super) struct SkipTwinRow {
+    pub claim: String,
+    pub store: String,
+    pub check_digest: String,
+    pub reason: String,
+    pub until: Option<String>,
+    pub lapsed_label: String,
+    pub dossier_twin_path: String,
+}
+
+impl From<&SkipRow> for SkipTwinRow {
+    fn from(row: &SkipRow) -> Self {
+        Self {
+            claim: markdown_cell_safe(&row.claim),
+            store: markdown_cell_safe(&row.store),
+            check_digest: markdown_cell_safe(&row.check_digest),
+            reason: markdown_cell_safe(&row.reason),
+            until: row.until.clone(),
+            lapsed_label: row.lapsed_label.clone(),
+            dossier_twin_path: row.dossier_twin_path.clone(),
+        }
+    }
+}
+
 /// The review queue page: the due/drifted/stale set — the human's primary "what needs a
 /// look" (HUB.md §5).
 ///
 /// One struct, two templates ([`ui/queue.html`](../../templates/queue.html) and
 /// [`ui/queue.md`](../../templates/queue.md)). The rows are the deriver's own due set, in the
-/// model's (store, id) order, so the page is deterministic.
+/// model's (store, id) order, so the page is deterministic. The `skips` are the deriver's one
+/// pure skip ranking, so the queue's skip section shows the same ordered set as `/api/skips`
+/// and the MCP `skips` tool.
 #[derive(Template)]
 #[template(path = "queue.html")]
 pub(super) struct QueueView {
     /// The queued claims, in (store, id) order — every drifted, stale, or due-for-recheck
     /// claim.
     pub rows: Vec<QueueRow>,
+    /// The skipped checks, ranked into the queue by age and lapsed `until` — lapsed first.
+    pub skips: Vec<SkipRow>,
     /// The inputs this queue derived from.
     pub as_of: AsOfView,
 }
@@ -169,6 +260,7 @@ pub(super) struct QueueView {
 #[template(path = "queue.md", escape = "none")]
 pub(super) struct QueueTwin<'a> {
     pub rows: Vec<QueueTwinRow>,
+    pub skips: Vec<SkipTwinRow>,
     pub as_of: &'a AsOfView,
 }
 
@@ -176,6 +268,7 @@ impl<'a> From<&'a QueueView> for QueueTwin<'a> {
     fn from(view: &'a QueueView) -> Self {
         Self {
             rows: view.rows.iter().map(QueueTwinRow::from).collect(),
+            skips: view.skips.iter().map(SkipTwinRow::from).collect(),
             as_of: &view.as_of,
         }
     }
@@ -188,7 +281,12 @@ impl QueueView {
         "/ui/queue.md"
     }
 
-    /// Build the queue from the derived read model: the due set, rendered as rows.
+    /// Build the queue from the derived read model: the due set as claim rows, plus the
+    /// ranked skip queue.
+    ///
+    /// The claim rows are the deriver's own due set; the skip rows are the deriver's one pure
+    /// skip ranking ([`rank_skips`]), so the page's skip section is the identical ordered set
+    /// the `/api/skips` endpoint and the MCP `skips` tool serve — one ranking, four surfaces.
     pub(super) fn from_read(read: &ReadState) -> Self {
         let rows = read
             .model
@@ -196,8 +294,13 @@ impl QueueView {
             .iter()
             .filter_map(|key| read.model.claims.get(key).map(QueueRow::from_standing))
             .collect();
+        let skips = rank_skips(&read.model)
+            .iter()
+            .map(SkipRow::from_ranked)
+            .collect();
         Self {
             rows,
+            skips,
             as_of: AsOfView::from_as_of(read.model.as_of),
         }
     }

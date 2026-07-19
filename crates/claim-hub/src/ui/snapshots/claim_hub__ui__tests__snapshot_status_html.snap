@@ -130,14 +130,14 @@ truthful zeros, never a fabricated &ldquo;healthy&rdquo;.</p>
 
 <dl class="meta">
   <dt>ledger head</dt><dd>2</dd>
-  <dt>registry version</dt><dd>2</dd>
-  <dt>in review queue</dt><dd><a href="/ui/queue">1</a></dd>
+  <dt>registry version</dt><dd>3</dd>
+  <dt>in review queue</dt><dd><a href="/ui/queue">2</a></dd>
   <dt>rejected ingests</dt><dd>0</dd>
 </dl>
 
 <div class="asof">
   As of ledger head <strong>2</strong>,
-  registry version <strong>2</strong>,
+  registry version <strong>3</strong>,
   clock <strong>2026-07-20T00:00:00Z</strong>.
 </div>
 

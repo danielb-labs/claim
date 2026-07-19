@@ -333,6 +333,54 @@ async fn due_matches_api_due() {
     );
 }
 
+/// A corpus with skipped checks across two stores — one lapsed, one not, one indefinite —
+/// so the `skips` tool and `/api/skips` are compared over a non-trivial ranked set.
+async fn seed_skip_corpus(store: &SqliteStore) {
+    seed(
+        store,
+        PAYMENTS,
+        ".claims/parked.md",
+        "id: payments/parked\nchecks:\n  \
+         - kind: cmd\n    run: \"a\"\n    \
+         skip:\n      reason: lapsed one\n      until: 2026-01-01\n  \
+         - kind: cmd\n    run: \"b\"\n    \
+         skip:\n      reason: not-yet-lapsed one\n      until: 2027-06-01",
+    )
+    .await;
+    seed(
+        store,
+        BILLING,
+        ".claims/muted.md",
+        "id: billing/muted\nchecks:\n  \
+         - kind: cmd\n    run: \"c\"\n    skip:\n      reason: indefinite one",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn skips_matches_api_skips() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_skip_corpus(&store).await;
+    let st = state(store);
+    let mcp = HubMcp::new(st.clone());
+
+    let api = api_get(&app(st), "/api/skips").await;
+    let tool = structured(mcp.skips(Parameters(NoArgs {})).await.unwrap());
+    assert_eq!(tool, api, "skips parity with GET /api/skips");
+    // The one ranking shows through both surfaces: lapsed first, then by until, indefinite last.
+    let reasons: Vec<&str> = tool["skips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["lapsed one", "not-yet-lapsed one", "indefinite one"],
+        "the tool shows the same ranked order as the API"
+    );
+}
+
 #[tokio::test]
 async fn dossier_matches_api_dossier() {
     let store = SqliteStore::open_in_memory().await.unwrap();
@@ -605,7 +653,7 @@ async fn a_tool_read_appends_no_event() {
 // ---- tools/list is stable across restarts (deterministic registration) ----
 
 #[tokio::test]
-async fn tools_list_is_the_five_read_tools() {
+async fn tools_list_is_the_six_read_tools() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let mcp = HubMcp::new(state(store));
     let names: Vec<String> = mcp
@@ -615,7 +663,10 @@ async fn tools_list_is_the_five_read_tools() {
         .map(|t| t.name.to_string())
         .collect();
     // list_all sorts by name, so this is the exact advertised order.
-    assert_eq!(names, vec!["context", "dossier", "drifts", "due", "search"]);
+    assert_eq!(
+        names,
+        vec!["context", "dossier", "drifts", "due", "search", "skips"]
+    );
 }
 
 #[tokio::test]

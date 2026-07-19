@@ -26,6 +26,9 @@ use tower::ServiceExt;
 
 const PAYMENTS: &str = "github.com/acme/payments";
 const BILLING: &str = "github.com/acme/billing";
+/// A third store the skip-bearing claim lives in, so seeding it does not `replace_store`
+/// away another store's claim (a `replace_store` is per-store and wipes-then-inserts).
+const OPS: &str = "github.com/acme/ops";
 /// The fixed read clock: within a 30-day window of the seeded verdicts, so a held claim
 /// reads `verified` and its `stale_at`/`as_of` are constants the snapshots pin.
 const READ_NOW: &str = "2026-07-20T00:00:00Z";
@@ -214,6 +217,89 @@ async fn the_queue_html_and_twin_hold_the_same_claims() {
         !md.contains("payments/pin"),
         "a fresh not-due claim is not queued (twin)"
     );
+}
+
+/// Seed a claim with two skipped `cmd` checks — one lapsed as of `READ_NOW`, one not — plus a
+/// second store's indefinite skip, so the queue's ranked skip section is non-trivial.
+async fn seed_skip_corpus(store: &SqliteStore) {
+    seed(
+        store,
+        PAYMENTS,
+        ".claims/parked.md",
+        "id: payments/parked\nchecks:\n  \
+         - kind: cmd\n    run: \"a\"\n    \
+         skip:\n      reason: lapsed one\n      until: 2026-01-01\n  \
+         - kind: cmd\n    run: \"b\"\n    \
+         skip:\n      reason: not-yet-lapsed one\n      until: 2027-06-01",
+        "The runbook and dashboard are current.",
+    )
+    .await;
+    seed(
+        store,
+        BILLING,
+        ".claims/muted.md",
+        "id: billing/muted\nchecks:\n  \
+         - kind: cmd\n    run: \"c\"\n    skip:\n      reason: indefinite one",
+        "The alert routing is correct.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_queue_html_and_twin_hold_the_same_ranked_skips() {
+    // Twin-parity for the skip section: the twin is built from the QueueView's own skip rows
+    // by `From`, so both lenses must name the same skipped checks, in the same ranked order,
+    // with the same lapsed/not-lapsed labeling.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_skip_corpus(&store).await;
+    let app = app(store);
+
+    let (_s, _ct, html) = get(&app, "/ui/queue").await;
+    let (_s2, _ct2, md) = get(&app, "/ui/queue.md").await;
+
+    for body in [&html, &md] {
+        // Every skip's reason appears in both lenses.
+        assert!(body.contains("lapsed one"), "the lapsed skip is present");
+        assert!(
+            body.contains("not-yet-lapsed one"),
+            "the aging skip is present"
+        );
+        assert!(
+            body.contains("indefinite one"),
+            "the indefinite skip is present"
+        );
+        // The lapsed skip's louder label shows in both lenses.
+        assert!(
+            body.contains("lapsed — the deferred check is due again"),
+            "the lapsed label is rendered: {body}"
+        );
+        // The ranking (lapsed first) shows: the lapsed reason precedes the aging one, which
+        // precedes the indefinite one.
+        let lapsed = body.find("lapsed one").unwrap();
+        let aging = body.find("not-yet-lapsed one").unwrap();
+        let indefinite = body.find("indefinite one").unwrap();
+        assert!(
+            lapsed < aging && aging < indefinite,
+            "the skip section is ranked lapsed → aging → indefinite: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_empty_skip_section_says_so_rather_than_blanking() {
+    // A queue with no skips renders the honest "every check is running" line in both lenses,
+    // never an empty table that reads like a green.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    seed_corpus(&store).await; // no skips
+    let app = app(store);
+    let (_s, _ct, html) = get(&app, "/ui/queue").await;
+    let (_s2, _ct2, md) = get(&app, "/ui/queue.md").await;
+    for body in [&html, &md] {
+        assert!(
+            body.contains("No skipped checks"),
+            "the empty skip section says so: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -752,6 +838,23 @@ async fn seed_snapshot_corpus(store: &SqliteStore) {
         ))
         .await
         .unwrap();
+
+    // A claim with two skipped checks — one lapsed, one not — in its own store so seeding it
+    // does not replace another store's claim. The queue's ranked skip section renders both and
+    // pins the lapsed-first ordering: read at 2026-07-20, the 2026-01-01 skip has lapsed and
+    // the 2027-06-01 one has not.
+    seed(
+        store,
+        OPS,
+        ".claims/parked.md",
+        "id: ops/parked\nchecks:\n  \
+         - kind: cmd\n    run: \"check-runbook\"\n    \
+         skip:\n      reason: no model runner in CI\n      until: 2026-01-01\n  \
+         - kind: cmd\n    run: \"check-dashboard\"\n    \
+         skip:\n      reason: dashboard behind a flag\n      until: 2027-06-01",
+        "The on-call runbook and dashboard are current.",
+    )
+    .await;
 }
 
 #[tokio::test]

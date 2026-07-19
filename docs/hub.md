@@ -12,11 +12,11 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > **This is v1, still growing.** The hub today ships the application shell (config,
 > the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
 > stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
-> `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets,
-> the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
+> `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets, the ranked
+> skip queue, the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
 > over the deriver), the **web UI** (server-rendered pages over the same read model, each
 > with a machine-readable **markdown twin**), **`/llms.txt`** (the agent-facing index of every
-> surface), the **hub MCP** (the agent binding — five read-only tools over the same read
+> surface), the **hub MCP** (the agent binding — six read-only tools over the same read
 > model, mounted at `/mcp`), the **router / nag** (it notices when a fact drifts, goes stale by
 > the clock, or a skip lapses, routes each to its CODEOWNERS owner exactly once, and serves the
 > rendered nag content at `GET /api/nags` for the CI glue to deliver), and **read authentication**
@@ -457,6 +457,7 @@ see [Read authentication](#read-authentication). The `curl` examples below assum
 | `GET /api/drifted` | Every claim whose latest standing is `drifted`. |
 | `GET /api/due` | The review queue: every drifted, stale, or due-for-recheck claim. |
 | `GET /api/suspect` | Every `suspect` claim (populated once the propagation rule lands). |
+| `GET /api/skips` | Every skipped check, ranked into the review queue by age and lapsed `until`. |
 | `GET /api/claims/{id}/dossier` | A claim's full dossier: statement, checks, standing, verdict history, provenance. |
 | `GET /api/feed?cursor=<seq>` | The ledger, pollable from a position — paginated by ledger seq. |
 
@@ -549,6 +550,55 @@ Three convenience views, each the same list shape (`{ "claims": [...], "as_of": 
   claim marking its dependents suspect over the supports graph) is a later deriver rule; the
   endpoint serves the set today so the surface already carries it, empty until the rule
   lands.
+
+### The ranked skip queue (`GET /api/skips`)
+
+A **skip** is a check deliberately not run — an acknowledged, bounded debt, never a pass. A
+skipped check records no verdict, so it never makes a claim `verified` (a claim whose only
+check is skipped is `stale`, never a green — invariant #4/#6); the skip is surfaced for a
+human to look at, not folded into the standing. `GET /api/skips` ranks every skipped check
+across the live set into the review queue, so the loudest debts rise to the top:
+
+```sh
+curl -s http://127.0.0.1:8080/api/skips
+```
+
+```json
+{
+  "skips": [
+    { "store": "github.com/acme/payments", "claim": "payments/parked",
+      "check_digest": "a1ce…4754", "reason": "no model runner in CI",
+      "until": "2026-01-01T00:00:00Z", "lapsed": true },
+    { "store": "github.com/acme/payments", "claim": "payments/parked",
+      "check_digest": "3de4…2755", "reason": "dashboard behind a flag",
+      "until": "2027-06-01T00:00:00Z", "lapsed": false },
+    { "store": "github.com/acme/billing", "claim": "billing/muted",
+      "check_digest": "1424…e197", "reason": "unbounded mute", "lapsed": false }
+  ],
+  "as_of": { "ledger_head": 5, "registry_version": 2, "clock": "2026-07-20T00:00:00Z" }
+}
+```
+
+The ranking rule (`claim_hub_core::rank_skips`, a pure function of the read model) is a
+total order, so the set is deterministic and every read surface renders the identical
+sequence:
+
+1. **A lapsed skip outranks a not-yet-lapsed one.** A skip whose `until` is at or before the
+   read clock has *lapsed* — the deferred check is due again (the router routes it as a
+   `lapsed-skip` transition) — so it leads, no matter how soon a not-yet-lapsed skip expires.
+   Each skip carries its `lapsed` flag as of the read clock.
+2. **Among lapsed skips, the one that lapsed *longer ago* leads** (ascending `until`) — the
+   oldest debt is loudest.
+3. **Among not-yet-lapsed skips, the one *nearer its expiry* leads**, and an **indefinite
+   skip** (no `until`) sorts **last** — an unbounded mute is surfaced plainly (it omits the
+   `until` field) so it cannot hide, but it is the least time-pressing since it will never
+   lapse.
+
+A ranked skip is **queue data, not a verdict**: the shape carries no `standing` and no
+`verdict`, and reading `/api/skips` changes no claim's standing. The set carries one shared
+`as_of`; an empty result is an empty `skips` array with a truthful as-of, never a fabricated
+entry. The same ranked set is served by the MCP `skips` tool and rendered in the review-queue
+page (`/ui/queue`) and its twin — one pure ranking, four surfaces, which cannot disagree.
 
 ### A claim's dossier (`GET /api/claims/{id}/dossier`)
 
@@ -737,6 +787,14 @@ claim — not a `standing == due` filter; a fresh, not-yet-due claim stays out, 
 *into* the queue by the clock alone (no new verdict needed). An empty queue says so plainly,
 never a fabricated green. A claim the registry does not hold is an honest `404`.
 
+Below the claim rows, the queue page renders the **ranked skip section**: every skipped check
+across the live set, ordered by the same rule as `GET /api/skips` — lapsed first, then by
+`until` (oldest lapse and nearest expiry first, indefinite last) — each marked lapsed or
+within-window. It is the *same ranked set* the API and the MCP `skips` tool serve (one pure
+ranking, rendered by both the HTML page and its twin), so the four surfaces cannot disagree.
+A skip is a debt surfaced for a look, never a pass: an empty skip section says "every check is
+running" plainly.
+
 **`/llms.txt`** is the agent's index of the whole hub: it names every surface — the JSON API
 endpoints, the UI pages, the markdown twins, and the ingest write path — with the twin-path
 rule, so an agent discovers where to look in one fetch rather than crawling.
@@ -771,6 +829,7 @@ body, so they cannot drift. The v1 tools:
 | `dossier` | `id` | `GET /api/claims/{id}/dossier` | One claim's full dossier: statement, checks, standing, verdict history, provenance. |
 | `drifts` | — | `GET /api/drifted` | Every claim whose latest standing is `drifted`. |
 | `due` | — | `GET /api/due` | The review queue: every drifted, stale, or due-for-recheck claim. |
+| `skips` | — | `GET /api/skips` | The ranked skip queue: every skipped check, ordered by age and lapsed `until` (lapsed first), each carrying whether it has lapsed. |
 
 Every tool is a **read** (invariant #3): it derives at read time and stores nothing, appends
 no event, and its result carries the same `as_of` the API does — an agent can cache, diff, and
