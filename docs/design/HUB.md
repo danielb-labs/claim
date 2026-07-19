@@ -20,7 +20,8 @@ verdict stream, standing, due-ness, the nag, routing, dashboards, and the
 agent-facing knowledge interface. Its reason to exist is invariant #6: the nag
 over time that the stateless CLI cannot issue.
 
-Four things the hub must never do, fixed by the boundary and the invariants:
+Five things the hub must never do, fixed by the boundary, the invariants, and
+the product's data-ownership stance:
 
 - **Never the source of truth for claims.** The repos are; the hub mirrors and
   reindexes, and is wrong only by being briefly behind.
@@ -31,6 +32,12 @@ Four things the hub must never do, fixed by the boundary and the invariants:
   CLI and reports back through the one ingest path.
 - **Never a gate on core verification.** `claim check` works standalone in any
   CI whether or not a hub exists (issue #8).
+- **Never owns the customer's data.** The claims are the customer's, in their
+  git; so is the verdict ledger the hub derives over. The hub operates a
+  customer's data on their behalf, over storage they control — never as the
+  product's own asset. This is an invariant, not a policy: the v1 shape (a
+  self-hostable per-environment instance, section 4) makes customer ownership
+  the default, and any hosted offering must preserve it.
 
 Per-environment means per-history: a QA hub and a production hub track the
 same claims on different cadences with different verdict streams. "The hub"
@@ -219,11 +226,21 @@ The alternative — a second-class "untrusted" tier — doubles the explanation 
 every surface ("verified, but by whom?") for no gain the attested lanes do not
 already provide.
 
-A hosted, multi-tenant hub adds two rules, not a new model: tenancy is the
-environment boundary (a tenant's ledger and registry are theirs alone), and
-read access mirrors repo permissions per source — the org-wide index must
-never become the one place where anyone can read everything sensitive in
-aggregate (PRODUCT.md §6).
+**Data ownership is the invariant; multi-tenancy is a later layer over it.**
+The customer owns their data — the claim registry and the verdict ledger are
+theirs, not the product's asset. The v1 shape makes this the default rather
+than a promise: a hub is a per-environment instance the customer runs over
+storage it controls, self-hostable, its ledger and registry exportable and
+deletable wholesale — so there is no central store the product owns, and no
+migration to escape later. A hosted, multi-tenant offering is a later layer,
+not a new model: it adds tenant isolation (a tenant's ledger and registry are
+theirs alone, never co-mingled) and per-source read access mirroring repo
+permissions (the org-wide index must never become the one place where anyone
+can read everything sensitive in aggregate, PRODUCT.md §6). It must preserve
+the ownership invariant — the product operates a customer's data for them, it
+does not own it. We are not building the multi-tenant control plane now; we
+are keeping the registry/ledger boundary clean so it can be added without ever
+re-owning the data.
 
 Two honesty properties round this out. Every displayed standing carries its
 *as-of* — the ledger position and registry commit it derives from — so the hub
@@ -351,6 +368,7 @@ in, staleness derived, a human nagged, an agent able to inherit.
 
 | v1 (bare essentials) | Later (extension seams) |
 |---|---|
+| Single-tenant, self-hostable over customer-owned storage | Hosted multi-tenant control plane (tenant isolation, per-source read ACLs) |
 | Ingest gate with OIDC pipeline identity | Sigstore signed attestations |
 | Event ledger as an append-only table | Broker-backed stream at scale |
 | Registry sync with supports index | — |
@@ -380,6 +398,11 @@ in, staleness derived, a human nagged, an agent able to inherit.
 7. **v1 scheduler publishes due-ness and dispatches nothing** (§3) — over
    hub-triggered execution. Preserves "no hub→CLI protocol" and degrades
    safely when the hub is down.
+8. **The customer owns their data; the hub does not** (§1, §4) — v1 is a
+   self-hostable per-environment instance over customer-controlled storage, so
+   ownership is the default, not a promise. Hosted multi-tenancy is a later
+   layer that must preserve the invariant; deferred now, with the
+   registry/ledger boundary kept clean so it needs no re-owning of data.
 
 ## Appendix: patterns drawn on (surveyed July 2026)
 
