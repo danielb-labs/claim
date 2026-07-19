@@ -374,26 +374,22 @@ pub async fn get_claim(app: &axum::Router, id: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-/// Copy a SQLite database file plus its WAL and SHM sidecars, if present — a consistent
-/// "cold copy" that carries not-yet-checkpointed writes, so the copy is complete even when
-/// the source hub is still running. This is the file-copy backup the self-host docs promise:
-/// the whole hub is one file (with its sidecars) the customer copies to back up or to leave.
-pub fn copy_database(src: &std::path::Path, dst: &std::path::Path) {
-    std::fs::copy(src, dst).expect("copy the database file");
+/// Back up a live hub to one self-contained file at `dst`, via the store's online backup
+/// (`VACUUM INTO`), then assert `dst` carries no `-wal`/`-shm` sidecar. This is the
+/// self-host backup the docs promise, taken against a *running* hub: a consistent snapshot
+/// under a read transaction that cannot lose a committed event to a racing checkpoint — the
+/// data-loss a bare `cp hub.db` risks (invariants #4 and #6). A restore is then a plain copy
+/// of this one file.
+pub async fn backup_database(store: &SqliteStore, dst: &std::path::Path) {
+    store.backup(dst).await.expect("online backup the hub");
     for suffix in ["-wal", "-shm"] {
-        let sidecar = with_suffix(src, suffix);
-        if sidecar.exists() {
-            std::fs::copy(&sidecar, with_suffix(dst, suffix)).expect("copy the sidecar");
-        }
+        let mut name = dst.as_os_str().to_owned();
+        name.push(suffix);
+        assert!(
+            !std::path::Path::new(&name).exists(),
+            "an online backup produces no {suffix} sidecar"
+        );
     }
-}
-
-/// Append a filename suffix to a path (`hub.db` + `-wal` -> `hub.db-wal`), the naming SQLite
-/// uses for the WAL and SHM sidecars.
-fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    std::path::PathBuf::from(name)
 }
 
 /// Read `/status` and return the parsed body.

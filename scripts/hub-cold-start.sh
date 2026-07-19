@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # The cold-start self-host check (hub-15): boot the real `claim-hub` binary against an
-# EMPTY directory and prove it stands up its own database and serves a TRUTHFUL /status —
-# head 0, version 0, no rejections. This is the "point the hub at a fresh volume and it just
-# boots" guarantee (HUB-IMPLEMENTATION.md §1.13) exercised against the real binary, no
-# Docker required: the same first-boot path the container image runs on an empty volume.
+# EMPTY directory with NO config file — only CLAIM_HUB_* env overrides, exactly as the
+# container image runs — and prove it stands up its own database and serves a TRUTHFUL
+# /status: head 0, version 0, no rejections. This is the "point the hub at a fresh volume
+# and it just boots" guarantee (HUB-IMPLEMENTATION.md §1.13) exercised against the real
+# binary, no Docker required.
+#
+# Config-less on purpose: with no --config and no hub.toml, a missing default config is not
+# an error — the binary starts from an empty config so the env overrides alone drive the
+# boot. This is the exact path `docker run` against an empty volume hits; a regression that
+# made a missing default config fatal would fail here (and in the container step) loudly.
 #
 # Truthful means the empty state is reported as empty, never as an error and never as a
 # fabricated "healthy" (invariant #6): a hub that lies about its own position is the first
@@ -40,17 +46,20 @@ cargo build -q -p claim-hub
 hub_bin="$repo_root/target/debug/claim-hub"
 [ -x "$hub_bin" ] || fail "claim-hub binary not found at $hub_bin"
 
-# An EMPTY data directory: no database file yet. The hub must create and migrate it on boot.
+# An EMPTY data directory: no database file and NO hub.toml. The hub must create and
+# migrate the database on boot and start from an empty config (env overrides only).
 data="$work/data"
 mkdir -p "$data"
 db="$data/hub.db"
 [ -e "$db" ] && fail "the data directory is not empty; $db already exists"
+[ -e "$data/hub.toml" ] && fail "the data directory has a hub.toml; the cold-start must be config-less"
 
-cfg="$data/hub.toml"
-printf 'listen = "127.0.0.1:%s"\ndatabase = "%s"\n' "$PORT" "$db" > "$cfg"
-
-echo "==> booting from the empty directory"
-"$hub_bin" --config "$cfg" >"$work/hub.log" 2>&1 &
+echo "==> booting config-less from the empty directory (env overrides only)"
+# Run with the empty data dir as the working directory, so the default hub.toml lookup
+# resolves *there* and provably finds nothing — the env overrides alone drive the boot.
+# `exec` so the hub replaces the subshell and `$!` is the hub's own PID for cleanup.
+( cd "$data" && exec env CLAIM_HUB_LISTEN="127.0.0.1:$PORT" CLAIM_HUB_DATABASE="$db" \
+  "$hub_bin" >"$work/hub.log" 2>&1 ) &
 srv=$!
 
 ready=""

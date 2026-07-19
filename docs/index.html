@@ -361,14 +361,17 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     forged, expired, or unauthorized push is rejected loudly and counted; the JSON API and the UI
     arrive in later items.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
-    container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume and
-    stands up its own database on first boot. Because the whole hub is that one file, the ownership
-    operations are file operations &mdash; <strong>export</strong> is a copy, <strong>delete</strong> is
-    an <code>rm</code>, and you <strong>leave</strong> by taking the file: restored into a fresh hub, it
-    derives the identical answers. Back up with <a href="https://litestream.io">Litestream</a> streaming
-    to your own object storage, or a plain periodic file copy. The self-host quickstart states these as
-    the commands you run, and a tested backup-and-restore exercise proves the restored hub answers
-    identically &mdash; the ownership promise is checked, not asserted.</p>
+    container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
+    no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is
+    that one file, the ownership operations are file operations &mdash; <strong>export</strong> is a copy
+    (of a stopped hub) or an online <code>sqlite3 ".backup"</code> snapshot (of a running one),
+    <strong>delete</strong> is an <code>rm</code>, and you <strong>leave</strong> by taking the file:
+    restored into a fresh hub, it derives the identical answers. Back up with
+    <a href="https://litestream.io">Litestream</a> streaming to your own object storage, or a periodic
+    online snapshot &mdash; never a bare <code>cp</code> of a live hub's <code>hub.db</code>, which races
+    the WAL and can drop the ledger tail. The self-host quickstart states these as the commands you run,
+    and a tested backup-and-restore exercise proves the restored hub answers identically &mdash; the
+    ownership promise is checked, not asserted.</p>
   </section>
 
   <section id="witness">

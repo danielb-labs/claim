@@ -1,20 +1,23 @@
 //! The backup-restore self-host test (hub-15): the data-ownership invariant as an
 //! executable exercise, not an assertion.
 //!
-//! HUB.md §1/§4: the whole hub is one SQLite file the customer owns — back up by copying
-//! the file, leave by taking it. This test proves the promise holds: seed a real
-//! file-backed hub through the real ingest gate, read a claim's standing, **copy the
-//! database file** into a fresh location, open a second hub over the copy, and derive the
-//! same claim's standing — the two derivations must be byte-identical. If a restored hub
-//! ever derived a different answer, "you own your data" would be a lie; this is the test
-//! that would catch it.
+//! HUB.md §1/§4: the whole hub is one SQLite file the customer owns — back up by taking a
+//! consistent snapshot of it, leave by taking that file. This test proves the promise holds:
+//! seed a real file-backed hub through the real ingest gate, read a claim's standing, **back
+//! up the database online** (`VACUUM INTO`, safe against a live writer) into one
+//! self-contained file, open a second hub over it, and derive the same claim's standing — the
+//! two derivations must be byte-identical. If a restored hub ever derived a different answer,
+//! "you own your data" would be a lie; this is the test that would catch it.
 //!
 //! It is deterministic and network-free (the harness's injected JWKS and fixed clocks), and
 //! it exercises the **real** store: a real `SqliteStore::open` on a real file, a real ingest
-//! append, a real filesystem copy of the DB (plus its WAL/SHM sidecars, as a consistent cold
-//! copy), and the real deriver over the copy. The shell script `scripts/hub-backup-restore.sh`
-//! is the same exercise one layer out — over the real HTTP *server* binary — run in CI; this
-//! test is the gate's deterministic, in-process guarantee of the identical-answers property.
+//! append, a real online backup of the live DB into one sidecar-free file, and the real
+//! deriver over the restored copy. Why online backup rather than a file copy: a `cp` against
+//! a live WAL-mode hub can race a checkpoint and silently drop the ledger tail (invariants #4
+//! and #6); `crates/claim-hub-store/tests/backup.rs` pins that data-loss and its fix directly.
+//! The shell script `scripts/hub-backup-restore.sh` is the same exercise one layer out — over
+//! the real HTTP *server* binary — run in CI; this test is the gate's deterministic,
+//! in-process guarantee of the identical-answers property.
 
 mod common;
 
@@ -105,14 +108,13 @@ async fn a_restored_hub_derives_an_identical_standing() {
         "stale_at is the claim's own 30d window from the verdict instant: {original}"
     );
 
-    // Back up: copy the one file plus its WAL/SHM sidecars — a consistent cold copy that
-    // carries any not-yet-checkpointed writes, so the copy is complete whether or not the
-    // WAL has been folded into the main file. This is "leave by taking the file". The
-    // original store stays open (a live hub is not stopped to be backed up), which is exactly
-    // why the sidecars are copied.
+    // Back up: an online `VACUUM INTO` snapshot of the live store into one self-contained
+    // file — no sidecars, safe against the still-open writer, so no committed event can be
+    // lost to a racing checkpoint. This is "leave by taking the file", taken correctly
+    // against a running hub (a live hub is not stopped to be backed up).
     let db_b = dir.path().join("b").join("hub.db");
     std::fs::create_dir_all(db_b.parent().unwrap()).unwrap();
-    copy_database(&db_a, &db_b);
+    backup_database(&store_a, &db_b).await;
 
     // Restore: open a FRESH hub over the copy — no re-seed, no re-ingest — and derive again.
     let store_b = SqliteStore::open(&db_b)
@@ -144,12 +146,12 @@ async fn a_restored_hub_reads_the_same_answer_over_the_http_read_api() {
     assert_eq!(status, axum::http::StatusCode::OK);
 
     let mut answer_a = get_claim(&app_a, "payments/libfoo-pin").await;
-    // The store stays open behind `app_a` (a live hub); the cold copy carries its sidecars.
-    let _ = &store_a;
 
+    // The store stays open behind `app_a` (a live hub); the online backup snapshots it
+    // consistently into one sidecar-free file, no need to stop the writer.
     let db_b = dir.path().join("b").join("hub.db");
     std::fs::create_dir_all(db_b.parent().unwrap()).unwrap();
-    copy_database(&db_a, &db_b);
+    backup_database(&store_a, &db_b).await;
 
     let (app_b, _store_b) = file_backed_app(&db_b, TestJwksSource::with_signing_key()).await;
     let mut answer_b = get_claim(&app_b, "payments/libfoo-pin").await;

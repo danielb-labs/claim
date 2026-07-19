@@ -12,10 +12,15 @@
 //! input change. The deriver and its memo are hub-06's; this struct is the shape
 //! they and the shell read.
 //!
-//! Loading is deliberately loud (invariant #6, CLAUDE.md's error-message rule): a
-//! missing file, unreadable bytes, or a malformed field fails with a message that
-//! names the file and the offending field, never a silent default that would let a
-//! typo'd address or path pass unnoticed.
+//! Loading is deliberately loud (invariant #6, CLAUDE.md's error-message rule):
+//! unreadable bytes or a malformed field fails with a message that names the file and
+//! the offending field, never a silent default that would let a typo'd address or path
+//! pass unnoticed. The one deliberate exception is a *missing* file at the **default**
+//! path: [`Config::load_with_env`] treats it as an empty config (all defaults), so a
+//! container booted from an empty volume with only `CLAIM_HUB_*` env overrides stands
+//! up (HUB-IMPLEMENTATION.md §1.13). A missing file at an **explicit** `--config` path
+//! stays a loud error — a user who names a config and mistypes it must never get silent
+//! defaults.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -73,6 +78,36 @@ pub struct Config {
     /// unauthenticated health, so nothing enforces this yet.
     #[serde(default)]
     pub read_auth: ReadAuthConfig,
+}
+
+/// Where a config path came from, so loading knows whether a missing file is a fatal
+/// typo or the expected empty-volume case.
+///
+/// The distinction is load-bearing (invariant #6): a missing file at the **default**
+/// path is the ordinary first-boot state a container hits against an empty volume, so it
+/// falls back to [`Config::default`] and lets `CLAIM_HUB_*` env overrides drive the boot;
+/// a missing file at a path the operator **named** with `--config` is a typo that must
+/// fail loudly, never silently substitute defaults.
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigSource<'a> {
+    /// The operator named this path with `--config`. A missing file here is a loud error.
+    Explicit(&'a Path),
+    /// No `--config` was given; this is [`DEFAULT_CONFIG_PATH`](crate::DEFAULT_CONFIG_PATH).
+    /// A missing file here falls back to [`Config::default`].
+    Default(&'a Path),
+}
+
+/// The empty-config defaults: every field's `#[serde(default)]`, so
+/// `Config::default()` is exactly the config an empty TOML file parses to.
+///
+/// Kept in lockstep with the serde defaults by *going through* the parser
+/// (`from_toml("")`) rather than duplicating each field's default — a new field with a
+/// `#[serde(default)]` is picked up here for free, and a field added without one makes
+/// this panic loudly at first use rather than drifting silently from the parsed shape.
+impl Default for Config {
+    fn default() -> Self {
+        Self::from_toml("").expect("the empty config parses via every field's serde default")
+    }
 }
 
 /// One connected git store, as the config names it. A stub for hub-05: the fields
@@ -212,7 +247,7 @@ impl Config {
             .map_err(|source| anyhow::anyhow!("config `{}`: {source}", path.display()))
     }
 
-    /// Read the config at `path` and apply environment-variable overrides on top.
+    /// Read the config at `source` and apply environment-variable overrides on top.
     ///
     /// The file is the base; a small set of `CLAIM_HUB_*` environment variables
     /// override individual fields after parsing (HUB-IMPLEMENTATION.md §1.12: "one
@@ -222,13 +257,40 @@ impl Config {
     /// — an operator's typo in an env var degrades the same way a bad file field
     /// does, never silently.
     ///
+    /// A **missing file at the default path** ([`ConfigSource::Default`]) is not an
+    /// error: it yields an empty [`Config::default`] before the env overrides apply, so
+    /// a container booted from an empty volume with only `CLAIM_HUB_LISTEN` /
+    /// `CLAIM_HUB_DATABASE` set stands up (HUB-IMPLEMENTATION.md §1.13). A missing file
+    /// at an **explicit** path ([`ConfigSource::Explicit`], from `--config`) stays a
+    /// loud error — a user who names a config and mistypes it must not get silent
+    /// defaults. A file that exists but is unreadable or malformed is a loud error in
+    /// either case; only `NotFound` on the default path falls back.
+    ///
     /// Recognized overrides:
     /// - `CLAIM_HUB_LISTEN` — the listen [`SocketAddr`], e.g. `0.0.0.0:8080`.
     /// - `CLAIM_HUB_DATABASE` — the database file path.
-    pub fn load_with_env(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let mut config = Self::load(path)?;
+    pub fn load_with_env(source: ConfigSource<'_>) -> anyhow::Result<Self> {
+        let mut config = Self::load_source(source)?;
         config.apply_env(&EnvVars::from_process())?;
         Ok(config)
+    }
+
+    /// Load the config named by `source`, applying the missing-default-path fallback.
+    ///
+    /// Split from [`Config::load_with_env`] so the fallback rule is tested without the
+    /// process environment. The fallback fires **only** for a `NotFound` at the default
+    /// path; any other IO error (a permission fault, a path that is a directory) and any
+    /// parse error stays loud, and an explicit missing path stays loud.
+    fn load_source(source: ConfigSource<'_>) -> anyhow::Result<Self> {
+        match source {
+            ConfigSource::Explicit(path) => Self::load(path),
+            ConfigSource::Default(path) => match std::fs::read_to_string(path) {
+                Ok(text) => Self::from_toml(&text)
+                    .map_err(|source| anyhow::anyhow!("config `{}`: {source}", path.display())),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(err) => Err(anyhow::anyhow!("config `{}`: {err}", path.display())),
+            },
+        }
     }
 
     /// Map the `[deriver]` section onto the deriver's
@@ -347,12 +409,63 @@ mod tests {
 
     #[test]
     fn load_names_the_file_when_it_is_missing() {
+        // The explicit-path case: an operator named this file, so a missing one is a
+        // loud error naming it — never a silent fallback to defaults.
         let err = Config::load("/no/such/hub/config.toml").unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains("/no/such/hub/config.toml"),
             "names the file: {message}"
         );
+    }
+
+    #[test]
+    fn a_missing_default_config_falls_back_to_defaults() {
+        // The empty-volume boot: no `--config` given and no `hub.toml` present, so the
+        // config is the empty default and the env overrides alone drive the boot.
+        let missing = Path::new("/no/such/hub/hub.toml");
+        let config = Config::load_source(ConfigSource::Default(missing)).unwrap();
+        assert_eq!(config.listen, default_listen());
+        assert_eq!(config.database, default_database_path());
+    }
+
+    #[test]
+    fn a_missing_explicit_config_stays_a_loud_error() {
+        // A path the operator named with `--config` that does not exist is a typo, not
+        // an empty-volume boot: it must fail loudly, naming the file, never fall back.
+        let missing = Path::new("/no/such/hub/named.toml");
+        let err = Config::load_source(ConfigSource::Explicit(missing)).unwrap_err();
+        assert!(
+            err.to_string().contains("named.toml"),
+            "names the missing explicit file: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_default_config_stays_a_loud_error() {
+        // The fallback is for a *missing* default file only. A default `hub.toml` that
+        // exists but is malformed must never silently become defaults — a hub half-
+        // honoring a typo'd config is the drift this product kills.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.toml");
+        std::fs::write(&path, r#"listen = "not-an-address""#).unwrap();
+        let err = Config::load_source(ConfigSource::Default(&path)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("hub.toml"), "names the file: {message}");
+        assert!(message.contains("listen"), "names the field: {message}");
+    }
+
+    #[test]
+    fn config_default_equals_the_empty_toml_parse() {
+        // `Config::default()` must be exactly what an empty file parses to, so the
+        // fallback config and the serde defaults never drift apart.
+        let from_empty = Config::from_toml("").unwrap();
+        let from_default = Config::default();
+        assert_eq!(from_default.listen, from_empty.listen);
+        assert_eq!(from_default.database, from_empty.database);
+        assert!(from_default.stores.is_empty());
+        assert!(from_default.oidc.is_none());
+        assert!(!from_default.read_auth.open_reads);
     }
 
     #[test]

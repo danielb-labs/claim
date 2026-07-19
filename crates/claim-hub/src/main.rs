@@ -1,20 +1,22 @@
 //! The `claim-hub` binary: boot the hub from a config file and serve.
 //!
-//! A thin entry point over the [`claim_hub`] library. It reads the config path
-//! (`--config <path>`, defaulting to `hub.toml` in the working directory), installs
-//! the tracing subscriber, and hands off to [`claim_hub::run`], which loads the
-//! config, opens the database, and serves. Every real concern lives in the library
-//! so it is testable in-process; this file is argument handling and the boot report.
+//! A thin entry point over the [`claim_hub`] library. It reads the optional `--config
+//! <path>` flag, installs the tracing subscriber, and hands off to [`claim_hub::run`],
+//! which loads the config (defaulting to `hub.toml` in the working directory when no
+//! flag is given), opens the database, and serves. Every real concern lives in the
+//! library so it is testable in-process; this file is argument handling and the boot
+//! report.
 //!
-//! A boot failure — a missing or invalid config, a database that will not open, an
-//! address that will not bind — is reported to stderr and exits non-zero, naming the
-//! problem (the item's "fail loudly" requirement). It never degrades to a silent or
-//! partial serve.
+//! A boot failure — an invalid config, a database that will not open, an address that
+//! will not bind — is reported to stderr and exits non-zero, naming the problem (the
+//! item's "fail loudly" requirement). It never degrades to a silent or partial serve.
+//! The one non-failure is a *missing* file at the *default* path: with no `--config`
+//! given, an absent `hub.toml` yields an empty config so `CLAIM_HUB_*` env overrides
+//! alone can boot a container off an empty volume. A missing file at an operator-named
+//! `--config` path is still a loud error.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-use claim_hub::DEFAULT_CONFIG_PATH;
 
 /// The multi-threaded tokio runtime axum serves on. `flavor = "multi_thread"` so the
 /// hub handles concurrent reads (WAL SQLite serves concurrent readers against one
@@ -23,8 +25,8 @@ use claim_hub::DEFAULT_CONFIG_PATH;
 async fn main() -> ExitCode {
     claim_hub::init_tracing();
 
-    let config_path = match parse_args() {
-        Ok(path) => path,
+    let config_arg = match parse_args() {
+        Ok(arg) => arg,
         Err(message) => {
             eprintln!("error: {message}");
             eprintln!("usage: claim-hub [--config <path>]");
@@ -32,7 +34,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match claim_hub::run(&config_path).await {
+    match claim_hub::run(config_arg).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // The full cause chain, so a lower layer's specific detail (the field a
@@ -44,13 +46,17 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Parse the one supported flag, `--config <path>`, returning the config path (the
-/// default when the flag is absent).
+/// Parse the one supported flag, `--config <path>`, returning `Some(path)` when the
+/// operator named a config and `None` when they did not.
 ///
-/// Hand-rolled rather than pulling in an argument parser: the hub binary takes one
-/// path and nothing else, so a dependency would be more surface than it earns. An
-/// unrecognized argument or a `--config` with no value is a usage error, named.
-fn parse_args() -> Result<PathBuf, String> {
+/// The presence of the flag is load-bearing downstream, not just the resolved path: a
+/// missing file at the operator-named path is a loud error, while a missing file at the
+/// default path is the ordinary empty-volume boot ([`claim_hub::run`] applies that rule
+/// via [`claim_hub::config::ConfigSource`]). Hand-rolled rather than pulling in an
+/// argument parser: the hub binary takes one path and nothing else, so a dependency would
+/// be more surface than it earns. An unrecognized argument or a `--config` with no value
+/// is a usage error, named.
+fn parse_args() -> Result<Option<PathBuf>, String> {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
@@ -66,5 +72,5 @@ fn parse_args() -> Result<PathBuf, String> {
             }
         }
     }
-    Ok(config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)))
+    Ok(config_path)
 }

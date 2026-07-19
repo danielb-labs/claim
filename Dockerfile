@@ -73,8 +73,11 @@ ENV CLAIM_HUB_LISTEN="0.0.0.0:8080" \
     CLAIM_HUB_DATABASE="/data/hub.db"
 EXPOSE 8080
 
-# The hub reads hub.toml in the working directory (/data) if present; env overrides win
-# regardless, so an empty data volume with no config file still boots on the right address
-# and database path. A self-hoster who wants richer config (stores, [oidc]) drops a
-# hub.toml into the mounted volume.
+# The hub reads hub.toml in the working directory (/data) if present. With no --config flag
+# and no hub.toml, a *missing* default config is not an error: the binary starts from an
+# empty config so these CLAIM_HUB_* env overrides alone drive the boot — which is what lets
+# an EMPTY data volume with no config file boot on the right address and database path. (A
+# malformed hub.toml, or a --config path that is missing, is still a loud failure.) A
+# self-hoster who wants richer config (stores, [oidc]) drops a hub.toml into the mounted
+# volume; env overrides still win.
 ENTRYPOINT ["claim-hub"]

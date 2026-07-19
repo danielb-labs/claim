@@ -41,9 +41,16 @@ TOML
 ```
 
 `--config` (or `-c`) names the file; with no flag the binary reads `hub.toml` in the
-working directory. A missing or invalid config fails loudly before anything binds,
-naming the file and pointing at the offending line — never a silent default. A typo'd
-`listen` address reports:
+working directory. An **invalid** config — malformed TOML, a bad field, an unreadable
+file — fails loudly before anything binds, naming the file and pointing at the offending
+line, never a silent default. There is one deliberate exception: with **no `--config`
+flag**, a *missing* `hub.toml` is not an error — the binary starts from an empty config so
+the `CLAIM_HUB_*` env overrides alone can drive a boot. This is what lets a container boot
+against an empty mounted volume with no config file at all (see [Run the
+container](#run-the-container)). A missing file at an **explicit** `--config` path is still
+a loud error: naming a config and mistyping it must never silently fall back to defaults.
+
+A typo'd `listen` address reports:
 
 ```text
 error: config `hub.toml`: TOML parse error at line 1, column 10
@@ -315,19 +322,26 @@ volume for the one owned file.
 
 ### Own, export, and delete the data — it is one file
 
-The whole hub is `hub.db` (with its `-wal`/`-shm` sidecars while running). So:
+The whole hub is `hub.db` (with `-wal`/`-shm` sidecars alongside it while the hub is
+running). A *stopped* hub is one complete file; a *running* hub must be snapshotted, not
+naively copied (see [Back up](#back-up)). So:
 
-- **Export** is a copy: `docker compose cp hub:/data/hub.db ./hub.db`, or `cp
-  /path/to/hub.db /elsewhere/` for a bare-binary hub. That file *is* your hub's history.
+- **Export** a *stopped* hub with a copy: `cp /path/to/hub.db /elsewhere/`. Export a
+  *running* hub with the online backup below (`cp hub.db` on a live hub can drop the WAL and
+  lose the ledger tail). That file *is* your hub's history.
 - **Delete** is an `rm`: remove the file, or `docker compose down -v` to destroy the volume.
   There is no server-side remnant, no soft-delete, no product-held copy.
-- **Leave** is taking the file: stand up `claim-hub` anywhere against a copy of `hub.db` and
+- **Leave** is taking the file: stand up `claim-hub` anywhere against a backup of `hub.db` and
   it derives the identical answers — proven by the backup-restore exercise below. There is no
   migration to escape, because there was never a store you did not control.
 
 ### Back up
 
-Two supported ways, both to storage **you** control:
+A hub in WAL mode holds recent, committed writes in the `hub.db-wal` sidecar until a
+checkpoint folds them into `hub.db`. So a plain `cp hub.db` against a **running** hub is a
+hot copy that races the checkpoint: it can produce a file that passes `PRAGMA
+integrity_check` yet has silently dropped the newest ledger events. Never `cp` a live hub's
+`hub.db` alone. Two supported ways, both to storage **you** control:
 
 1. **Litestream (continuous, near-real-time).** [Litestream](https://litestream.io) streams
    the SQLite WAL to S3-compatible object storage as it is written, so a crash loses seconds,
@@ -336,13 +350,26 @@ Two supported ways, both to storage **you** control:
    directory, then boot the hub over it. Use this when the ledger is load-bearing enough that
    point-in-time recovery matters.
 
-2. **Plain file copy (periodic, zero-dependency).** Because the hub is one file, a copy is a
-   backup. The consistent way to copy a *live* hub's database is to copy `hub.db` together
-   with its `-wal` and `-shm` sidecars (a "cold copy" that carries not-yet-checkpointed
-   writes), or to checkpoint the WAL first (`sqlite3 hub.db 'PRAGMA wal_checkpoint(TRUNCATE);'`)
-   and copy `hub.db` alone. A stopped hub is trivially copyable — the file is complete on a
-   clean shutdown. Schedule it however you back up any file (a nightly `cp` to durable
-   storage is enough for many hubs).
+2. **Online snapshot (periodic, one self-contained file).** SQLite's online backup takes a
+   transactionally-consistent snapshot of a *live* hub into one new file with **no** sidecars,
+   so nothing races the WAL:
+
+   ```sh
+   # A running hub, backed up safely into one file:
+   sqlite3 /path/to/hub.db ".backup '/backups/hub-$(date +%F).db'"
+   # equivalently: sqlite3 /path/to/hub.db "VACUUM INTO '/backups/hub.db'"
+   ```
+
+   Restore is a plain copy of that one file into a fresh data directory — copy no `-wal`/`-shm`
+   (there are none), and delete any stale sidecar beside the destination first so SQLite cannot
+   recover a wrong-but-consistent state — then boot the hub over it. A *stopped* hub needs no
+   snapshot: it is one complete file you can `cp` directly. Schedule the snapshot however you
+   back up any file (a nightly `.backup` to durable storage is enough for many hubs).
+
+   > **`sqlite3` runs on the host, not in the container.** The runtime image ships only the
+   > hub binary, `git`, and CA certificates — deliberately no `sqlite3`. Run the `.backup`
+   > from the host against the mounted volume's `hub.db` (e.g. a path under the `hub-data`
+   > volume), or install `sqlite3` on the host; do not expect it inside the container.
 
 Either way the backup is your file on your storage; the product never holds a copy.
 
@@ -353,16 +380,18 @@ answer* — is checked, not just claimed:
 
 - `scripts/hub-backup-restore.sh` runs the **real server binary**: it seeds a hub (syncs a
   git fixture, ingests one attested verdict through the real ingest gate), reads a claim's
-  standing over `/api/claims/{id}`, copies the database file, restores it into a second hub,
-  and asserts the restored hub's standing is byte-identical (`standing`, `verified_as_of`,
-  `stale_at`, and the ledger/registry as-of) — only the wall-clock read instant legitimately
-  differs.
+  standing over `/api/claims/{id}`, takes an online `sqlite3 ".backup"` of the live hub,
+  restores that single file into a second hub, and asserts the restored hub's standing is
+  byte-identical (`standing`, `verified_as_of`, `stale_at`, and the ledger/registry as-of) —
+  only the wall-clock read instant legitimately differs.
 - `scripts/hub-cold-start.sh` boots the real binary against an empty directory and asserts a
   truthful empty `/status` (head 0 / version 0 / no rejections) — the "point it at a fresh
   volume and it just works" guarantee.
 - `crates/claim-hub/tests/backup_restore.rs` is the same identical-answers property as a
   deterministic, in-process gate test (no ports, no external tools), so every branch and CI
-  run proves it.
+  run proves it, and `crates/claim-hub-store/tests/backup.rs` pins the data-loss directly:
+  the online backup captures uncheckpointed writes a bare `cp hub.db` drops, and survives a
+  checkpoint racing a concurrent writer.
 
 The container image builds and cold-starts, and the two scripts run, in CI
 (`.github/workflows/hub-image.yml`); the deterministic test runs in the gate.

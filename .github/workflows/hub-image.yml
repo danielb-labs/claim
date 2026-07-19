@@ -1,12 +1,19 @@
 name: hub-image
 
-# Packaging checks for the self-host container image and the file-copy backup story
-# (hub-15). Kept in its own workflow, not the fast `gate`, because a Docker build is minutes
-# of work the per-commit gate should not pay every push; this runs on hub/packaging changes
-# and on main. The load-bearing identical-answers property is ALSO covered deterministically
-# in the gate by `crates/claim-hub/tests/backup_restore.rs` — this workflow adds the two
-# things that need a real runner: the image actually building, and the shell scripts driving
-# the real HTTP server binary.
+# Packaging checks for the self-host container image and the online-backup story (hub-15).
+# Kept in its own workflow, not the fast `gate`, because a Docker build is minutes of work
+# the per-commit gate should not pay every push; this runs on hub/packaging changes and on
+# main. The load-bearing identical-answers property is ALSO covered deterministically in the
+# gate by `crates/claim-hub/tests/backup_restore.rs` — this workflow adds the two things that
+# need a real runner: the image actually building, and the shell scripts driving the real
+# HTTP server binary.
+
+# Least privilege: read the checked-out tree to build the image and run the scripts. No write
+# scope — the workflow builds the image locally and curls /status; it never pushes an image,
+# logs in to a registry, or mints an id-token.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]

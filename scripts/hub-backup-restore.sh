@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# The load-bearing self-host test (hub-15): back up a hub by copying its one SQLite file,
+# The load-bearing self-host test (hub-15): back up a live hub with SQLite's online backup,
 # restore it into a fresh hub, and prove the restored hub derives IDENTICAL answers. This
 # is the data-ownership invariant (HUB.md §1/§4) exercised as an operation rather than
-# asserted: the whole hub is one file the customer controls, so a file-copy backup and a
+# asserted: the whole hub is one file the customer controls, so a consistent backup and a
 # restore into a clean instance must reproduce the exact standing.
+#
+# The backup is `sqlite3 hub.db ".backup"`, NOT a file copy: a `cp` against a live WAL-mode
+# hub is a hot copy that races a checkpoint and can silently drop the ledger tail (invariants
+# #4/#6). `.backup` reads a transactionally-consistent snapshot and writes ONE self-contained
+# file with no `-wal`/`-shm` sidecars, so a restore is a plain copy of that one file.
 #
 # It runs the REAL binaries, no Docker required:
 #   1. seed a hub — sync a local git fixture and ingest one attested `held` verdict, through
 #      the real sync and the real ingest gate (`--example seed_hub`), into a file-backed DB;
 #   2. boot the real `claim-hub` server over that DB and read the claim's standing;
-#   3. back up: copy the DB file (and its WAL/SHM sidecars) — the "leave by taking the file"
-#      operation the docs promise;
-#   4. restore the copy into a fresh directory and boot a second real `claim-hub` server over
-#      it — no re-seed, no re-sync;
+#   3. back up with `sqlite3 ".backup"` against the LIVE (still-running) hub — the safe
+#      "leave by taking the file" operation the docs promise;
+#   4. restore the single backup file into a fresh directory (deleting any stale sidecar so
+#      SQLite cannot recover a wrong-but-consistent state) and boot a second real `claim-hub`
+#      server over it — no re-seed, no re-sync;
 #   5. assert the restored hub's derived standing is byte-identical to the original's on the
 #      load-bearing fields (standing, verified_as_of, stale_at, and the ledger/registry
 #      as-of). The read clock (wall-clock now) legitimately differs between the two reads and
@@ -26,12 +32,20 @@
 # seed (no GitHub), and the verdict's `reported_at` is a fixed instant — so verified_as_of
 # and stale_at are fixed values, identical across the copy. The gate runs this; CI runs the
 # same script.
+#
+# `sqlite3` is a HOST tool here (the gate runner and CI's ubuntu-latest both ship it); the
+# runtime container image deliberately does NOT bundle it, so an in-container backup runs
+# `sqlite3` on the host against the mounted volume (see docs/hub.md).
 set -euo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi
+command -v sqlite3 >/dev/null 2>&1 || {
+  echo "hub-backup-restore: sqlite3 is required for the online backup; install it and retry" >&2
+  exit 1
+}
 export SQLX_OFFLINE=true
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -151,24 +165,28 @@ head_a="$(printf '%s' "$status_a" | jq '.ledger_head')"
 standing_val="$(printf '%s' "$answer_a" | jq -r '.standing')"
 [ "$standing_val" = "verified" ] || fail "seeded claim is '$standing_val', expected 'verified'"
 
-# 2. Back up by copying the one file the customer owns — plus its WAL/SHM sidecars, so the
-#    copy is consistent whether or not the WAL has been checkpointed. This is the "leave by
-#    taking the file" operation; SQLite recovers the WAL into the copy on the next open.
-echo "==> backing up: copying the database file (and its WAL/SHM sidecars)"
+# 2. Back up the LIVE hub with SQLite's online backup: a transactionally-consistent snapshot
+#    into ONE self-contained file, no sidecars. The original hub is still running (a live hub
+#    is not stopped to be backed up), which is exactly why a `cp` would be unsafe and `.backup`
+#    is not. The backup file must not pre-exist (SQLite writes it fresh).
+echo "==> backing up the live hub with sqlite3 .backup (online, consistent)"
 backup_dir="$work/backup"
 mkdir -p "$backup_dir"
-cp "$db_a" "$backup_dir/hub.db"
-[ -f "$db_a-wal" ] && cp "$db_a-wal" "$backup_dir/hub.db-wal"
-[ -f "$db_a-shm" ] && cp "$db_a-shm" "$backup_dir/hub.db-shm"
+backup_file="$backup_dir/hub.db"
+sqlite3 "$db_a" ".backup '$backup_file'" || fail "online backup (.backup) failed"
+[ -f "$backup_file" ] || fail "the backup produced no file at $backup_file"
+{ [ -f "$backup_file-wal" ] || [ -f "$backup_file-shm" ]; } \
+  && fail "the online backup left a WAL/SHM sidecar; it must be one self-contained file"
 
-# 3. Restore into a FRESH directory and boot a second real hub over it — no re-seed.
-echo "==> restoring the copy into a fresh hub and reading the same claim"
+# 3. Restore: a plain copy of the ONE backup file into a fresh directory. Delete any stale
+#    -wal/-shm beside the destination first, so SQLite cannot recover a wrong-but-consistent
+#    state from a leftover sidecar. No sidecars are restored — the backup carries none.
+echo "==> restoring the single backup file into a fresh hub and reading the same claim"
 data_b="$work/b"
 mkdir -p "$data_b"
 db_b="$data_b/hub.db"
-cp "$backup_dir/hub.db" "$db_b"
-[ -f "$backup_dir/hub.db-wal" ] && cp "$backup_dir/hub.db-wal" "$db_b-wal"
-[ -f "$backup_dir/hub.db-shm" ] && cp "$backup_dir/hub.db-shm" "$db_b-shm"
+rm -f "$db_b" "$db_b-wal" "$db_b-shm"
+cp "$backup_file" "$db_b"
 
 srv_b="$(boot_hub "$hub_bin" "$db_b" "$PORT_B" "$work/b.log")"
 status_b="$(curl -fsS "http://127.0.0.1:$PORT_B/status")" || fail "reading /status (b) failed"

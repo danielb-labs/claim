@@ -18,9 +18,11 @@
 #     curl -s http://127.0.0.1:8080/status
 #     # => {"ledger_head":0,"registry_version":0,"rejection_count":0}
 #
-# The `hub-data` volume holds `hub.db`; export it with `docker compose cp`, or delete the
-# whole hub by removing the volume (`docker compose down -v`) — export is a copy, delete is
-# an rm, and there is no database server the product runs on your behalf (HUB.md §1).
+# The `hub-data` volume holds `hub.db`. Back up a *running* hub with SQLite's online backup
+# from the host (`sqlite3 <volume>/hub.db ".backup '/backups/hub.db'"`) — a `docker compose
+# cp` of a live `hub.db` alone drops the WAL and loses the ledger tail. Delete the whole hub
+# by removing the volume (`docker compose down -v`); there is no database server the product
+# runs on your behalf (HUB.md §1). See docs/hub.md for the full ownership story.
 
 services:
   hub:
@@ -42,8 +44,12 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       # The one file the customer owns. Starts EMPTY — the hub creates hub.db here on first
-      # boot. This is what makes "boots from an empty mounted volume" literally true. Back
-      # up the hub by copying this volume's `hub.db`; leave by taking it (see docs/hub.md).
+      # boot (no config file needed: the image's CLAIM_HUB_* env overrides drive a config-less
+      # boot). This is what makes "boots from an empty mounted volume" literally true. Back up
+      # a *running* hub with SQLite's online backup from the HOST against this volume's file
+      # (`sqlite3 <volume>/hub.db ".backup '/backups/hub.db'"`), NOT `docker compose cp
+      # hub:/data/hub.db` — copying only hub.db on a live hub drops the WAL and loses the
+      # ledger tail. The image ships no sqlite3; run it on the host. See docs/hub.md.
       - hub-data:/data
 
 volumes:
