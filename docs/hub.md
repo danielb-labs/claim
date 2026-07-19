@@ -12,11 +12,11 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 > **This is v1, still growing.** The hub today ships the application shell (config,
 > the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
 > stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
-> `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets,
-> the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
+> `POST /ingest`), the **read API** (claims queries, the drifted/due/suspect sets, the ranked
+> skip queue, the per-claim dossier, and the cursor feed — every response carrying its *as-of*, all
 > over the deriver), the **web UI** (server-rendered pages over the same read model, each
 > with a machine-readable **markdown twin**), **`/llms.txt`** (the agent-facing index of every
-> surface), the **hub MCP** (the agent binding — five read-only tools over the same read
+> surface), the **hub MCP** (the agent binding — six read-only tools over the same read
 > model, mounted at `/mcp`), the **router / nag** (it notices when a fact drifts, goes stale by
 > the clock, or a skip lapses, routes each to its CODEOWNERS owner exactly once, and serves the
 > rendered nag content at `GET /api/nags` for the CI glue to deliver), and **read authentication**

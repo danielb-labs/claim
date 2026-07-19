@@ -238,6 +238,36 @@ mod tests {
     }
 
     #[test]
+    fn a_skip_whose_until_equals_the_clock_is_lapsed() {
+        // The inclusive boundary the ranking shares with the router's `lapsed_skips`: `until
+        // == clock` counts as lapsed (a window is expired at its own instant), so such a skip
+        // ranks with the lapsed class ahead of any still within its window. Both surfaces read
+        // the same lapse test, so they agree on this edge and never split a skip between "due
+        // to nag" and "still parked".
+        let now = "2026-07-18T00:00:00Z";
+        let model = model_of(
+            now,
+            vec![standing_with_skips(
+                "t",
+                "s",
+                vec![
+                    skip("a".repeat(64).as_str(), "at-boundary", Some(now)),
+                    skip(
+                        "b".repeat(64).as_str(),
+                        "aging",
+                        Some("2027-01-01T00:00:00Z"),
+                    ),
+                ],
+            )],
+        );
+        let ranked = rank_skips(&model);
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked[0].lapsed, "an `until == clock` skip is lapsed");
+        assert_eq!(ranked[0].reason, "at-boundary");
+        assert!(!ranked[1].lapsed, "the still-in-window skip ranks after it");
+    }
+
+    #[test]
     fn among_lapsed_skips_the_older_lapse_ranks_first() {
         // Rule 2: two lapsed skips sort by `until` ascending — the one that lapsed longer
         // ago is the louder, older debt.
