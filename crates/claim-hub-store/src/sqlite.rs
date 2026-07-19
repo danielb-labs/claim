@@ -490,6 +490,16 @@ impl Registry for SqliteStore {
         Ok(RegistryVersion(row.version))
     }
 
+    async fn stores(&self) -> Result<Vec<String>> {
+        // `store` is a TEXT PRIMARY KEY, which sqlite reports as nullable in query
+        // metadata; the `!` asserts the non-null the schema guarantees so the column
+        // maps to `String`, not `Option<String>`.
+        let rows = sqlx::query!(r#"SELECT store AS "store!" FROM stores ORDER BY store ASC"#)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.store).collect())
+    }
+
     async fn claims_of(&self, store: &str) -> Result<Vec<RegisteredClaim>> {
         let rows = sqlx::query!(
             r#"

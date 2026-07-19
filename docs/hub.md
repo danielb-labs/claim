@@ -11,11 +11,13 @@ single binary plus one SQLite file the customer owns — export is `cp`, delete 
 
 > **This is v1, still growing.** The hub today ships the application shell (config,
 > the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
-> stores), and the **ingest gate** (the single OIDC-authenticated verdict write path,
-> `POST /ingest`). The **JSON API**, the **hub MCP**, and the **web UI** arrive in
-> later items and mount into this same shell. A freshly booted hub reports a truthful
-> *empty* position — head 0, version 0 — until a sync populates the registry and a CI
-> lane starts pushing verdicts through the ingest gate.
+> stores), the **ingest gate** (the single OIDC-authenticated verdict write path,
+> `POST /ingest`), and the **first read endpoint** (`GET /api/claims/{id}`, the walking
+> skeleton that derives a claim's standing over the live store). The *full* JSON API,
+> the **hub MCP**, and the **web UI** arrive in later items and mount into this same
+> shell. A freshly booted hub reports a truthful *empty* position — head 0, version 0 —
+> until a sync populates the registry and a CI lane starts pushing verdicts through the
+> ingest gate.
 
 ## Running the binary
 
@@ -73,6 +75,21 @@ exposes no write path at all, rather than one that rejects everything:
 audience = "https://hub.acme.example"   # what the hub identifies itself as
 repositories = ["acme/payments"]         # connected repos a token may come from
 ```
+
+The `[deriver]` section tunes how the **read API** ages claims — the freshness window
+the deriver applies (HUB.md §2). Both values are `<N>d` day counts, the same spelling a
+claim file uses; a malformed value fails the boot loudly, naming the field:
+
+```toml
+[deriver]
+default_max_age = "30d"    # window for a claim that declares no hub.max-age
+max_age_override = "7d"     # (optional) forces this window on every claim, winning over its own
+```
+
+With no `[deriver]` section, no window applies and a passing claim stays fresh forever —
+the CLI's stance: absent a window, the hub does not invent one. `max_age_override` is the
+operator's final word on cadence for this environment; `default_max_age` is the fallback
+for claims that declare none of their own.
 
 Other sections a later item consumes are already accepted so an operator's file
 keeps working as the hub grows: `[[stores]]` (connected git stores, syncing),
@@ -175,3 +192,72 @@ A rejected push **writes no event** and returns a JSON body naming the reason
 telemetry away is visible rather than silently aging claims into stale. An
 *unavailable* identity provider is a `503`, not a rejection: the hub could not judge
 the token, so it never calls a possibly-valid push forged — the producer retries.
+
+## Reading a claim's standing (`GET /api/claims/{id}`)
+
+The hub's first read endpoint derives one claim's **standing** over the live store and
+returns it with its *as-of* — the exact inputs the answer was computed from. This is the
+read half of the loop: the CLI reports a verdict, the ingest gate lands it on the ledger,
+and this endpoint derives what that verdict (plus the clock) *means* right now.
+
+```sh
+curl -s http://127.0.0.1:8080/api/claims/payments/libfoo-pin
+```
+
+```json
+{
+  "id": "payments/libfoo-pin",
+  "store": "github.com/acme/payments",
+  "standing": "verified",
+  "verified_as_of": "2026-07-18T12:00:00Z",
+  "stale_at": "2026-08-17T12:00:00Z",
+  "due_at": null,
+  "skips": [],
+  "as_of": { "ledger_head": 1, "registry_version": 1, "clock": "2026-07-20T00:00:00Z" }
+}
+```
+
+The `standing` is the conservative join over the claim's checks — bad news dominates, so
+no combination of verdicts manufactures a green: `verified` only when every check's latest
+verdict holds *and* the claim is within its freshness window; `stale` when a check is
+overdue, broken, or never verified; `drifted` when any check's latest is `drifted`. A
+claim the registry does not know is a `404`.
+
+The **as-of** makes every answer honest and reproducible: the same (`ledger_head`,
+`registry_version`, `clock`) always derives the same standing, and the standing can never
+be older than the evidence it names. Nothing is stored — the standing is computed at read
+time from the ledger and the clock every time (invariant #3), so a claim **ages into stale
+by the clock alone**: with a `[deriver]` window set, a claim that was `verified` reads
+`stale` once the read clock passes `stale_at`, with no new verdict and no write.
+
+> **Note (v1):** the registry does not yet persist a claim's own `hub.max-age`/`recheck`
+> hints, so freshness comes from the `[deriver]` config window rather than a per-claim
+> hint. The check-identity join is already exact — a verdict lands only on the check whose
+> definition it names — so the standing itself is correct; a focused follow-up on registry
+> sync will carry each claim's own cadence through, at which point a claim's declared
+> window wins where the config sets no override. The `/api/claims/{id}` endpoint is the
+> walking skeleton; the full read surface (claims by path/repo/standing, the drifted and
+> due sets, the dossier, the cursor feed) arrives with the JSON API.
+
+## Trying the whole loop
+
+The end-to-end loop — git → sync → attested verdict → ledger → derive → read — is what the
+hub exists to close. The integration test `crates/claim-hub/tests/skeleton.rs` runs it in
+one process with an injected clock and a mocked identity provider (no network): it seeds a
+git fixture, syncs it, POSTs one attested `held` verdict through the ingest gate, and reads
+`/api/claims/{id}` to see `verified` — then advances the clock to watch the same claim age
+into `stale` with no new event.
+
+To run a hub against an empty data directory and watch it stand up its own database on
+first boot, use the compose example (a minimal from-source boot; the packaged container
+image is a later item):
+
+```sh
+docker compose -f examples/hub/docker-compose.yml up
+# in another shell:
+curl -s http://127.0.0.1:8080/status   # => head 0 / version 0 on a fresh volume
+```
+
+The `hub-data` volume starts empty and holds `hub.db`; the hub creates and migrates it on
+first boot. Export the hub by copying that file, delete it by removing the volume — export
+is a copy, delete is an `rm` (HUB.md §1).

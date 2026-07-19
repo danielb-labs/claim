@@ -1,4 +1,4 @@
-//! Shared harness for the ingest-gate integration tests.
+//! Shared harness for the hub's integration tests (ingest and the walking skeleton).
 //!
 //! The whole point is a **deterministic, network-free** verification path: the tests
 //! sign their own OIDC id-tokens with a fixed RSA key and verify them against an
@@ -6,6 +6,12 @@
 //! reaching into real time — the app's clock and the JWKS source are both parameters
 //! (CLAUDE.md's determinism rule). A forged token is signed with a *different* key, so
 //! the signature genuinely fails against the injected set.
+//!
+//! Shared by more than one test binary (`ingest.rs` and `skeleton.rs`), each of which
+//! uses a subset of these helpers, so `#![allow(dead_code)]` keeps the binary that does
+//! not exercise a given helper from warning — the helper is live in the *other* binary.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 

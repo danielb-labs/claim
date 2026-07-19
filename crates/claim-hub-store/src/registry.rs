@@ -150,6 +150,17 @@ pub trait Registry {
     /// registry. One of the deriver's memo keys.
     fn version(&self) -> impl std::future::Future<Output = Result<RegistryVersion>> + Send;
 
+    /// Every connected store's canonical id, in ascending order.
+    ///
+    /// A store appears here from the moment it is connected (its first
+    /// [`replace_store`](Registry::replace_store)/[`replace_store_snapshot`](Registry::replace_store_snapshot)),
+    /// even with no live claims — a connected-but-empty store is still connected. The
+    /// deriver-snapshot builder walks these to gather every claim across every store into
+    /// one [`claim_hub_core::RegistrySnapshot`], so a read endpoint derives the whole read
+    /// model rather than one store's slice. Ascending order keeps that build
+    /// deterministic.
+    fn stores(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+
     /// Every claim currently at tip in `store`, in ascending id order.
     ///
     /// Ascending id order makes the result deterministic, so a

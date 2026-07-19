@@ -43,8 +43,8 @@ pub mod wire;
 mod digest;
 
 pub use deriver::{
-    derive, AsOf, ClaimEntry, ClaimStanding, DeriverConfig, ReadModel, RegistrySnapshot, SkipAge,
-    Standing,
+    derive, AsOf, ClaimEntry, ClaimStanding, DerivedCheck, DerivedSkip, DeriverConfig, HubHints,
+    ReadModel, RegistrySnapshot, SkipAge, Standing,
 };
 pub use digest::check_digest;
 pub use envelope::{CheckRef, Event, EventKind, Producer};
