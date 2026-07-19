@@ -212,6 +212,7 @@ name = "claim-hub-core"
 version = "0.1.0"
 dependencies = [
  "claim-core",
+ "jiff",
  "serde",
  "serde_json",
  "sha2",

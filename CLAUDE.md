@@ -154,7 +154,13 @@ The gate is the same locally and in CI so the two can never disagree.
 Every PR is opened with `.github/PULL_REQUEST_TEMPLATE.md`, which surfaces these
 obligations as an author checklist — the gate, a diff scoped to one item, tests on
 the negative paths, docs shipping with the behavior they describe, and a one-line
-justification for any new dependency.
+justification for any new dependency. GitHub only *pre-fills* that template; a PR
+opened with an explicit body (`gh pr create --body …`) bypasses it silently. So a
+required `pull_request` check (`pr-template`, workflow `.github/workflows/pr-template.yml`,
+script `scripts/check-pr-body.sh`) enforces it: it derives the required `## ` sections
+from the template itself and fails a PR whose body drops one, naming each missing
+section. Keep every section and write "None" where one does not apply; a body that skips
+a section fails the check and cannot merge.
 
 ## Testing
 
