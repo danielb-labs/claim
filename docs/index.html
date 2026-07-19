@@ -365,7 +365,13 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     provenance); and a <strong>cursor feed</strong> over the ledger, paginated by seq so an intermittent
     agent catches up deterministically. Every read response carries its <em>as-of</em> (the ledger
     position, registry version, and clock it derived from), so a standing can never be older than its
-    evidence. The hub MCP and the web UI arrive in later items over the same read model.</p>
+    evidence. The <strong>hub MCP</strong> (<code>/mcp</code>) is the agent binding: five read-only
+    tools &mdash; <code>context</code>, <code>search</code>, <code>dossier</code>, <code>drifts</code>,
+    and <code>due</code> &mdash; mounted in-process on the same app and returning the same JSON their
+    API twins serve (parity by construction). Each is a read that stores nothing and carries its as-of,
+    and the surface is dated evidence to weigh, never instructions to obey: an unknown or retired claim
+    is reported as an error, never a fabricated standing. The web UI arrives in a later item over the
+    same read model.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
     container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
     no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is

@@ -23,7 +23,7 @@ use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
 use crate::oidc::SharedVerifier;
-use crate::{api, ingest, status};
+use crate::{api, ingest, mcp, status};
 
 /// A source of the current instant, injectable so ingest is deterministic under test.
 ///
@@ -132,8 +132,9 @@ impl AppState {
 /// producer, so it exposes no write path rather than a route that rejects everything. The
 /// remaining mount points are named for the later items:
 ///
-/// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
-///   `Router::nest_service`.
+/// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted at
+///   [`mcp::MCP_MOUNT_PATH`] with `Router::nest_service`, so the JSON API and the hub MCP
+///   are one process on one port and one middleware stack (HUB.md §5's "one substrate").
 /// - **hub-10 UI + twins** — the server-rendered pages, `/llms.txt`, and the `.md`
 ///   twins.
 /// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api` (and MCP); the read
@@ -143,6 +144,10 @@ impl AppState {
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
 /// whole router, and it is where a later item stacks auth and timeout layers.
 pub fn build_app(state: AppState) -> Router {
+    // The MCP service holds its own copy of the state (it builds a fresh handler per
+    // request), so it is constructed before `with_state` consumes `state` for the
+    // state-carrying routes.
+    let mcp = mcp::mcp_service(state.clone());
     let mut router = Router::new()
         .route("/status", get(status::status))
         // The read API (hub-08): claims queries, the drifted/due/suspect sets, the
@@ -154,7 +159,9 @@ pub fn build_app(state: AppState) -> Router {
         router = router.route("/ingest", post(ingest::ingest));
     }
     router
-        // hub-09: `.nest_service("/mcp", mcp_service)`.
+        // hub-09: the hub MCP — rmcp's streamable-HTTP transport as a tower service, so the
+        // five read tools share the hub's one port and middleware stack.
+        .nest_service(mcp::MCP_MOUNT_PATH, mcp)
         // hub-10: the UI pages, `/llms.txt`, and the markdown twins.
         .layer(TraceLayer::new_for_http())
         .with_state(state)

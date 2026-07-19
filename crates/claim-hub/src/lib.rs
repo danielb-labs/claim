@@ -31,6 +31,7 @@ pub mod app;
 pub mod config;
 pub mod http;
 pub mod ingest;
+pub mod mcp;
 pub mod oidc;
 pub mod status;
 
