@@ -250,12 +250,22 @@ fn materialize_bundle_into(dir: &Path) -> Result<()> {
 ///
 /// The temp name carries the process id and a per-process counter, so two writers —
 /// in the same process or different ones — never pick the same temp path and cannot
-/// clobber each other's in-flight file.
+/// clobber each other's in-flight file. A crash between writing the temp and renaming
+/// it can orphan a `.tmp` file; that is harmless — it is not a `dest` any reader
+/// opens, and the cache lives under a sweepable cache directory — so it is left rather
+/// than swept.
 ///
-/// On Windows, `rename` does not clobber an existing target. Because the cache is
-/// version-stamped, an existing `dest` already holds the identical bytes for this
-/// binary, so a rename that fails only because `dest` is present is treated as
-/// success and the temp file is removed; any other rename error is propagated.
+/// On Windows, `fs::rename` refuses to overwrite an existing target, so a `dest`
+/// already present makes the rename fail. This function still overwrites — the same
+/// self-healing contract as Unix, because the bundle in the binary, not whatever is on
+/// disk, is the source of truth: a same-version pre-fix binary wrote `dest` in place
+/// and a crash mid-write could have left it 0-byte or partial, so a present `dest` is
+/// not assumed good. On that failure it removes `dest` and retries the rename; a
+/// genuine error (permission, disk full) propagates rather than being swallowed. The
+/// remove/retry has a brief non-atomic window Unix's single `rename` does not, but it
+/// never leaves a torn file trusted, and Windows is not a shipped-and-tested target
+/// (CI is macOS and Linux); a fully atomic replace there would need a `MoveFileEx`
+/// (`MOVEFILE_REPLACE_EXISTING`) syscall and the Windows-only dependency to reach it.
 fn atomic_write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -270,20 +280,23 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
     fs::write(&tmp, bytes)?;
 
-    match fs::rename(&tmp, dest) {
+    let result = match fs::rename(&tmp, dest) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            // Best-effort cleanup so a failed rename leaves no stray temp file behind.
-            let _ = fs::remove_file(&tmp);
-            // Windows `rename` refuses to overwrite an existing target; the cache is
-            // version-stamped, so the present `dest` already holds these exact bytes.
-            if cfg!(target_os = "windows") && dest.exists() {
-                Ok(())
-            } else {
-                Err(err)
-            }
+        Err(_) if cfg!(target_os = "windows") && dest.exists() => {
+            // Overwrite unconditionally: drop the present (possibly torn) `dest` and
+            // retry, so a crashed pre-fix write cannot be trusted forever.
+            fs::remove_file(dest).and_then(|()| fs::rename(&tmp, dest))
         }
+        Err(err) => Err(err),
+    };
+
+    // On any error arm the temp write did not become `dest`; remove it so a failed
+    // run leaves no stray `.tmp` behind. (A crash before this point still can — see
+    // the docstring; such orphans are harmless and left for the cache sweep.)
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
 }
 
 /// The base directory for the docs cache, per platform.
@@ -514,11 +527,14 @@ mod tests {
         // With the old truncate-in-place `fs::write`, an asset spends a real window at
         // length 0 (`O_TRUNC` zeroes it before the ~250 KB PNG is written back), and a
         // reader that stats in that window sees `len == 0` — exactly the
-        // `architecture.png must not be empty` panic. The reader here asserts the same
-        // invariant the original test did — an existing asset is never length 0 — and
-        // additionally that a full read equals the embedded bytes, so a torn (partial)
-        // read is caught too. Atomic rename makes both impossible: the asset appears at
-        // `dest` only as a complete file.
+        // `architecture.png must not be empty` panic. The `len != 0` assertion below is
+        // what catches the bug: it is the same invariant the original test tripped, and
+        // the mechanism can only ever leave an asset short (0 or a growing prefix),
+        // never full-length-with-wrong-bytes. The inline byte-compare on a full-length
+        // read is a cheap extra guard, not the real content check — with truncate it
+        // can effectively only fire alongside a completed write; the post-storm
+        // full-bundle byte-check is where content is truly verified. Atomic rename makes
+        // both impossible: the asset appears at `dest` only as a complete file.
         let root = tempfile::TempDir::new().unwrap();
         let dir = root.path().to_path_buf();
 
@@ -600,12 +616,19 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_replaces_in_place_and_leaves_no_temp() {
-        // A second atomic_write to the same path replaces the contents wholesale and
-        // does not leave its temp file behind, so the cache directory holds only the
-        // materialized files, never stray `.tmp` artifacts.
+    fn atomic_write_overwrites_existing_and_leaves_no_temp() {
+        // Every run overwrites `dest` wholesale — the self-healing contract on both
+        // platforms, so a torn `dest` a crashed pre-fix write left behind is replaced,
+        // never trusted. A pre-seeded 0-byte `dest` (the exact crash-recovery shape the
+        // Windows overwrite path exists for) must be replaced by the full bytes; and
+        // atomic_write must leave no `.tmp` artifact, so the cache holds only the
+        // materialized files.
         let root = tempfile::TempDir::new().unwrap();
         let dest = root.path().join("page.html");
+
+        // Stand in for a crash-truncated `dest` from an earlier, pre-fix run.
+        fs::write(&dest, b"").unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 0);
 
         atomic_write(&dest, b"first").unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"first");

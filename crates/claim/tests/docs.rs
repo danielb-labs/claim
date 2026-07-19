@@ -293,3 +293,34 @@ fn concurrent_docs_runs_never_leave_a_torn_asset() {
         );
     }
 }
+
+#[test]
+fn cache_dir_env_var_redirects_the_site_and_is_documented() {
+    // CLAIM_DOCS_CACHE_DIR is user-facing behavior: it relocates a real user's cache
+    // ahead of the platform default. The verb must honor it — the printed page must
+    // land under the directory given — and `--help` must name it, matching the
+    // CLAIM_AGENT_CMD precedent that documents its env var in both help and docs. A
+    // rename that dropped either the honoring or the help text would slip past the
+    // docs-cover backstop, which checks verbs, not env vars.
+    let cache = TempDir::new().unwrap();
+    let out = claim_with_cache(cache.path())
+        .args(["docs"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let page = path_line(&out);
+    assert!(
+        Path::new(&page).starts_with(cache.path()),
+        "the printed page {page} must be under CLAIM_DOCS_CACHE_DIR {}",
+        cache.path().display()
+    );
+
+    let (mut claim, _cache) = claim();
+    claim
+        .args(["docs", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CLAIM_DOCS_CACHE_DIR"));
+}
