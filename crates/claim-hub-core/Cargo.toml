@@ -25,6 +25,14 @@ serde_json = { workspace = true }
 # and offer no collision resistance) and over pulling a broader crypto suite. The
 # 0.10 line is the long-stable, widely-audited RustCrypto release.
 sha2 = "0.10"
+# The deriver's freshness arithmetic adds a `hub:` day-window to a passing verdict's
+# `claim_core::Timestamp` and compares the result to the clock. `jiff` (the
+# workspace's instant type, carried over from claim-core — HUB-IMPLEMENTATION.md
+# §1.14) supplies the checked `SignedDuration` addition that surfaces range overflow
+# instead of wrapping, so an expiry can never silently wrap into the past. It is the
+# same instant type `claim_core::Timestamp` re-exports, so the two never disagree
+# about an instant's meaning; we depend on it directly only to name `SignedDuration`.
+jiff = { workspace = true }
 
 [dev-dependencies]
 # The contract test builds and drives the real `claim` binary against a temp store
