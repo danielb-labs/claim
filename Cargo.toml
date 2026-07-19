@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/claim-core", "crates/claim-store", "crates/claim", "crates/claim-hub-core", "crates/claim-hub-store"]
+members = ["crates/claim-core", "crates/claim-store", "crates/claim", "crates/claim-hub-core", "crates/claim-hub-store", "crates/claim-hub"]
 
 [workspace.package]
 version = "0.1.0"
