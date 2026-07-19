@@ -726,6 +726,310 @@ async fn an_empty_ledger_feed_is_an_empty_page_at_head_zero() {
     assert_eq!(json["ledger_head"], 0);
 }
 
+// ---- Retired claims, the `/dossier` id-shadow, and the one-integer as-of (hub-08 review) ----
+
+#[tokio::test]
+async fn a_retired_claim_reads_retired_and_its_dossier_404s() {
+    // Invariant #6: a claim the ledger knows but the registry has dropped is *retired* — it
+    // must read `retired`, never a fabricated `verified`, and its dossier (which needs a live
+    // statement) is an honest 404, never a green.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let claim = seed(
+        &store,
+        PAYMENTS,
+        ".claims/pin.md",
+        &frontmatter("payments/libfoo-pin", "hub:\n  max-age: 30d\n"),
+    )
+    .await;
+    store
+        .append(&verdict_event(
+            PAYMENTS,
+            &claim,
+            0,
+            Verdict::Held,
+            "2026-07-18T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    // Retire it: drop it from the registry tip, leaving its ledger history behind.
+    store.replace_store(PAYMENTS, &[]).await.unwrap();
+    let app = app(store);
+
+    let (status, json) = get(&app, "/api/claims/payments/libfoo-pin").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a retired claim still has a standing: {json}"
+    );
+    assert_eq!(json["standing"], "retired");
+
+    let (status, json) = get(&app, "/api/claims?standing=retired").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["payments/libfoo-pin"],
+        "the retired set holds it: {json}"
+    );
+
+    let (status, json) = get(&app, "/api/claims/payments/libfoo-pin/dossier").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no live statement to render: {json}"
+    );
+    assert!(
+        json["error"].as_str().unwrap().contains("retired"),
+        "the reason says retired: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_id_ending_in_dossier_is_not_shadowed_by_the_dossier_route() {
+    // A claim whose own id ends in `/dossier` must stay reachable at `GET /api/claims/{id}`;
+    // the trailing `/dossier` must not silently route to a dossier of the prefix (a silent
+    // wrong answer invariant #6 forbids).
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let claim = seed(
+        &store,
+        PAYMENTS,
+        ".claims/dossier.md",
+        &frontmatter("payments/dossier", "hub:\n  max-age: 30d\n"),
+    )
+    .await;
+    store
+        .append(&verdict_event(
+            PAYMENTS,
+            &claim,
+            0,
+            Verdict::Held,
+            "2026-07-18T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+    // `payments` is not a claim, so this is the standing of the claim literally named
+    // `payments/dossier`, not a dossier of `payments`.
+    let (status, json) = get(&app(store), "/api/claims/payments/dossier").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the id ending in /dossier resolves to its standing: {json}"
+    );
+    assert_eq!(json["id"], "payments/dossier");
+    assert_eq!(json["standing"], "verified");
+    assert!(
+        json.get("statement").is_none(),
+        "this is a standing, not a dossier: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_dossier_wins_over_a_same_named_claim_reachable_by_path() {
+    // The documented tie-break: when both `x` and `x/dossier` exist, `GET /api/claims/x/dossier`
+    // is x's dossier, and the standing of `x/dossier` is addressed exactly via `?path=`.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let claims = seed_many(
+        &store,
+        PAYMENTS,
+        &[
+            (".claims/pin.md", &frontmatter("payments/pin", "")),
+            (".claims/pind.md", &frontmatter("payments/pin/dossier", "")),
+        ],
+    )
+    .await;
+    store
+        .append(&verdict_event(
+            PAYMENTS,
+            &claims[0],
+            0,
+            Verdict::Held,
+            "2026-07-18T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    let app = app(store);
+
+    let (status, json) = get(&app, "/api/claims/payments/pin/dossier").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "resolves to the base claim's dossier: {json}"
+    );
+    assert_eq!(json["id"], "payments/pin");
+    assert!(
+        json.get("statement").is_some(),
+        "a dossier carries a statement: {json}"
+    );
+
+    let (status, json) = get(&app, "/api/claims?path=payments/pin/dossier").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["payments/pin/dossier"],
+        "the path filter addresses it exactly: {json}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_ledger_reports_head_zero_not_null() {
+    // The as-of is one integer contract across every surface: `0` on an empty ledger, never
+    // `null` on the claim sets while `/status` and `/api/feed` report `0`.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let (status, json) = get(&app(store), "/api/claims").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["as_of"]["ledger_head"].is_number(),
+        "ledger_head is a number, not null: {json}"
+    );
+    assert_eq!(json["as_of"]["ledger_head"], 0);
+}
+
+#[tokio::test]
+async fn the_standing_filter_accepts_stale_and_rejects_an_unknown_value() {
+    // `standing=stale` selects the stale set directly (not only via `/due`), and an
+    // unrecognized standing is a loud 400 naming the accepted set.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    // A claim whose check was never verified has lapsed freshness: stale, not drifted.
+    seed(
+        &store,
+        PAYMENTS,
+        ".claims/pin.md",
+        &frontmatter("payments/pin", "hub:\n  max-age: 30d\n"),
+    )
+    .await;
+    let app = app(store);
+
+    let (status, json) = get(&app, "/api/claims?standing=stale").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["payments/pin"],
+        "a never-verified claim is stale: {json}"
+    );
+
+    let (status, json) = get(&app, "/api/claims?standing=nonsense").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("verified, stale, drifted, suspect, retired"),
+        "the 400 names the accepted set: {json}"
+    );
+}
+
+#[test]
+fn parse_standing_round_trips_every_serialized_name() {
+    // The filter parses through the enum's own serde, so every standing's wire name is
+    // accepted and a hand-kept list here cannot drift out of step with the enum.
+    for want in [
+        Standing::Verified,
+        Standing::Stale,
+        Standing::Drifted,
+        Standing::Suspect,
+        Standing::Retired,
+    ] {
+        let value = serde_json::to_value(want).unwrap();
+        let name = value.as_str().unwrap();
+        assert_eq!(
+            parse_standing(name).unwrap(),
+            want,
+            "`{name}` parses back to its variant"
+        );
+    }
+    assert!(
+        parse_standing("verified ").is_err(),
+        "a near-miss with trailing space is rejected"
+    );
+}
+
+#[tokio::test]
+async fn a_shared_id_resolves_to_the_lexicographically_first_store() {
+    // Ids are unique only within a store; the documented M0 tie-break returns the
+    // lexicographically first (store, id), and the `store` filter addresses one exactly.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let billing = seed(
+        &store,
+        BILLING,
+        ".claims/pin.md",
+        &frontmatter("shared/pin", "hub:\n  max-age: 30d\n"),
+    )
+    .await;
+    let payments = seed(
+        &store,
+        PAYMENTS,
+        ".claims/pin.md",
+        &frontmatter("shared/pin", "hub:\n  max-age: 30d\n"),
+    )
+    .await;
+    store
+        .append(&verdict_event(
+            BILLING,
+            &billing,
+            0,
+            Verdict::Held,
+            "2026-07-18T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    store
+        .append(&verdict_event(
+            PAYMENTS,
+            &payments,
+            0,
+            Verdict::Drifted,
+            "2026-07-18T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    let app = app(store);
+
+    // BILLING sorts before PAYMENTS, so the bare id returns billing's standing (verified).
+    let (status, json) = get(&app, "/api/claims/shared/pin").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["standing"], "verified",
+        "the first store (billing) wins: {json}"
+    );
+
+    // The `store` filter addresses payments' copy exactly (drifted).
+    let (status, json) = get(
+        &app,
+        "/api/claims?store=github.com/acme/payments&standing=drifted",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["shared/pin"],
+        "the store filter reaches payments' drifted copy: {json}"
+    );
+}
+
 // ---- Determinism ----
 
 #[tokio::test]

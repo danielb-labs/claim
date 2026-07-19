@@ -131,15 +131,28 @@ impl ReadError {
 /// `GET /api/claims/{id}` and `GET /api/claims/{id}/dossier`, disambiguated by a trailing
 /// `/dossier` in the catch-all capture.
 ///
-/// The catch-all captures the whole tail after `/api/claims/`. A capture ending in
-/// `/dossier` is the dossier request for the id that precedes it; anything else is the
-/// id itself. Splitting here rather than in two routes is forced by axum: a catch-all must
-/// be the final path segment, so `/api/claims/{*id}/dossier` cannot be expressed.
+/// The catch-all captures the whole tail after `/api/claims/`. Splitting here rather than
+/// in two routes is forced by axum: a catch-all must be the final path segment, so
+/// `/api/claims/{*id}/dossier` cannot be expressed.
+///
+/// A trailing `/dossier` is the dossier request **only when the id before it names a claim
+/// the model holds**. Otherwise the whole capture is the id — including a claim whose own
+/// id legitimately ends in `/dossier` — so that claim's standing stays reachable at
+/// `GET /api/claims/{id}` instead of being silently shadowed by the dossier route (a silent
+/// wrong answer invariant #6 forbids). In the rare case both `x` and `x/dossier` exist as
+/// claims, `GET /api/claims/x/dossier` resolves to x's dossier; the standing of `x/dossier`
+/// is then addressed exactly via `GET /api/claims?path=x/dossier`.
 async fn claim_or_dossier(State(state): State<AppState>, Path(rest): Path<String>) -> Response {
-    match rest.strip_suffix("/dossier") {
-        Some(id) => dossier(&state, id).await,
-        None => claim_standing(&state, &rest).await,
+    let read = match read_state(&state).await {
+        Ok(read) => read,
+        Err(error) => return error.into_response(),
+    };
+    if let Some(prefix) = rest.strip_suffix("/dossier") {
+        if read.model.claims.keys().any(|(_, cid)| cid == prefix) {
+            return dossier(&state, &read, prefix).await;
+        }
     }
+    claim_standing(&read, &rest)
 }
 
 /// `GET /api/claims/{id}`: the derived standing of one claim, with its as-of.
@@ -149,11 +162,7 @@ async fn claim_or_dossier(State(state): State<AppState>, Path(rest): Path<String
 /// stores share a claim id (ids are unique only within a store), the lexicographically
 /// first `(store, id)` match is returned — the documented M0 tie-break; the `store` query
 /// param on `GET /api/claims` addresses a claim exactly.
-async fn claim_standing(state: &AppState, id: &str) -> Response {
-    let read = match read_state(state).await {
-        Ok(read) => read,
-        Err(error) => return error.into_response(),
-    };
+fn claim_standing(read: &ReadState, id: &str) -> Response {
     match read.model.claims.iter().find(|((_, cid), _)| cid == id) {
         Some((_, standing)) => {
             Json(StandingResponse::new(standing, read.model.as_of)).into_response()
@@ -325,7 +334,15 @@ async fn standing_set(state: &AppState, want: Standing) -> Response {
 /// registry entry, so an absent one is an honest 404, never a fabricated standing. Where
 /// the id is shared across stores, the lexicographically first store wins (as with
 /// `GET /api/claims/{id}`).
-async fn dossier(state: &AppState, id: &str) -> Response {
+///
+/// The `standing`, `history`, and `as_of` all come from the one derived model, so the
+/// trust judgment is stamped with exactly the inputs it derived from. The descriptive
+/// fields — `statement`, `checks`, `commit`, `supports` — are the registry's *current*
+/// rendering of the claim, read once more here; normally that is the same registry version
+/// the model derived from, and at most one sync ahead of it. That is a safe direction: the
+/// body can only ever describe a claim as current-or-newer than the `as_of`, never as more
+/// verified than the standing, because the standing is the model's alone.
+async fn dossier(state: &AppState, read: &ReadState, id: &str) -> Response {
     let claim_id = match id.parse::<ClaimId>() {
         Ok(id) => id,
         Err(error) => {
@@ -334,11 +351,6 @@ async fn dossier(state: &AppState, id: &str) -> Response {
                 &format!("`{id}` is not a valid claim id: {error}"),
             )
         }
-    };
-
-    let read = match read_state(state).await {
-        Ok(read) => read,
-        Err(error) => return error.into_response(),
     };
 
     // The standing locates the store: the read model is keyed by (store, id), so the first
@@ -381,7 +393,7 @@ async fn dossier(state: &AppState, id: &str) -> Response {
         .events
         .iter()
         .filter(|(_, event)| &event.store == store && event.claim == id)
-        .map(|(seq, event)| VerdictEntry::from_event(*seq, event))
+        .filter_map(|(seq, event)| VerdictEntry::from_event(*seq, event))
         .collect();
 
     let checks: Vec<CheckRef> = registered
@@ -464,21 +476,19 @@ async fn cursor_feed(State(state): State<AppState>, Query(query): Query<FeedQuer
 
 /// Parse a `standing` query value against the [`Standing`] enum's kebab-case wire names.
 ///
-/// The wire names match the enum's `serde(rename_all = "kebab-case")` so a caller filters
-/// by the same string the standing serializes as. An unrecognized value returns the
-/// actionable reason (the accepted set), which the handler answers `400` with.
+/// Deserializing through the enum's own `serde` names makes the accepted set the single
+/// source of truth: a caller filters by the exact string the standing serializes as, and
+/// a future `Standing` variant (the enum is `#[non_exhaustive]`, reserved for growth)
+/// becomes filterable automatically — there is no hand-kept list here to drift out of step
+/// with the enum. An unrecognized value returns the actionable reason, which the handler
+/// answers `400` with.
 fn parse_standing(value: &str) -> Result<Standing, String> {
-    match value {
-        "verified" => Ok(Standing::Verified),
-        "stale" => Ok(Standing::Stale),
-        "drifted" => Ok(Standing::Drifted),
-        "suspect" => Ok(Standing::Suspect),
-        "retired" => Ok(Standing::Retired),
-        other => Err(format!(
-            "unknown standing `{other}`; expected one of verified, stale, drifted, suspect, \
+    serde_json::from_value::<Standing>(serde_json::Value::String(value.to_owned())).map_err(|_| {
+        format!(
+            "unknown standing `{value}`; expected one of verified, stale, drifted, suspect, \
              retired"
-        )),
-    }
+        )
+    })
 }
 
 /// A single claim's standing plus (optionally) the read's as-of.
@@ -575,9 +585,20 @@ struct VerdictEntry {
 }
 
 impl VerdictEntry {
-    /// Render one ledger event as a history entry.
-    fn from_event(seq: u64, event: &claim_hub_core::Event) -> Self {
-        Self {
+    /// Render one ledger event as a history entry, or `None` if the event is not a verdict.
+    ///
+    /// Only a [`EventKind::Verdict`](claim_hub_core::EventKind) event carries a verdict; a
+    /// later kind (a nag, an ack) is not a verdict and must never render as one in the
+    /// history — that would be telemetry masquerading as a verdict (invariant #4). The enum
+    /// is `#[non_exhaustive]`, so a new kind lands in the `_` arm and is excluded from the
+    /// verdict history rather than mislabeled; surfacing it is a deliberate later choice,
+    /// not a silent default.
+    fn from_event(seq: u64, event: &claim_hub_core::Event) -> Option<Self> {
+        match event.kind {
+            claim_hub_core::EventKind::Verdict => {}
+            _ => return None,
+        }
+        Some(Self {
             seq,
             verdict: event.verdict,
             check: CheckRef {
@@ -588,7 +609,7 @@ impl VerdictEntry {
             commit: event.commit.clone(),
             evidence: event.evidence.clone(),
             producer: event.producer.0.clone(),
-        }
+        })
     }
 }
 

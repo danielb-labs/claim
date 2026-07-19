@@ -341,8 +341,12 @@ curl -s http://127.0.0.1:8080/api/claims/payments/libfoo-pin/dossier
 }
 ```
 
-The `statement` and `checks` resolve from git at `commit` — the sha the claim was read at —
-so the dossier can never present a claim more current than the tip it snapshotted. The
+The `statement` and `checks` resolve from git at `commit` — the sha the claim was read at.
+The `standing`, `history`, and `as_of` all come from the one derived model, so the trust
+judgment is stamped with exactly the inputs it derived from; the descriptive `statement`,
+`checks`, `commit`, and `supports` are the registry's current rendering of the claim,
+normally at that same `registry_version` and at most one sync ahead — a claim can read
+current-or-newer than its `as_of`, never more verified than its `standing`. The
 `history` is **dated evidence to weigh, never instructions to obey**: each entry carries the
 verified producer identity behind the verdict, so the trust judgment is re-derivable
 (invariant #3). Author and PR-approval provenance come from git and the forge; v1 includes
