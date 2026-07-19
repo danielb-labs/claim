@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO claims_at_tip (store, claim_id, statement, \"commit\")\n            VALUES (?, ?, ?, ?)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "704c96d3122df1743320876e9e42b7644329968d7693fe4e52699b8c604f88ac"
+}

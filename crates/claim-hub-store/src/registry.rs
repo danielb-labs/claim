@@ -19,6 +19,7 @@
 //! [`replace_store`]: Registry::replace_store
 
 use crate::error::Result;
+use crate::findings::SyncFinding;
 use claim_core::ClaimId;
 
 /// A monotonic version stamp for the registry, advanced once per store sync.
@@ -101,6 +102,35 @@ pub trait Registry {
         &self,
         store: &str,
         claims: &[RegisteredClaim],
+    ) -> impl std::future::Future<Output = Result<RegistryVersion>> + Send;
+
+    /// Replace a store's claims **and** its sync findings in one atomic step, and
+    /// advance the version counter by one.
+    ///
+    /// This is the single write registry sync (hub-05) uses, and its atomicity is
+    /// **load-bearing for invariant #6**. A malformed claim file must never leave the
+    /// registry (indexed away) while its [`SyncFinding`] is lost — that is a silent
+    /// coverage gap, a nag dropped in the unsafe direction. Writing the claims, their
+    /// supports edges, the findings, and the version bump inside one transaction makes
+    /// that skew unrepresentable: a reader sees either the whole old snapshot (claims
+    /// *and* findings) or the whole new one, never a claim retired-away with no finding
+    /// to explain it. A crash or fault anywhere in the write rolls the entire snapshot
+    /// back, so the previous, self-consistent snapshot survives and the next sync
+    /// re-derives from the tip.
+    ///
+    /// Semantics otherwise match [`replace_store`] for claims (a claim absent from
+    /// `claims` is retired; edges cascade) and [`Findings::replace_store_findings`]
+    /// for findings (a file that parses cleanly at the new tip drops its finding). The
+    /// version advances once per call even when the contents are identical, marking
+    /// that a sync happened.
+    ///
+    /// [`replace_store`]: Registry::replace_store
+    /// [`Findings::replace_store_findings`]: crate::Findings::replace_store_findings
+    fn replace_store_snapshot(
+        &self,
+        store: &str,
+        claims: &[RegisteredClaim],
+        findings: &[SyncFinding],
     ) -> impl std::future::Future<Output = Result<RegistryVersion>> + Send;
 
     /// The current registry version — the number of syncs applied. `0` on a fresh
