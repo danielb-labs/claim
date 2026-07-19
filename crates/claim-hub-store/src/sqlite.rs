@@ -12,6 +12,7 @@
 //! column or a type mismatch is a build failure, not a wrong answer at read time.
 
 use crate::error::{Result, StoreError};
+use crate::findings::{Findings, SyncFinding};
 use crate::ledger::{Appended, Ledger, Position, StoredEvent};
 use crate::registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 use claim_core::{ClaimId, Timestamp, Verdict};
@@ -491,6 +492,82 @@ impl Registry for SqliteStore {
                 })
             })
             .collect()
+    }
+}
+
+impl Findings for SqliteStore {
+    async fn replace_store_findings(&self, store: &str, findings: &[SyncFinding]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // The store row must exist for the FK; a sync always replaces the registry
+        // first (which inserts it), but insert-or-ignore here keeps this method safe to
+        // call independently. Then wipe the store's findings and re-insert the current
+        // set, so a file fixed at the new tip no longer nags.
+        sqlx::query!("INSERT OR IGNORE INTO stores (store) VALUES (?)", store)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM sync_findings WHERE store = ?", store)
+            .execute(&mut *tx)
+            .await?;
+        for f in findings {
+            sqlx::query!(
+                r#"
+                INSERT INTO sync_findings (store, file, "commit", reason)
+                VALUES (?, ?, ?, ?)
+                "#,
+                store,
+                f.file,
+                f.commit,
+                f.reason,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn findings(&self) -> Result<Vec<SyncFinding>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT store, file, "commit" AS commit_sha, reason
+            FROM sync_findings
+            ORDER BY store ASC, file ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SyncFinding {
+                store: r.store,
+                file: r.file,
+                commit: r.commit_sha,
+                reason: r.reason,
+            })
+            .collect())
+    }
+
+    async fn findings_of(&self, store: &str) -> Result<Vec<SyncFinding>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT file, "commit" AS commit_sha, reason
+            FROM sync_findings
+            WHERE store = ?
+            ORDER BY file ASC
+            "#,
+            store,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SyncFinding {
+                store: store.to_owned(),
+                file: r.file,
+                commit: r.commit_sha,
+                reason: r.reason,
+            })
+            .collect())
     }
 }
 

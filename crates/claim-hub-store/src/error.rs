@@ -59,6 +59,65 @@ pub enum StoreError {
         /// The offending stored value.
         value: String,
     },
+
+    /// The `git` binary could not be spawned to mirror a store — it is not installed
+    /// or not on `PATH`. Registry sync shells to the system `git` (the one runtime
+    /// dependency beside the hub binary, HUB-IMPLEMENTATION.md §1.6), so a missing
+    /// binary is a real deployment fault named for the operator, not a state to
+    /// continue past silently. Distinct from a git command that ran and exited
+    /// non-zero ([`StoreError::Git`]).
+    #[error("failed to run `git {args}` while syncing store {store}; is git installed and on PATH? ({source})")]
+    GitSpawn {
+        /// The connected store the sync was mirroring, so the operator knows which.
+        store: String,
+        /// The git subcommand and arguments that could not be spawned.
+        args: String,
+        /// The underlying spawn error.
+        source: std::io::Error,
+    },
+
+    /// A git command that must succeed to mirror or read a store ran and exited
+    /// non-zero — a clone against an unreachable remote, a fetch that failed, a
+    /// tip that could not be resolved. Carries git's own stderr so the operator sees
+    /// exactly what git reported. A sync that cannot mirror is a loud failure the
+    /// interval driver reports and retries next tick, never a silently empty
+    /// snapshot that would retire every claim (invariant #6).
+    #[error("`git {args}` failed while syncing store {store}: {stderr}")]
+    Git {
+        /// The connected store the sync was mirroring.
+        store: String,
+        /// The git subcommand and arguments that failed.
+        args: String,
+        /// Git's stderr, trimmed.
+        stderr: String,
+    },
+
+    /// A filesystem fault while preparing a store's mirror or its tip checkout — a
+    /// mirror directory or worktree could not be created, listed, or removed.
+    /// Distinct from a git command failure so the message can name the path, and
+    /// distinct from a malformed claim file, which is a recorded
+    /// [`SyncFinding`](crate::SyncFinding), never an error that fails the sync.
+    #[error("{context}: {source}")]
+    Io {
+        /// What was being attempted, naming the path, so the message is actionable.
+        context: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// A store's checked-out `.claims/` corpus itself could not be read — the
+    /// directory could not be listed. This is the whole-corpus failure
+    /// [`claim_store::Store::load_all`] raises, distinct from a single malformed
+    /// file (which becomes a recorded [`SyncFinding`](crate::SyncFinding)). Wraps
+    /// the store crate's error message, since a sync failing to read a tip at all is
+    /// an environment fault, not a per-claim nag.
+    #[error("failed to read the .claims/ corpus while syncing store {store}: {reason}")]
+    Corpus {
+        /// The connected store whose tip corpus could not be read.
+        store: String,
+        /// The underlying store-load error, as text.
+        reason: String,
+    },
 }
 
 /// The store's result type.

@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT store, file, \"commit\" AS commit_sha, reason\n            FROM sync_findings\n            ORDER BY store ASC, file ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "store",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "file",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_sha",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "reason",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0ffed532708381229baeb3af140741c09369e08d88bb75cdee4edf0db2b10527"
+}
