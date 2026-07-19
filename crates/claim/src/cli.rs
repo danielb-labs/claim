@@ -360,6 +360,7 @@ TOPICS (the page `claim docs <topic>` selects; default is the overview):
   ci             the two CI lanes, exit codes, and the renderer
   agent-checks   the CLAIM_AGENT_CMD runner contract and verdict mapping
   dogfooding     how this repo verifies its own decisions with claim
+  hub            self-hosting the hub: the binary, config, and /status
 
 The site is bundled into this binary, so it always matches the version you ran.
 `claim docs` writes it to a per-version cache directory and prints the path — only
@@ -383,8 +384,8 @@ ENVIRONMENT:
 #[derive(Debug, clap::Args)]
 #[command(after_long_help = DOCS_HELP)]
 pub struct DocsArgs {
-    /// The topic page: `ci`, `agent-checks`, or `dogfooding`. Omitted, the overview
-    /// (`index.html`).
+    /// The topic page: `ci`, `agent-checks`, `dogfooding`, or `hub`. Omitted, the
+    /// overview (`index.html`).
     #[arg(value_name = "TOPIC")]
     pub topic: Option<String>,
 

@@ -72,6 +72,10 @@ const BUNDLE: &[BundledFile] = &[
         bytes: include_bytes!("../../../../docs/dogfooding.md"),
     },
     BundledFile {
+        rel: "hub.md",
+        bytes: include_bytes!("../../../../docs/hub.md"),
+    },
+    BundledFile {
         rel: "assets/architecture.png",
         bytes: include_bytes!("../../../../docs/assets/architecture.png"),
     },
@@ -94,6 +98,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("ci", "ci.md"),
     ("agent-checks", "agent-checks.md"),
     ("dogfooding", "dogfooding.md"),
+    ("hub", "hub.md"),
 ];
 
 /// The machine form of `claim docs`, stable across runs.
@@ -513,6 +518,7 @@ mod tests {
             "ci.md",
             "agent-checks.md",
             "dogfooding.md",
+            "hub.md",
         ] {
             let path = dir.join(rel);
             let meta = fs::metadata(&path).unwrap_or_else(|_| panic!("{rel} was not written"));
