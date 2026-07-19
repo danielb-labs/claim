@@ -249,6 +249,7 @@ jobs:
 | `audience` | The identifier the OIDC token is minted for. **It must equal the hub's configured `[oidc].audience`**, or the hub rejects the token (`401`, wrong audience). |
 | `claims-dir` | The directory holding the `.claims/` store to check. Default `.`. |
 | `claim-bin` | The `claim` binary to run. Default `claim` (on `PATH`). |
+| `max-time` | Seconds bounding each HTTP request (the token mint and the ingest POST). Default `60`. A hub that stalls after accepting the connection times out into a loud failure rather than hanging the lane. |
 
 Two things are load-bearing:
 
@@ -272,6 +273,15 @@ for a wrong audience or a bad signature, a `400` for a claim the hub has not syn
 a `503` when the identity provider is unreachable each fail the step with the reason
 named, so a hub silently dropping telemetry can never masquerade as a healthy lane.
 
+The same holds when the hub does not answer at all. A refused connection fails the step
+immediately; a hub that accepts the connection then stalls (a slow-loris or half-dead
+hub) is bounded by `max-time` (default 60 seconds) and fails with `the hub did not
+respond within Ns (timed out)` — never an indefinite hang to the runner's wall-clock. A
+`2xx` is also not trusted on its face: the Action requires the hub's accepted-envelope
+JSON (`{"accepted": N}`) before declaring success, so a proxy interstitial or CDN page
+returning `200` with a non-JSON body fails loudly rather than reading as a phantom
+acceptance.
+
 A **drift is not a failure** of the push: `claim check` exiting `1` (drifted) or `2`
 (broken) is exactly the telemetry the hub exists to receive, so the Action pushes the
 report regardless of the check's verdict and succeeds when the *ingest* is accepted. What
@@ -287,9 +297,11 @@ parameterized so the flow runs without a real runner: the Action's YAML mints th
 (the one runner-specific step) and hands it to the script through `HUB_INGEST_TOKEN`; a
 test injects a token the local hub accepts through the same seam. The gate exercises the
 whole flow against a locally-served hub with a mocked identity provider
-(`crates/claim-hub/tests/ingest_action.rs`) — proving a valid push succeeds, an ingest
-rejection fails the step with the hub's reason, and no non-2xx is ever swallowed — with
-no network to GitHub.
+(`crates/claim-hub/tests/ingest_action.rs`) — proving a valid push succeeds, a drifted or
+broken verdict is still pushed as telemetry, an ingest rejection fails the step with the
+hub's reason, no non-2xx is ever swallowed, and a hub that refuses the connection or never
+responds fails the step loudly (the latter via `--max-time`) rather than hanging — with no
+network to GitHub.
 
 ## Reading a claim's standing (`GET /api/claims/{id}`)
 

@@ -155,7 +155,9 @@ repo. That authentication and attestation live in the hub's action, out of CLI s
 That Action ships with the hub as **`hub-ingest`**
 (`.github/actions/hub-ingest`): it needs `permissions: id-token: write` to mint the
 runner's OIDC identity, and it **fails the CI step loudly on any non-2xx from the hub** —
-a rejected or broken push never passes as green. See the hub doc's
+a rejected or broken push never passes as green. A hub that never answers is bounded by a
+per-request timeout (`max-time`, default 60s) and fails loudly rather than hanging the
+step. See the hub doc's
 [Pushing verdicts from CI](hub.md#pushing-verdicts-from-ci-the-ingest-action) for the
 adoption workflow and the `id-token: write` / audience configuration.
 

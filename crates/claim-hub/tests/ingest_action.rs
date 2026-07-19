@@ -25,6 +25,17 @@
 //!   output, and appends nothing.
 //! - [`a_non_2xx_is_never_swallowed`] — the script's exit code is non-zero on every
 //!   non-2xx, so a rejected push can never pass as green (CLAUDE.md invariants #1/#6).
+//!
+//! The telemetry-is-pushed-regardless arm covers both non-held verdicts: a drift
+//! ([`a_drifted_report_is_still_pushed_not_swallowed`]) and a **broken** check
+//! ([`a_broken_report_is_still_pushed_not_swallowed`]) each still land on the ledger,
+//! because a broken verdict is exactly the rot the hub exists to surface (invariant #1).
+//!
+//! The hub-transport failure arm covers the two ways the hub can be unreachable without a
+//! non-2xx: a **connection refused** ([`a_connection_refused_fails_the_step_loudly`]) and
+//! a hub that accepts the connection but **never responds**
+//! ([`a_hub_that_never_responds_times_out_loudly`]) — both must fail loudly rather than
+//! hang the lane to the runner's wall-clock (invariants #1/#6).
 
 mod common;
 
@@ -186,6 +197,96 @@ async fn a_drifted_report_is_still_pushed_not_swallowed() {
     assert_eq!(events[0].event.verdict, claim_core::Verdict::Drifted);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_report_is_still_pushed_not_swallowed() {
+    // A broken verdict is the load-bearing arm of invariant #1: a check that could not run
+    // is telemetry the hub must receive, never a swallowed green. Seed a check that is
+    // killed by a signal (`kill -KILL $$` — a death-by-signal outcome, unconditionally
+    // `Broken`), so the CLI reports `broken` (exit 2). The push must still land a `Broken`
+    // event and the script must succeed — the ingest was accepted, and it is the hub's job
+    // to nag on the broken fact, not the lane's to hide it.
+    let broken_frontmatter =
+        "id: payments/libfoo-pin\nchecks:\n  - kind: cmd\n    run: \"kill -KILL $$\"";
+    let hub = ServedHub::start_with_claim(broken_frontmatter).await;
+    let claims_dir = claims_store_with(PIN_ID, broken_frontmatter);
+
+    let token = sign_token(&TokenClaims::valid());
+    let run = run_script(&hub, claims_dir.path(), Some(&token), TEST_AUDIENCE).await;
+
+    assert!(
+        run.status.success(),
+        "a broken verdict is pushed, not swallowed; the ingest itself succeeded: \
+         stdout=<{}> stderr=<{}>",
+        run.stdout,
+        run.stderr
+    );
+    let events = hub.store.scan_from(Position(0)).await.unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "the broken verdict was pushed as telemetry"
+    );
+    assert_eq!(events[0].event.verdict, claim_core::Verdict::Broken);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_refused_fails_the_step_loudly() {
+    // A hub that cannot be reached at all (nothing listening on the port) must fail the
+    // lane loudly — a connection failure is a non-delivery, and invariant #6 forbids it
+    // degrading to a stale green. Point the script at a closed port and assert a non-zero
+    // exit with the transport reason, and that nothing was recorded anywhere reachable.
+    let closed_url = closed_port_url();
+    let claims_dir = claims_store_with(PIN_ID, PIN_FRONTMATTER);
+
+    let token = sign_token(&TokenClaims::valid());
+    let run = run_script_at(&closed_url, claims_dir.path(), Some(&token), TEST_AUDIENCE).await;
+
+    assert!(
+        !run.status.success(),
+        "a refused connection fails the step; stdout=<{}> stderr=<{}>",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("failed to complete") || run.stderr.contains("unreachable"),
+        "the script names the transport failure: {}",
+        run.stderr
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_never_responds_times_out_loudly() {
+    // The slow-loris / half-dead hub: it accepts the TCP connection but never sends a
+    // response. Without `--max-time` the script would hang to the runner's wall-clock;
+    // with it, the step must fail loudly and name the timeout (invariants #1/#6). A tiny
+    // `--max-time` keeps the test fast; a listener that accepts but never answers stands
+    // in for the stalled hub.
+    let stalled = StalledHub::start().await;
+    let claims_dir = claims_store_with(PIN_ID, PIN_FRONTMATTER);
+
+    let token = sign_token(&TokenClaims::valid());
+    let run = run_script_with_max_time(
+        &stalled.base_url(),
+        claims_dir.path(),
+        Some(&token),
+        TEST_AUDIENCE,
+        1,
+    )
+    .await;
+
+    assert!(
+        !run.status.success(),
+        "a hub that never responds fails the step; stdout=<{}> stderr=<{}>",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("did not respond") && run.stderr.contains("timed out"),
+        "the script names the timeout as the reason: {}",
+        run.stderr
+    );
+}
+
 /// A hub served over a real ephemeral TCP port, so the script's `curl` reaches a genuine
 /// HTTP endpoint (not the in-process `oneshot` the other tests use — the script speaks
 /// real HTTP). Holds the store so a test reads the ledger back, and the bound address so
@@ -279,28 +380,59 @@ struct ScriptRun {
 
 /// Run `ci/hub-ingest.sh` against `hub`, checking the `.claims/` store at `claims_dir`.
 ///
-/// `token` is injected through the script's `HUB_INGEST_TOKEN` seam (the runner-agnostic
-/// path); `None` leaves it unset AND scrubs the GitHub runner env, so the script's
-/// token-acquisition fails loudly rather than reaching a real endpoint. `audience` is what
-/// the script would mint the token for — passed through so a test can prove the argument
-/// is wired, though with an injected token the value is not used to mint.
-///
-/// The script is spawned through [`tokio::task::spawn_blocking`], so its blocking wait for
-/// the child process does not tie up a runtime worker the served hub's axum task needs to
-/// answer the script's `curl` — without this the (few-threaded) test runtime deadlocks: the
-/// script blocks waiting for a response the server never gets scheduled to send.
+/// A thin wrapper over [`run_script_at`] that supplies the served hub's URL; see it for
+/// the seam and threading contract.
 async fn run_script(
     hub: &ServedHub,
     claims_dir: &Path,
     token: Option<&str>,
     audience: &str,
 ) -> ScriptRun {
+    run_script_at(&hub.base_url(), claims_dir, token, audience).await
+}
+
+/// Run `ci/hub-ingest.sh` against an arbitrary `hub_url`, checking the `.claims/` store at
+/// `claims_dir`, with the script's default `--max-time`.
+///
+/// Taking a bare URL (not a `ServedHub`) lets the transport-failure tests point the script
+/// at a closed port or a stalled listener. See [`run_script_with_max_time`] for the seam
+/// and threading contract.
+async fn run_script_at(
+    hub_url: &str,
+    claims_dir: &Path,
+    token: Option<&str>,
+    audience: &str,
+) -> ScriptRun {
+    run_script_with_max_time(hub_url, claims_dir, token, audience, None).await
+}
+
+/// Run `ci/hub-ingest.sh` against `hub_url`, optionally overriding `--max-time` (seconds).
+///
+/// `token` is injected through the script's `HUB_INGEST_TOKEN` seam (the runner-agnostic
+/// path); `None` leaves it unset AND scrubs the GitHub runner env, so the script's
+/// token-acquisition fails loudly rather than reaching a real endpoint. `audience` is what
+/// the script would mint the token for — passed through so a test can prove the argument
+/// is wired, though with an injected token the value is not used to mint. `max_time`, when
+/// `Some`, bounds each HTTP request so the timeout path is reached fast in the test.
+///
+/// The script is spawned through [`tokio::task::spawn_blocking`], so its blocking wait for
+/// the child process does not tie up a runtime worker the served hub's axum task needs to
+/// answer the script's `curl` — without this the (few-threaded) test runtime deadlocks: the
+/// script blocks waiting for a response the server never gets scheduled to send.
+async fn run_script_with_max_time(
+    hub_url: &str,
+    claims_dir: &Path,
+    token: Option<&str>,
+    audience: &str,
+    max_time: impl Into<Option<u64>>,
+) -> ScriptRun {
     let script = script_path();
-    let hub_url = hub.base_url();
+    let hub_url = hub_url.to_owned();
     let audience = audience.to_owned();
     let claims_dir = claims_dir.to_path_buf();
     let claim_bin = claim_binary();
     let token = token.map(str::to_owned);
+    let max_time = max_time.into();
 
     tokio::task::spawn_blocking(move || {
         let mut command = Command::new("bash");
@@ -314,6 +446,9 @@ async fn run_script(
             .arg(claims_dir)
             .arg("--claim-bin")
             .arg(claim_bin);
+        if let Some(max_time) = max_time {
+            command.arg("--max-time").arg(max_time.to_string());
+        }
 
         // Scrub any ambient GitHub-runner OIDC env so the injection seam is the ONLY token
         // source under test — a developer running this on a self-hosted runner cannot leak a
@@ -338,6 +473,53 @@ async fn run_script(
     })
     .await
     .expect("the script task ran to completion")
+}
+
+/// A `--hub-url` pointing at a port with nothing listening, so the script's POST is
+/// refused. Bind an ephemeral port to learn a free one, then drop the listener so the
+/// port is closed by the time the script connects. A subsequent bind by another process is
+/// possible but vanishingly unlikely in a test run, and a *different* listener would still
+/// not answer `/ingest` with an accepted envelope, so the test stays loud either way.
+fn closed_port_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("the bound address");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// A listener that accepts connections but never answers — the slow-loris / half-dead hub.
+/// It stands in for a hub that takes the TCP connection then stalls, so the script's
+/// `--max-time` is what must end the wait.
+struct StalledHub {
+    addr: SocketAddr,
+    _server: AbortOnDrop,
+}
+
+impl StalledHub {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("the bound address");
+        // Accept every connection and then hold it open forever, reading nothing and
+        // writing nothing, so the client's request never receives a response. Holding the
+        // accepted sockets in a vec keeps them from being closed (which would let curl see
+        // EOF and fail fast instead of timing out).
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        Self {
+            addr,
+            _server: AbortOnDrop(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
 }
 
 /// Write a real `.claims/` store containing one claim, so the in-tree `claim` binary

@@ -41,6 +41,13 @@ inputs:
     description: The `claim` binary to run (a path, or a name on PATH).
     required: false
     default: claim
+  max-time:
+    description: >
+      Seconds bounding each HTTP request (the OIDC token mint and the ingest POST). A hub
+      that accepts the connection then never answers times out into a loud failure rather
+      than hanging the step to the runner's wall-clock.
+    required: false
+    default: "60"
 
 runs:
   using: composite
@@ -88,15 +95,18 @@ runs:
         HUB_AUDIENCE: ${{ inputs.audience }}
         CLAIMS_DIR: ${{ inputs.claims-dir }}
         CLAIM_BIN: ${{ inputs.claim-bin }}
+        HUB_MAX_TIME: ${{ inputs.max-time }}
         # The action's own directory, so the script is found regardless of the caller's
         # checkout layout. GITHUB_ACTION_PATH points at this action's root.
         ACTION_PATH: ${{ github.action_path }}
       # Inputs are passed via env, never interpolated into the command line, to keep
       # untrusted input off the shell (the Actions injection footgun). The script under
-      # ci/ is two levels up from this action directory (.github/actions/hub-ingest).
+      # ci/ is three levels up from this action directory: hub-ingest → actions →
+      # .github → repo root (.github/actions/hub-ingest), hence `../../../`.
       run: |
         "$ACTION_PATH/../../../ci/hub-ingest.sh" \
           --hub-url "$HUB_URL" \
           --audience "$HUB_AUDIENCE" \
           --claims-dir "$CLAIMS_DIR" \
-          --claim-bin "$CLAIM_BIN"
+          --claim-bin "$CLAIM_BIN" \
+          --max-time "$HUB_MAX_TIME"
