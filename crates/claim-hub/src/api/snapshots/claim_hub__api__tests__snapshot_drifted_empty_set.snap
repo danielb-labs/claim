@@ -1,0 +1,12 @@
+---
+source: crates/claim-hub/src/api/tests.rs
+expression: json
+---
+{
+  "as_of": {
+    "clock": "2026-07-20T00:00:00Z",
+    "ledger_head": 1,
+    "registry_version": 1
+  },
+  "claims": []
+}

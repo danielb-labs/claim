@@ -336,6 +336,7 @@ dependencies = [
  "claim-hub-core",
  "claim-hub-store",
  "http-body-util",
+ "insta",
  "jsonwebtoken",
  "predicates",
  "reqwest",
@@ -1271,6 +1272,7 @@ checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
 dependencies = [
  "console",
  "once_cell",
+ "serde",
  "similar",
  "tempfile",
 ]

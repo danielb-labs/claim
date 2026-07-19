@@ -142,3 +142,8 @@ assert_cmd = "2"
 # Match the binary's stderr against the named-message expectations (which argument,
 # which variable) rather than a brittle full-string compare. Approved stack (CLAUDE.md).
 predicates = "3"
+# Snapshot-test the read API's response shapes (hub-08): `insta` pins each endpoint's
+# JSON body so a format change is deliberate and reviewable — the approved snapshot stack
+# (CLAUDE.md). The `json` feature renders a `serde_json::Value` as a stable snapshot; no
+# redactions are needed because the tests fix every input (clock, digests) to constants.
+insta = { version = "1", features = ["json"] }
