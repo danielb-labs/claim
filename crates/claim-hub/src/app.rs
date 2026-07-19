@@ -22,7 +22,10 @@ use claim_hub_core::{DeriverConfig, Memo};
 use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
+use crate::authlayer::{self, AuthLayerState};
+use crate::metadata;
 use crate::oidc::SharedVerifier;
+use crate::scope::RequiredScope;
 use crate::{api, ingest, mcp, status, ui};
 
 /// A source of the current instant, injectable so ingest is deterministic under test.
@@ -84,6 +87,14 @@ pub struct AppState {
     /// no data directory configured yet — the router then dead-letters every owned rule,
     /// honestly, since there is no mirror to read.
     pub mirror_root: Option<std::path::PathBuf>,
+    /// The resolved read-auth layer state (hub-13), or `None` when no read-auth policy is
+    /// installed. `None` means the read surfaces are served **unauthenticated** — used by
+    /// tests that exercise a surface directly. The binary's boot path ([`crate::serve`])
+    /// **always** installs a policy (resolved by [`crate::serve`]), which enforces
+    /// secure-by-default and fails loudly rather than serving open by accident; so a
+    /// production hub never has `None` here, and this open path is a test affordance, not a
+    /// live default.
+    pub read_auth: Option<Arc<AuthLayerState>>,
 }
 
 impl AppState {
@@ -104,6 +115,7 @@ impl AppState {
             memo: Arc::new(Memo::new()),
             deriver_config: DeriverConfig::default(),
             mirror_root: None,
+            read_auth: None,
         }
     }
 
@@ -146,49 +158,93 @@ impl AppState {
         self.deriver_config = config;
         self
     }
+
+    /// This state with a resolved read-auth policy installed — boot installs the policy it
+    /// resolved from `[read_auth]`.
+    ///
+    /// With this set, [`build_app`] wraps every read surface in the auth layer and serves
+    /// the RFC 9728 metadata document. Without it, the read surfaces serve unauthenticated
+    /// (the test affordance; the binary always sets it).
+    #[must_use]
+    pub fn with_read_auth(mut self, read_auth: Arc<AuthLayerState>) -> Self {
+        self.read_auth = Some(read_auth);
+        self
+    }
 }
 
-/// Assemble the hub's axum [`Router`] over `state`, with the shared middleware stack.
+/// Assemble the hub's axum [`Router`] over `state`, with the read-auth layer and the shared
+/// middleware stack.
 ///
-/// The router is the mount board for every hub surface. It mounts `/status` always, the
-/// read API ([`api::router`] — the claims queries, the derived sets, the dossier, and the
-/// cursor feed, all under `/api`), the UI ([`ui::router`] — the server-rendered queue,
-/// dossier, and status pages, each with a `.md` markdown twin, plus `/llms.txt`), the hub
-/// MCP ([`mcp`] — five read-only tools over the same read model, nested at
-/// [`mcp::MCP_MOUNT_PATH`] so the JSON API and the MCP are one process on one port and one
-/// middleware stack, HUB.md §5's "one substrate"), and the ingest route `POST /ingest`
-/// **only when the state carries a verifier** — a hub with no OIDC config has no way to
-/// authenticate a producer, so it exposes no write path rather than a route that rejects
-/// everything. The remaining mount point is named for the later item:
+/// The router is the mount board for every hub surface, split into two groups so read auth
+/// (hub-13) covers exactly the right ones:
 ///
-/// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api`, the UI, and MCP; the
-///   read routes are unauthenticated until it lands.
+/// **Protected** (wrapped in the read-auth layer when `state.read_auth` is set): the read
+/// API ([`api::router`] — claims queries, the derived sets, the dossier, the cursor feed,
+/// under `/api`), the UI ([`ui::router`] — the server-rendered pages, their `.md` twins,
+/// and `/llms.txt`), and the hub MCP ([`mcp`] — the read tools nested at
+/// [`mcp::MCP_MOUNT_PATH`]). One [`authlayer::protect`] layer wraps the whole group, so
+/// every read surface is gated **uniformly** and a read route added to this group later is
+/// covered for free — there is no read route the layer does not cover.
 ///
-/// The [`TraceLayer`] wraps every route so a request carries a tracing span through
-/// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
-/// whole router, and it is where a later item stacks auth and timeout layers.
+/// **Unauthenticated by design**: `/status` (machine-readable health — a monitor must reach
+/// it without a credential), the RFC 9728 metadata document at
+/// [`metadata::METADATA_PATH`] (discovery data a client reads *before* it can authenticate),
+/// and — only with a verifier — `POST /ingest` (the telemetry write path, which carries its
+/// own OIDC authentication, distinct from read auth). Each of these is mounted **outside**
+/// the read-auth layer here, so its exposure is a visible, reviewed decision, not an
+/// accident (a security requirement of hub-13).
+///
+/// When `state.read_auth` is `None` the read group is served without the layer — the test
+/// affordance; the binary's boot path always installs a resolved policy, which enforces
+/// secure-by-default.
+///
+/// The [`TraceLayer`] wraps the whole router so a request carries a tracing span through
+/// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes every route,
+/// the auth layer included.
 pub fn build_app(state: AppState) -> Router {
     // The MCP service holds its own copy of the state (it builds a fresh handler per
     // request), so it is constructed before `with_state` consumes `state` for the
     // state-carrying routes.
     let mcp = mcp::mcp_service(state.clone());
-    let mut router = Router::new()
-        .route("/status", get(status::status))
-        // The read API (hub-08): claims queries, the drifted/due/suspect sets, the
-        // dossier, and the cursor feed, all over the deriver under `/api`.
+
+    // The protected read group: the API, the UI + twins, and the MCP. Assembled as one
+    // sub-router so a single auth layer covers all of it uniformly.
+    let read_group = Router::new()
         .merge(api::router())
-        // The UI (hub-10): server-rendered pages over the same read model, each with a
-        // markdown twin at its path + `.md`, plus `/llms.txt` indexing every surface.
-        .merge(ui::router());
+        .merge(ui::router())
+        .nest_service(mcp::MCP_MOUNT_PATH, mcp);
+    let read_group = match &state.read_auth {
+        // Wrap every read route in the read-auth layer, enforcing the read scope. This is
+        // the outer layer that covers `/api`, `/ui`, `/llms.txt`, and `/mcp` at once.
+        Some(auth) => authlayer::protect(read_group, auth.clone(), RequiredScope::READ),
+        // No policy installed (a test): the read surfaces serve unauthenticated.
+        None => read_group,
+    };
+
+    // The unauthenticated surfaces, deliberately outside the read-auth layer.
+    let mut public = Router::new().route("/status", get(status::status));
+    if let Some(auth) = &state.read_auth {
+        // The RFC 9728 metadata document, served unauthenticated so a client discovers how
+        // to authenticate — mounted only when a policy is installed, since without one there
+        // is nothing to discover.
+        let metadata = auth.metadata().clone();
+        public = public.route(
+            metadata::METADATA_PATH,
+            get(move || {
+                let metadata = metadata.clone();
+                async move { axum::Json(metadata) }
+            }),
+        );
+    }
     if state.verifier.is_some() {
         // The single telemetry write path (HUB.md §3). Mounted only with a verifier so a
-        // hub that cannot authenticate producers exposes no ingest at all.
-        router = router.route("/ingest", post(ingest::ingest));
+        // hub that cannot authenticate producers exposes no ingest at all. It carries its
+        // own OIDC authentication, so it sits outside the read-auth layer.
+        public = public.route("/ingest", post(ingest::ingest));
     }
-    router
-        // hub-09: the hub MCP — rmcp's streamable-HTTP transport as a tower service, so the
-        // five read tools share the hub's one port and middleware stack.
-        .nest_service(mcp::MCP_MOUNT_PATH, mcp)
+
+    public
+        .merge(read_group)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

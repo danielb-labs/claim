@@ -122,8 +122,11 @@ async fn serve_fails_loudly_when_the_listen_address_cannot_be_bound() {
     // socket to any real peer is attempted, only a local bind that the kernel refuses.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("hub.db");
+    // `open_reads = true` so read-auth resolution (which runs before the bind, enforcing
+    // secure-by-default) succeeds and the failure is genuinely the bind — this test is
+    // about the listener, not the auth policy.
     let config = Config::from_toml(&format!(
-        "database = {:?}\nlisten = \"192.0.2.1:8080\"\n",
+        "database = {:?}\nlisten = \"192.0.2.1:8080\"\n[read_auth]\nopen_reads = true\n",
         db_path.to_str().unwrap()
     ))
     .unwrap();

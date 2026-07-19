@@ -1,5 +1,6 @@
 ---
 source: crates/claim-hub/src/ui/tests.rs
+assertion_line: 810
 expression: body
 ---
 # claim hub
@@ -35,6 +36,16 @@ cannot describe different facts.
 - [/ui/queue](/ui/queue) — the review queue (the human's primary "what needs a look"). Twin: [/ui/queue.md](/ui/queue.md).
 - [/ui/claims/{id}](/ui/claims/{id}) — a claim's dossier. Twin: [/ui/claims/{id}.md](/ui/claims/{id}.md).
 - [/ui/status](/ui/status) — the hub's health and position. Twin: [/ui/status.md](/ui/status.md).
+
+## Authentication (how to read)
+
+The read surfaces (the JSON API, the UI and its twins, and the MCP) require a bearer
+credential unless the operator has explicitly opted into open reads for a trusted private
+network. An unauthenticated read is a `401` carrying a `WWW-Authenticate: Bearer
+resource_metadata="…"` pointer to the discovery document below; a credential lacking the
+required scope is a `403`.
+
+- [GET /.well-known/oauth-protected-resource](/.well-known/oauth-protected-resource): the RFC 9728 protected-resource metadata — the resource identifier, the authorization server(s) to obtain a token from, and the scopes supported. Served unauthenticated so a client can discover how to authenticate. `/status` and this document are the only unauthenticated read surfaces.
 
 ## Ingest (the single write path — not a read)
 
