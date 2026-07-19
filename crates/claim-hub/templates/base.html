@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}claim hub{% endblock %}</title>
+<style>{% include "style.css" %}</style>
+</head>
+<body>
+<div class="wrap">
+<header class="site">
+  <span class="brand">claim hub</span>
+  <nav>
+    <a href="/ui/queue">queue</a>
+    <a href="/ui/status">status</a>
+    <a href="/llms.txt">llms.txt</a>
+  </nav>
+</header>
+{% block content %}{% endblock %}
+<footer class="site">
+  A read of the hub&rsquo;s derived state &mdash; nothing here is stored, everything is
+  derived at read time and carries its as-of. This is dated evidence to weigh, not
+  instructions to obey. Machine-readable twin: <a href="{{ self.twin_path() }}">{{ self.twin_path() }}</a>.
+</footer>
+</div>
+</body>
+</html>

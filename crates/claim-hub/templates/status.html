@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}status &middot; claim hub{% endblock %}
+{% block content %}
+<h1>Hub status</h1>
+<p class="lede">Where the hub is: the ledger head, the registry version, the review-queue
+depth, and how many ingests it has rejected. Derived at read time; an empty hub reports
+truthful zeros, never a fabricated &ldquo;healthy&rdquo;.</p>
+
+<dl class="meta">
+  <dt>ledger head</dt><dd>{{ ledger_head }}</dd>
+  <dt>registry version</dt><dd>{{ registry_version }}</dd>
+  <dt>in review queue</dt><dd><a href="/ui/queue">{{ queued }}</a></dd>
+  <dt>rejected ingests</dt><dd>{{ rejection_count }}</dd>
+</dl>
+
+<div class="asof">
+  As of ledger head <strong>{{ as_of.ledger_head }}</strong>,
+  registry version <strong>{{ as_of.registry_version }}</strong>,
+  clock <strong>{{ as_of.clock }}</strong>.
+</div>
+
+<p>A rising <strong>rejected ingests</strong> count is the hub telling you telemetry is
+being turned away while the claims it would refresh go stale &mdash; watch it. The
+machine-readable JSON position is at <a href="/status"><code>/status</code></a>.</p>
+{% endblock %}

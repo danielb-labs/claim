@@ -23,7 +23,7 @@ use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
 use crate::oidc::SharedVerifier;
-use crate::{api, ingest, status};
+use crate::{api, ingest, status, ui};
 
 /// A source of the current instant, injectable so ingest is deterministic under test.
 ///
@@ -125,19 +125,19 @@ impl AppState {
 
 /// Assemble the hub's axum [`Router`] over `state`, with the shared middleware stack.
 ///
-/// The router is the mount board for every hub surface. It mounts `/status` always and
-/// the read API ([`api::router`] — the claims queries, the derived sets, the dossier, and
-/// the cursor feed, all under `/api`), and the ingest route `POST /ingest` **only when the
-/// state carries a verifier** — a hub with no OIDC config has no way to authenticate a
-/// producer, so it exposes no write path rather than a route that rejects everything. The
-/// remaining mount points are named for the later items:
+/// The router is the mount board for every hub surface. It mounts `/status` always, the
+/// read API ([`api::router`] — the claims queries, the derived sets, the dossier, and the
+/// cursor feed, all under `/api`), the UI ([`ui::router`] — the server-rendered queue,
+/// dossier, and status pages, each with a `.md` markdown twin, plus `/llms.txt`), and the
+/// ingest route `POST /ingest` **only when the state carries a verifier** — a hub with no
+/// OIDC config has no way to authenticate a producer, so it exposes no write path rather
+/// than a route that rejects everything. The remaining mount points are named for the later
+/// items:
 ///
 /// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
 ///   `Router::nest_service`.
-/// - **hub-10 UI + twins** — the server-rendered pages, `/llms.txt`, and the `.md`
-///   twins.
-/// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api` (and MCP); the read
-///   routes are unauthenticated until it lands.
+/// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api`, the UI, and MCP; the
+///   read routes are unauthenticated until it lands.
 ///
 /// The [`TraceLayer`] wraps every route so a request carries a tracing span through
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
@@ -147,7 +147,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/status", get(status::status))
         // The read API (hub-08): claims queries, the drifted/due/suspect sets, the
         // dossier, and the cursor feed, all over the deriver under `/api`.
-        .merge(api::router());
+        .merge(api::router())
+        // The UI (hub-10): server-rendered pages over the same read model, each with a
+        // markdown twin at its path + `.md`, plus `/llms.txt` indexing every surface.
+        .merge(ui::router());
     if state.verifier.is_some() {
         // The single telemetry write path (HUB.md §3). Mounted only with a verifier so a
         // hub that cannot authenticate producers exposes no ingest at all.
@@ -155,7 +158,6 @@ pub fn build_app(state: AppState) -> Router {
     }
     router
         // hub-09: `.nest_service("/mcp", mcp_service)`.
-        // hub-10: the UI pages, `/llms.txt`, and the markdown twins.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

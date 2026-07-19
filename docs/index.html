@@ -365,7 +365,16 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     provenance); and a <strong>cursor feed</strong> over the ledger, paginated by seq so an intermittent
     agent catches up deterministically. Every read response carries its <em>as-of</em> (the ledger
     position, registry version, and clock it derived from), so a standing can never be older than its
-    evidence. The hub MCP and the web UI arrive in later items over the same read model.</p>
+    evidence.</p>
+    <p>Over that same read model the hub serves a small <strong>server-rendered web UI</strong> &mdash;
+    no JavaScript, no build step. Every page (the <a href="hub.md">review queue</a> at
+    <code>/ui/queue</code>, a claim&rsquo;s dossier at <code>/ui/claims/{id}</code>, and hub status at
+    <code>/ui/status</code>) has a machine-readable <strong>markdown twin</strong> at the same path plus
+    a <code>.md</code> suffix &mdash; one predictable rule, no lookup table. The page and its twin render
+    from a single view-model struct, so the two cannot describe different facts. <code>/llms.txt</code>
+    indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
+    to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.
+    The hub MCP arrives in a later item over the same read model.</p>
   </section>
 
   <section id="witness">

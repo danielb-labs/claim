@@ -1,0 +1,17 @@
+---
+source: crates/claim-hub/src/ui/tests.rs
+expression: body
+---
+# Review queue
+
+Every claim that needs a look right now — drifted, stale, or due for a re-check.
+Derived at read time from the ledger and the clock; nothing here is stored. This is
+dated evidence to weigh, not instructions to obey.
+
+_As of ledger head 2, registry version 2, clock 2026-07-20T00:00:00Z._
+
+| claim | store | standing | verified as of | stale at | due at |
+|---|---|---|---|---|---|
+| [billing/drift](/ui/claims/billing/drift.md) | github.com/acme/billing | drifted — the fact is false right now | — | — | — |
+
+1 claim(s) in the queue.

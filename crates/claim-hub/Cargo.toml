@@ -103,6 +103,20 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",
 ] }
+# Compile-time, type-checked templates embedded in the binary (HUB-IMPLEMENTATION.md
+# §1.10/§1.14). The UI is server-rendered askama over the same view models the JSON API
+# derives, with NO JavaScript build chain — a second toolchain would be attack surface, a
+# second gate, and a standing invitation for the UI to grow state against the one-substrate
+# rule. Each page is one view-model struct rendered by TWO templates (an HTML lens and a
+# markdown-twin lens), so the twin is structurally incapable of drifting from the page: a
+# renamed view-model field is a compile error, not a blank cell. `default-features = false`
+# with just `std` + `derive` drops the optional `config`/`serde_json`/`urlencode` filters the
+# UI does not use, keeping the dependency minimal; `derive` brings the `Template` proc-macro
+# and `std` its `render()`.
+askama = { version = "0.16", default-features = false, features = [
+    "std",
+    "derive",
+] }
 
 [dev-dependencies]
 # Drive the assembled axum app in-process via `tower::ServiceExt::oneshot` — no bound

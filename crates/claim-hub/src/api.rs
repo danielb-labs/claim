@@ -72,14 +72,18 @@ pub fn router() -> Router<AppState> {
 /// as-of), and the dossier also needs the raw ledger events. Building both in one place
 /// keeps the derivation identical across handlers and the as-of consistent: the model's
 /// [`AsOf`] is the single source of every response's as-of.
-struct ReadState {
+///
+/// Visible to the crate so the UI ([`crate::ui`]) renders its pages from **the same
+/// derivation** the JSON API serves — the HTML/markdown surface is a lens over this read
+/// model, not a second read of the store, so the two can never disagree.
+pub(crate) struct ReadState {
     /// The derived read model — every claim's standing, the due set, the horizon, and the
     /// as-of the whole surface reports.
-    model: ReadModel,
+    pub(crate) model: ReadModel,
     /// The ledger's events in ascending seq order, retained so the dossier can render a
     /// claim's verdict history. The same slice the model was derived from, so the two
     /// never disagree about the ledger head.
-    events: Vec<(u64, claim_hub_core::Event)>,
+    pub(crate) events: Vec<(u64, claim_hub_core::Event)>,
 }
 
 /// Build the read state — the registry snapshot, the ledger scan, and the derivation —
@@ -91,7 +95,9 @@ struct ReadState {
 /// model and the raw events. A store read fault is surfaced as a [`ReadError`] the caller
 /// maps to a `500` — the hub cannot state the standing, so it says so loudly rather than
 /// fabricating one (invariant #6).
-async fn read_state(state: &AppState) -> Result<ReadState, ReadError> {
+///
+/// `pub(crate)` so the UI reuses the identical derivation rather than re-deriving.
+pub(crate) async fn read_state(state: &AppState) -> Result<ReadState, ReadError> {
     let registry = registry_snapshot(&state.store)
         .await
         .map_err(|error| ReadError::new("cannot read the registry right now", error))?;
@@ -110,8 +116,9 @@ async fn read_state(state: &AppState) -> Result<ReadState, ReadError> {
 /// A store read fault, with the operator-facing message the handler answers `500` with.
 ///
 /// The underlying [`StoreError`] is logged (it may name a disk or connection fault the
-/// client must not see), and the client gets the terse, safe `message`.
-struct ReadError {
+/// client must not see), and the client gets the terse, safe `message`. `pub(crate)` so the
+/// UI answers a store fault the same loud way (invariant #6).
+pub(crate) struct ReadError {
     message: &'static str,
     source: StoreError,
 }
@@ -121,8 +128,14 @@ impl ReadError {
         Self { message, source }
     }
 
+    /// A read fault from a store error, for the UI and any crate-internal caller reading the
+    /// store outside [`read_state`]. `message` is the safe, terse client-facing reason.
+    pub(crate) fn from_store(message: &'static str, source: StoreError) -> Self {
+        Self::new(message, source)
+    }
+
     /// Log the underlying fault and answer a `500` with the safe message.
-    fn into_response(self) -> Response {
+    pub(crate) fn into_response(self) -> Response {
         tracing::error!(error = %self.source, "a read failed to reach the store");
         problem(StatusCode::INTERNAL_SERVER_ERROR, self.message)
     }

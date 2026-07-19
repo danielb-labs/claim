@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}review queue &middot; claim hub{% endblock %}
+{% block content %}
+<h1>Review queue</h1>
+<p class="lede">Every claim that needs a look right now &mdash; drifted, stale, or due for a
+re-check. Derived at read time from the ledger and the clock; nothing here is stored.</p>
+
+<div class="asof">
+  As of ledger head <strong>{{ as_of.ledger_head }}</strong>,
+  registry version <strong>{{ as_of.registry_version }}</strong>,
+  clock <strong>{{ as_of.clock }}</strong>.
+</div>
+
+{% if rows.is_empty() %}
+<p class="empty">The queue is empty: no claim is drifted, stale, or due right now.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>claim</th><th>store</th><th>standing</th><th>verified as of</th><th>stale at</th><th>due at</th></tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="{{ row.dossier_path }}">{{ row.id }}</a></td>
+      <td>{{ row.store }}</td>
+      <td><span class="badge {{ row.standing }}">{{ row.standing_label }}</span></td>
+      <td>{% match row.verified_as_of %}{% when Some with (t) %}{{ t }}{% when None %}&mdash;{% endmatch %}</td>
+      <td>{% match row.stale_at %}{% when Some with (t) %}{{ t }}{% when None %}&mdash;{% endmatch %}</td>
+      <td>{% match row.due_at %}{% when Some with (t) %}{{ t }}{% when None %}&mdash;{% endmatch %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="twin-note">{{ rows.len() }} claim(s) in the queue.</p>
+{% endif %}
+{% endblock %}

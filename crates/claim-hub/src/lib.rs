@@ -33,6 +33,7 @@ pub mod http;
 pub mod ingest;
 pub mod oidc;
 pub mod status;
+pub mod ui;
 
 pub use app::{build_app, AppState};
 pub use config::Config;
