@@ -166,6 +166,13 @@ struct RunContext<'a> {
 /// One check's verdict within a claim's result.
 #[derive(Debug, Serialize)]
 struct CheckResult {
+    /// The check's zero-based position in the claim's **declared** check list, not its
+    /// position in this `checks` array. The two differ whenever a skip precedes a run
+    /// check: a skipped check is reported in [`ClaimResult::skipped`] and omitted here,
+    /// so this array is compacted while the declared index is stable. A consumer that
+    /// must tie a verdict back to a specific declared check (the hub, keying a verdict
+    /// on the check's content identity) reads this, never the array offset.
+    index: usize,
     /// The verdict the check reported.
     verdict: Verdict,
     /// The structured process end: `exited` with a code, `timed-out`, `signalled`,
@@ -190,6 +197,12 @@ struct CheckResult {
 /// Reported so a skip is never silent, and carries no verdict: a skip is not a pass.
 #[derive(Debug, Serialize)]
 struct SkippedCheck {
+    /// The check's zero-based position in the claim's **declared** check list, so a
+    /// consumer can name exactly which check was skipped even though it carries no
+    /// verdict. Shares the declared-index space with [`CheckResult::index`]: across a
+    /// claim's `checks` and `skipped` lists together, every declared index appears
+    /// exactly once.
+    index: usize,
     /// The author's justification, from the claim's `skip.reason`.
     reason: String,
     /// The skip's expiry, if it declared one (RFC 3339). `None` for an indefinite
@@ -216,9 +229,12 @@ struct ClaimResult {
     id: String,
     /// The claim file's path relative to the store root.
     file: String,
-    /// Each check's verdict, in the claim's declared order. A check whose skip was in
-    /// force this run is *not* here — it is in [`skipped`](ClaimResult::skipped)
-    /// instead, with no verdict, so it contributes nothing to the exit code.
+    /// The verdict-bearing checks, in declared order but **compacted**: a check whose
+    /// skip was in force this run is *not* here — it is in
+    /// [`skipped`](ClaimResult::skipped) instead, with no verdict, so it contributes
+    /// nothing to the exit code. Because skips are omitted, a result's array offset is
+    /// not its declared position; each result carries its own
+    /// [`index`](CheckResult::index) for that.
     checks: Vec<CheckResult>,
     /// Checks whose declared skip suppressed this run: reported (never silent), never
     /// a pass, and recording no verdict.
@@ -238,7 +254,12 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> ClaimResult {
 
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
-    for check in &claim.checks {
+    // `index` is the check's *declared* position, carried onto every result so a
+    // consumer maps a verdict back to the exact declared check. It must not be the
+    // position within `checks`: a skipped check is `continue`d out of `checks`, so that
+    // array compacts and its offsets stop matching declared order the moment a skip
+    // precedes a run check. `enumerate` over the declared list keeps the index stable.
+    for (index, check) in claim.checks.iter().enumerate() {
         // A declared skip is evaluated *before* the check runs. When it holds, the
         // check does not run and records no verdict — a skip is never a pass.
         // `Run(note)` carries why a skip did not apply (a lapsed `until`, or an
@@ -248,6 +269,7 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> ClaimResult {
             Some(skip) => match evaluate_skip(skip, &run.ctx, run.now) {
                 SkipDecision::Skip => {
                     skipped.push(SkippedCheck {
+                        index,
                         reason: skip.reason.clone(),
                         until: skip.until.map(|t| t.to_string()),
                     });
@@ -260,6 +282,7 @@ fn check_one(run: &RunContext, loaded: &LoadedClaim) -> ClaimResult {
 
         let outcome = run_check(check, &run.ctx);
         checks.push(CheckResult {
+            index,
             verdict: outcome.verdict,
             detail: outcome.status(),
             end: outcome.end.clone(),
@@ -503,6 +526,7 @@ mod tests {
 
     fn held() -> CheckResult {
         CheckResult {
+            index: 0,
             verdict: Verdict::Held,
             end: ProcessEnd::Exited { code: 0 },
             detail: "exit 0".to_owned(),
@@ -513,6 +537,7 @@ mod tests {
 
     fn with(verdict: Verdict) -> CheckResult {
         CheckResult {
+            index: 0,
             verdict,
             end: ProcessEnd::Exited { code: 0 },
             detail: "x".to_owned(),
@@ -582,6 +607,7 @@ mod tests {
 
     fn skipped(reason: &str) -> SkippedCheck {
         SkippedCheck {
+            index: 0,
             reason: reason.to_owned(),
             until: None,
         }

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT digest FROM check_digests\n            WHERE store = ? AND claim_id = ?\n            ORDER BY check_index ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "digest",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cad40a8ec2c04905957fe21d69727b29fe1a3b5d7f24b8d31cf6a0492680e460"
+}

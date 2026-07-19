@@ -27,9 +27,9 @@ async fn boot_app_from_minimal_config() -> (axum::Router, SqliteStore, tempfile:
     // The boot path: open (creating + migrating) the SQLite file from the config's
     // database path. Empty directory in, a stood-up schema out.
     let store = SqliteStore::open(&config.database).await.unwrap();
-    let app = build_app(AppState {
-        store: store.clone(),
-    });
+    // No verifier: the boot test exercises `/status` and first-boot schema creation, not
+    // ingest (which has its own test file with an injected JWKS).
+    let app = build_app(AppState::new(store.clone(), None));
     (app, store, dir)
 }
 

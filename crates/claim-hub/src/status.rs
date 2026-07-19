@@ -8,15 +8,16 @@
 //! that lies about its own position is the first thing a monitor would trust and the
 //! last thing it should.
 //!
-//! Two fields — last sync and rejection count — have no producer in this shell:
-//! registry sync (hub-05) records the sync time, and the ingest gate (hub-04)
-//! records rejections. They are wired here reading zero/`None`, so the shape is
-//! stable and the later items fill the source rather than reshape the endpoint.
+//! One field — last sync — has no producer yet: registry sync (hub-05) records the
+//! sync time, and it is wired here reading `None` so the shape is stable and that item
+//! fills the source rather than reshape the endpoint. The rejection count **is** sourced
+//! now, from the store's [`Rejections`] counter the ingest gate (hub-04) increments —
+//! the hub-03 placeholder `0` is gone.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use claim_hub_store::{Ledger, Registry};
+use claim_hub_store::{Ledger, Registry, Rejections};
 use serde::Serialize;
 
 use crate::app::AppState;
@@ -45,21 +46,23 @@ pub struct Status {
     pub last_sync: Option<String>,
 
     /// How many ingests the hub has rejected — a quiet source of staleness a monitor
-    /// must be able to see (invariant #6). `0` in this shell: the ingest gate (hub-04)
-    /// is what counts rejections; the field is wired so that item fills the source.
+    /// must be able to see (invariant #6). Sourced from the store's [`Rejections`]
+    /// counter, which the ingest gate increments on every refused push (a forged token,
+    /// a wrong audience, a malformed envelope); a rising count means telemetry is being
+    /// turned away while the claims it would refresh go stale.
     pub rejection_count: i64,
 }
 
 /// The `/status` handler: read the hub's position from the store and report it.
 ///
-/// Reads the ledger head and registry version through the trait seam (never SQL),
-/// so an empty store reports truthful zeros rather than erroring — the birth state
-/// of a freshly-booted hub is a valid, reportable position. A store read that
-/// genuinely fails (a disk fault, a closed pool) is a `500`: the hub cannot state
+/// Reads the ledger head, registry version, and rejection count through the trait seam
+/// (never SQL), so an empty store reports truthful zeros rather than erroring — the
+/// birth state of a freshly-booted hub is a valid, reportable position. A store read
+/// that genuinely fails (a disk fault, a closed pool) is a `500`: the hub cannot state
 /// its position, so it says so loudly rather than reporting a fabricated one.
 ///
-/// `last_sync` and `rejection_count` read `None`/`0` here; hub-05 and hub-04 wire
-/// their sources without changing this handler's shape.
+/// `last_sync` reads `None` until registry sync (hub-05) records one; `rejection_count`
+/// is sourced from the store, so it is truthful the moment the ingest gate rejects a push.
 pub async fn status(State(state): State<AppState>) -> Result<Json<Status>, StatusCode> {
     let ledger_head = state
         .store
@@ -80,13 +83,16 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<Status>, Statu
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .0;
+    let rejection_count = state.store.rejection_count().await.map_err(|error| {
+        tracing::error!(%error, "failed to read the rejection count for /status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(Status {
         ledger_head,
         registry_version,
-        // Sourced by hub-05 (registry sync) and hub-04 (ingest gate) respectively;
-        // truthfully empty until then.
+        // Sourced by hub-05 (registry sync); truthfully empty until then.
         last_sync: None,
-        rejection_count: 0,
+        rejection_count,
     }))
 }

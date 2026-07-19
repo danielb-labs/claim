@@ -141,6 +141,7 @@ async fn replace_store_snapshot_writes_claims_and_findings_together() {
         statement: "Good".to_owned(),
         supports: vec!["decisions/x".to_owned()],
         commit: "c1".to_owned(),
+        check_digests: Vec::new(),
     };
     let v = store
         .replace_store_snapshot(STORE, &[claim], &[finding(STORE, "broken.md", "bad YAML")])

@@ -13,33 +13,78 @@
 //! Binding and serving is [`crate::serve`]'s job, kept apart from assembly so the
 //! part under test never touches the network.
 
-use axum::routing::get;
+use std::sync::Arc;
+
+use axum::routing::{get, post};
 use axum::Router;
+use claim_core::Timestamp;
 use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
-use crate::status;
+use crate::oidc::SharedVerifier;
+use crate::{ingest, status};
 
-/// State shared across the hub's handlers: the one store, cloned per handler.
+/// A source of the current instant, injectable so ingest is deterministic under test.
+///
+/// The ingest gate stamps each event's `reported_at` with the moment the observation
+/// reached the ledger — a wall-clock instant in production, but a fixed value a test
+/// supplies so the appended event is exact (CLAUDE.md's determinism rule: time is a
+/// parameter, never a hidden `now()` inside logic under test). Boxed behind an `Arc`
+/// so [`AppState`] stays `Clone` and cheap to share.
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+
+/// State shared across the hub's handlers: the store, the OIDC verifier, and the clock.
 ///
 /// The [`SqliteStore`] is a reference-counted pool, so cloning is cheap and every
-/// handler shares one database (HUB-IMPLEMENTATION.md §1.4). It is held in an
-/// [`AppState`] rather than passed as a bare store so a later item adds shared state
-/// (the deriver's memo, the JWKS cache, config) as fields without changing every
-/// handler's extractor.
+/// handler shares one database (HUB-IMPLEMENTATION.md §1.4). The `verifier` is the
+/// ingest gate's OIDC trust anchor, `None` when the hub has no OIDC config (the ingest
+/// route is then not mounted). The `clock` produces the ingest instant. Held in an
+/// [`AppState`] so a later item adds shared state (the deriver's memo) as a field
+/// without changing every handler's extractor.
 #[derive(Clone)]
 pub struct AppState {
-    /// The ledger-and-registry store `/status` reads and later surfaces derive over.
+    /// The ledger-and-registry store `/status` reads, ingest appends to, and later
+    /// surfaces derive over.
     pub store: SqliteStore,
+    /// The OIDC verifier the ingest gate authenticates producers with. `None` when the
+    /// hub has no `[oidc]` config — the ingest route is then not mounted, so the
+    /// handler's own `None` guard is a defensive backstop, not a live path.
+    pub verifier: Option<SharedVerifier>,
+    /// The clock the ingest gate stamps each event's `reported_at` from. Defaults to
+    /// wall-clock `now`; a test injects a fixed instant.
+    pub clock: Clock,
+}
+
+impl AppState {
+    /// State for a hub with an ingest gate: the store, its verifier, and wall-clock time.
+    ///
+    /// The common production shape. [`with_clock`](AppState::with_clock) swaps the clock
+    /// for a deterministic one under test.
+    #[must_use]
+    pub fn new(store: SqliteStore, verifier: Option<SharedVerifier>) -> Self {
+        Self {
+            store,
+            verifier,
+            clock: Arc::new(Timestamp::now),
+        }
+    }
+
+    /// This state with its clock replaced, for deterministic ingest tests.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
 }
 
 /// Assemble the hub's axum [`Router`] over `state`, with the shared middleware stack.
 ///
-/// The router is the mount board for every hub surface. This shell mounts one real
-/// route, `/status`; the comments mark where the later items attach:
+/// The router is the mount board for every hub surface. It mounts `/status` always, and
+/// the ingest route `POST /ingest` **only when the state carries a verifier** — a hub
+/// with no OIDC config has no way to authenticate a producer, so it exposes no write
+/// path rather than a route that rejects everything. The remaining mount points are
+/// named for the later items:
 ///
-/// - **hub-04 ingest** — the one telemetry write path, `POST /ingest`, behind the
-///   OIDC verification layer.
 /// - **hub-08 JSON API** — the read surface, nested under `/api`.
 /// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
 ///   `Router::nest_service`.
@@ -50,9 +95,13 @@ pub struct AppState {
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
 /// whole router, and it is where a later item stacks auth and timeout layers.
 pub fn build_app(state: AppState) -> Router {
-    Router::new()
-        .route("/status", get(status::status))
-        // hub-04: `.route("/ingest", post(ingest::ingest))` behind the OIDC layer.
+    let mut router = Router::new().route("/status", get(status::status));
+    if state.verifier.is_some() {
+        // The single telemetry write path (HUB.md §3). Mounted only with a verifier so a
+        // hub that cannot authenticate producers exposes no ingest at all.
+        router = router.route("/ingest", post(ingest::ingest));
+    }
+    router
         // hub-08: `.nest("/api", api::router())`.
         // hub-09: `.nest_service("/mcp", mcp_service)`.
         // hub-10: the UI pages, `/llms.txt`, and the markdown twins.
@@ -70,11 +119,12 @@ mod tests {
     use tower::ServiceExt;
 
     /// Build an app over a fresh in-memory store — no file, no port, no network.
+    ///
+    /// No verifier: `/status` needs none, and a state with no verifier does not mount
+    /// the ingest route (asserted in `ingest_route_is_absent_without_a_verifier`).
     async fn app_over_empty_store() -> (Router, SqliteStore) {
         let store = SqliteStore::open_in_memory().await.unwrap();
-        let app = build_app(AppState {
-            store: store.clone(),
-        });
+        let app = build_app(AppState::new(store.clone(), None));
         (app, store)
     }
 
@@ -138,6 +188,46 @@ mod tests {
             .unwrap();
         let (_status, body) = get_json(app, "/status").await;
         assert_eq!(body["registry_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn status_rejection_count_is_sourced_from_the_store() {
+        // The rejection count is no longer a hardcoded 0: recording a rejection through
+        // the store's `Rejections` trait moves it, and /status reflects the new value —
+        // the hub-03 placeholder is gone.
+        use claim_hub_store::Rejections;
+        let (app, store) = app_over_empty_store().await;
+        store.record_rejection().await.unwrap();
+        store.record_rejection().await.unwrap();
+        let (status, body) = get_json(app, "/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["rejection_count"], 2,
+            "rejection_count reflects the store, not a constant: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_route_is_absent_without_a_verifier() {
+        // A hub with no OIDC verifier exposes no write path: `POST /ingest` is not
+        // mounted, so it 404s rather than a route that rejects everything. `/status`
+        // still serves.
+        let (app, _store) = app_over_empty_store().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ingest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "ingest is unmounted without a verifier"
+        );
     }
 
     /// A minimal valid verdict event for the head-advance test. Mirrors the envelope

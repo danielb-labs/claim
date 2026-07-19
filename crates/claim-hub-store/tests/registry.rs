@@ -23,6 +23,10 @@ fn claim(id: &str, statement: &str, supports: &[&str], commit: &str) -> Register
         statement: statement.into(),
         supports: supports.iter().map(|s| (*s).to_owned()).collect(),
         commit: commit.into(),
+        // Most registry tests exercise the claim/statement/supports/version paths; a
+        // claim with no checks is the simplest fixture. The digest read/write path has
+        // its own dedicated test (`check_digests_round_trip`).
+        check_digests: Vec::new(),
     }
 }
 
@@ -221,4 +225,91 @@ async fn claims_of_an_unknown_store_is_empty() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// A registered claim carrying two check digests, for the digest read/write tests.
+fn claim_with_digests(id: &str, digests: &[&str]) -> RegisteredClaim {
+    RegisteredClaim {
+        id: ClaimId::from_str(id).expect("valid id"),
+        statement: "S".into(),
+        supports: vec![],
+        commit: "c1".into(),
+        check_digests: digests.iter().map(|d| (*d).to_owned()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn check_digests_round_trip_by_index_and_read_back_in_order() {
+    // The ingest gate's bridge: a claim's per-check digests are stored by position and
+    // read back by (store, claim, index) and as an ordered vector.
+    let (store, _dir) = fresh_store().await;
+    let digest0 = "a".repeat(64);
+    let digest1 = "b".repeat(64);
+    store
+        .replace_store(STORE, &[claim_with_digests("pin", &[&digest0, &digest1])])
+        .await
+        .unwrap();
+
+    let id = ClaimId::from_str("pin").unwrap();
+    assert_eq!(
+        store.check_digest(STORE, &id, 0).await.unwrap(),
+        Some(digest0.clone())
+    );
+    assert_eq!(
+        store.check_digest(STORE, &id, 1).await.unwrap(),
+        Some(digest1.clone())
+    );
+    // The whole claim reads its digests back in declared order.
+    let claim = store.claim(STORE, &id).await.unwrap().unwrap();
+    assert_eq!(claim.check_digests, vec![digest0, digest1]);
+}
+
+#[tokio::test]
+async fn check_digest_is_none_for_an_unknown_claim_or_out_of_range_index() {
+    // Both "the registry never synced this claim" and "the index is past the claim's
+    // checks" return `None` — the ingest gate's reject-loudly signal, distinct from an
+    // error.
+    let (store, _dir) = fresh_store().await;
+    store
+        .replace_store(STORE, &[claim_with_digests("pin", &[&"c".repeat(64)])])
+        .await
+        .unwrap();
+    let id = ClaimId::from_str("pin").unwrap();
+    let unknown = ClaimId::from_str("never-synced").unwrap();
+
+    assert_eq!(store.check_digest(STORE, &unknown, 0).await.unwrap(), None);
+    assert_eq!(
+        store.check_digest(STORE, &id, 1).await.unwrap(),
+        None,
+        "index 1 is past the single check"
+    );
+    assert_eq!(
+        store
+            .check_digest("github.com/acme/other", &id, 0)
+            .await
+            .unwrap(),
+        None,
+        "a different store does not see this claim's digest"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_replace_retires_a_removed_claims_check_digests() {
+    // Digests cascade with their claim: a claim absent at the new tip drops its digests,
+    // so a retired check's identity never lingers to mis-key a stale verdict.
+    let (store, _dir) = fresh_store().await;
+    let id = ClaimId::from_str("pin").unwrap();
+    store
+        .replace_store(STORE, &[claim_with_digests("pin", &[&"a".repeat(64)])])
+        .await
+        .unwrap();
+    assert!(store.check_digest(STORE, &id, 0).await.unwrap().is_some());
+
+    // Re-snapshot the store with the claim gone (a retirement).
+    store.replace_store(STORE, &[]).await.unwrap();
+    assert_eq!(
+        store.check_digest(STORE, &id, 0).await.unwrap(),
+        None,
+        "the retired claim's digest is gone"
+    );
 }

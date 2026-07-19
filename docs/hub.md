@@ -9,12 +9,13 @@ freshness, and due-ness from the verdict stream it stores (see the
 single binary plus one SQLite file the customer owns — export is `cp`, delete is
 `rm`, and there is no database server the product runs on your behalf.
 
-> **This is the v1 shell.** This item (hub-03) ships the application shell only:
-> config, the HTTP app, `/status`, tracing, and boot. **Ingest** (the verdict write
-> path), **registry sync** (mirroring your git stores), the **JSON API**, the **hub
-> MCP**, and the **web UI** arrive in later items and mount into this same shell. A
-> freshly booted hub therefore reports a truthful *empty* position — head 0, version
-> 0 — until those surfaces land and start populating the ledger and registry.
+> **This is v1, still growing.** The hub today ships the application shell (config,
+> the HTTP app, `/status`, tracing, boot), **registry sync** (mirroring your git
+> stores), and the **ingest gate** (the single OIDC-authenticated verdict write path,
+> `POST /ingest`). The **JSON API**, the **hub MCP**, and the **web UI** arrive in
+> later items and mount into this same shell. A freshly booted hub reports a truthful
+> *empty* position — head 0, version 0 — until a sync populates the registry and a CI
+> lane starts pushing verdicts through the ingest gate.
 
 ## Running the binary
 
@@ -61,11 +62,22 @@ The config is one TOML file plus a few environment overrides. v1 fields:
 | `listen` | The address the HTTP listener binds. | `127.0.0.1:8080` (loopback — an unconfigured hub is not exposed off the host) |
 | `database` | The SQLite file the ledger and registry live in; created and migrated on first boot. | `hub.db` |
 
-Sections the later items consume are already accepted so an operator's file keeps
-working as the hub grows: `[[stores]]` (connected git stores, hub-05), `[oidc]`
-(ingest trust anchor, hub-04), `[hub_overrides]` (per-hub `hub:` cadence overrides,
-hub-06), and `[read_auth]` (read-auth policy, hub-13, secure-by-default). They are
-inert in this shell.
+The `[oidc]` section configures the **ingest gate** (see below): its `audience` is
+the identifier the hub verifies a producer's OIDC token against, and `repositories`
+is the set of connected repositories a token may come from. **With no `[oidc]`
+section the ingest route is not mounted** — a hub that cannot authenticate producers
+exposes no write path at all, rather than one that rejects everything:
+
+```toml
+[oidc]
+audience = "https://hub.acme.example"   # what the hub identifies itself as
+repositories = ["acme/payments"]         # connected repos a token may come from
+```
+
+Other sections a later item consumes are already accepted so an operator's file
+keeps working as the hub grows: `[[stores]]` (connected git stores, syncing),
+`[hub_overrides]` (per-hub `hub:` cadence overrides), and `[read_auth]` (read-auth
+policy, secure-by-default).
 
 Two environment variables override the file's fields per instance, so a shared
 config can be pointed at different addresses or database paths without editing it:
@@ -100,9 +112,66 @@ curl -s http://127.0.0.1:8080/status
 |---|---|---|
 | `ledger_head` | The position of the most recent event on the append-only ledger; `0` on an empty ledger. Advances as verdicts are ingested. | `Ledger::head` |
 | `registry_version` | The number of store syncs applied; `0` before the first sync. | `Registry::version` |
-| `last_sync` | When the registry was last synced (RFC 3339). Omitted until registry sync (hub-05) records one. | registry sync (hub-05) |
-| `rejection_count` | How many ingests the hub rejected — a quiet source of staleness a monitor must be able to see. `0` until the ingest gate (hub-04) counts them. | ingest gate (hub-04) |
+| `last_sync` | When the registry was last synced (RFC 3339). Omitted until registry sync records one. | registry sync |
+| `rejection_count` | How many ingests the hub rejected — a quiet source of staleness a monitor must be able to see. Increments on every refused push (a forged token, a wrong audience, a malformed envelope); a rising count means telemetry is being turned away while the claims it would refresh go stale. | the ingest gate's rejection counter |
 
-`last_sync` and `rejection_count` have no producer in this shell, so they report
-`omitted`/`0` truthfully; the later items fill their sources without changing the
-endpoint's shape.
+`last_sync` reports `omitted` until a sync records one. `rejection_count` is live:
+watch it — a climbing count is the hub telling you telemetry is being dropped, which
+is exactly the invisible staleness the tool exists to prevent.
+
+## The ingest gate (`POST /ingest`)
+
+Ingest is the hub's **single telemetry write path**. A CI lane runs `claim check
+--json` and POSTs the report to `/ingest`, authenticated by the runner's GitHub
+Actions OIDC id-token in an `Authorization: Bearer <token>` header. There is no other
+way in — no backfill endpoint, no manual verdict entry, no static ingest token. A
+developer's local `claim check` is a terminal report, never hub telemetry.
+
+The gate authenticates *who produced* each push — the pipeline that ran the checks,
+proven by its OIDC token — and records that verified identity verbatim beside every
+verdict, so the trust judgment stays re-derivable. In order, it verifies:
+
+1. **Signature** against the issuer's published JWKS (fetched once and cached;
+   refreshed when a token names a key id the cache does not yet hold, so key rotation
+   heals with no redeploy). That refresh is **rate-limited** — the key id is
+   attacker-controlled and read before the signature is checked, so an un-throttled
+   fetch-per-unknown-key would let a flood of forged tokens drive the hub's outbound
+   request rate; a refresh fires at most once per short window regardless.
+2. **`iss`** is present *and* the GitHub Actions issuer. A token that omits `iss`, `aud`,
+   or `exp` is rejected outright — the issuer/audience pinning is never hollow.
+3. **`aud`** is the hub's configured `audience` — this is what stops a token minted
+   for another service from being replayed here. An empty configured `audience` is
+   refused at boot, so the gate never stands up with vacuous audience pinning.
+4. **`exp`** is in the future.
+5. **`repository`** is one of the configured connected `repositories`.
+
+A valid push appends one event per check result and returns the ledger positions:
+
+```json
+{ "status": "accepted", "accepted": 1, "positions": [{ "position": 42, "new": true }] }
+```
+
+A **redelivery** — the same run reporting the same check again — dedups to the
+original success and adds no row (`"new": false`), so a retried CI push never
+double-counts. Evidence is capped at ingest: an oversized note is truncated with a
+visible marker, never silently dropped.
+
+Every failure is **loud and, where it is a judged-and-refused push, counted**:
+
+| Failure | Status | Counted |
+|---|---|---|
+| Forged/invalid signature | `401` | yes |
+| Expired token | `401` | yes |
+| Wrong audience / issuer | `401` | yes |
+| Unknown signing key | `401` | yes |
+| Unconnected repository (authentic but unauthorized) | `403` | yes |
+| Malformed `--json` envelope (names the field) | `400` | yes |
+| Claim/check the registry has not synced | `400` | yes |
+| Missing `Authorization` header (no identity to judge) | `401` | no |
+| Identity provider unreachable (cannot verify *now*) | `503` | no |
+
+A rejected push **writes no event** and returns a JSON body naming the reason
+(`{"error": "..."}`). The counted rejections show up at `/status`, so a hub turning
+telemetry away is visible rather than silently aging claims into stale. An
+*unavailable* identity provider is a `503`, not a rejection: the hub could not judge
+the token, so it never calls a possibly-valid push forged — the producer retries.

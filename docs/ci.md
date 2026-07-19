@@ -199,16 +199,18 @@ The renderer consumes exactly this shape:
   "exit": 1,
   "checked": 1,
   "ran": 1,
-  "skipped": 0,
+  "skipped": 1,
   "claims": [
     {
       "id": "payments/libfoo-pin",
       "file": ".claims/payments/libfoo-pin.md",
       "checks": [
-        { "verdict": "drifted", "end": { "kind": "exited", "code": 1 },
+        { "index": 1, "verdict": "drifted", "end": { "kind": "exited", "code": 1 },
           "detail": "exit 1", "evidence": null, "note": null }
       ],
-      "skipped": [],
+      "skipped": [
+        { "index": 0, "reason": "agent check runs on the nightly lane", "until": null }
+      ],
       "supports": [
         { "target": "requirements.txt#libfoo", "resolved": true, "reason": null }
       ],
@@ -227,14 +229,22 @@ they keep the honesty explicit: `ran == 0` is never "all held," because a skip i
 pass (golden invariant #6). A selection that matched no claim (an empty `--path`) reports
 `checked`, `ran`, and `skipped` all `0`.
 
-Each claim carries its `id`, `file`, the per-check `checks[]` (each a `verdict`, its
-process `end`, a `detail`, `evidence`, and a `note`), any `skipped` checks, the
-`supports[]` with their resolution, and the claim's own worst `exit`. Top-level
-`errors[]` holds unloadable or duplicate-id claim files. There is no `selection`,
-`report_only`, `now`, or top-level `notes`, and no per-check `when` — selection is a
-command-line concern (positional ids and `--path`), not something the report echoes back,
-and the CLI no longer persists, timestamps a run against a stored log, or carries a
-trigger.
+Each claim carries its `id`, `file`, the per-check `checks[]`, any `skipped` checks, the
+`supports[]` with their resolution, and the claim's own worst `exit`. Each entry in
+`checks[]` carries its declared `index` (its zero-based position in the claim's declared
+check list), a `verdict`, its process `end`, a `detail`, `evidence`, and a `note`; each
+`skipped` entry carries the same declared `index` plus its `reason` and optional `until`.
+The `index` matters because **`checks[]` is compacted**: a check whose skip was in force
+is omitted from `checks[]` (it appears in `skipped[]` instead), so a check's *position in
+the array is not its declared index* once a skip precedes a run check. In the example
+above the surviving check sits at array offset 0 but reports declared `index` 1 — the
+skipped check took declared index 0. A consumer that ties a verdict back to a specific
+declared check (the hub, keying a verdict on the check's content identity) must read the
+`index` field, never the array offset. Top-level `errors[]` holds unloadable or
+duplicate-id claim files. There is no `selection`, `report_only`, `now`, or top-level
+`notes`, and no per-check `when` — selection is a command-line concern (positional ids
+and `--path`), not something the report echoes back, and the CLI no longer persists,
+timestamps a run against a stored log, or carries a trigger.
 
 ### CODEOWNERS and statements
 
