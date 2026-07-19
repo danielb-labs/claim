@@ -424,6 +424,39 @@ async fn appending_the_same_nag_twice_dedups_on_the_fire_key() {
 }
 
 #[tokio::test]
+async fn a_verdict_event_with_no_verdict_is_rejected_and_writes_nothing() {
+    // The columns are nullable so a nag can hold NULL for verdict/check, but a VERDICT-kind
+    // event with a NULL verdict is unreadable: every later `scan_from` would fail on "a
+    // verdict row has no verdict", bricking the whole hub on an append-only ledger with no
+    // recovery. The write boundary must reject it, symmetrically with the missing-check
+    // guard — the opposite of the nag case, which legitimately carries no verdict.
+    let (store, _dir) = fresh_store().await;
+    let mut verdict_no_verdict = event("run-1", "payments/pin", &"a".repeat(64), Verdict::Held);
+    verdict_no_verdict.verdict = None;
+    assert_eq!(
+        verdict_no_verdict.kind,
+        claim_hub_core::EventKind::Verdict,
+        "still a verdict-kind event"
+    );
+
+    let err = store
+        .append(&verdict_no_verdict)
+        .await
+        .expect_err("a verdict-kind event with no verdict is rejected");
+    assert!(
+        matches!(err, StoreError::Corrupt { .. }),
+        "the rejection is loud corruption, not a coerced write: {err}"
+    );
+
+    // Nothing was written: the ledger stays empty, so no unreadable NULL row can poison a
+    // later scan.
+    assert!(
+        store.scan_from(Position(0)).await.unwrap().is_empty(),
+        "the rejected verdict added no row"
+    );
+}
+
+#[tokio::test]
 async fn fired_keys_derives_the_set_of_appended_nags() {
     // The router's memory is derived from the ledger's nag events, not stored: `fired_keys`
     // rebuilds it by scanning. A verdict event contributes no fire key; two distinct nags do.

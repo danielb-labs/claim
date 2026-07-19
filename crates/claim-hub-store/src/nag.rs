@@ -61,11 +61,33 @@ pub fn resolve_owners(
     commit: &str,
     claim_file: &str,
 ) -> Result<Vec<String>> {
-    let mirror = mirror_path(mirror_root, store_id);
-    let text = read_codeowners(&mirror, store_id, commit)?;
+    let text = read_codeowners_at(mirror_root, store_id, commit)?;
     Ok(text
         .map(|text| owners_for(claim_file, &text))
         .unwrap_or_default())
+}
+
+/// The CODEOWNERS text for a store at a commit, read from its synced mirror, or `None`.
+///
+/// The read half of [`resolve_owners`], exposed so a caller resolving many claims in one
+/// store can read that store's CODEOWNERS **once** and match every claim's path against the
+/// cached text with [`owners_for`] — one `git show` per `(store, commit)` instead of one per
+/// claim. Reads the first existing CODEOWNERS (`CODEOWNERS`, `.github/CODEOWNERS`, then
+/// `docs/CODEOWNERS`, GitHub's precedence order) at `commit`; a store with no CODEOWNERS, or
+/// an unreadable commit, is `None` — the legitimate "no owner" case the router dead-letters,
+/// not an error.
+///
+/// # Errors
+///
+/// [`StoreError::GitSpawn`] only if the `git` binary cannot be spawned at all, a deployment
+/// fault. A missing CODEOWNERS or an unresolvable commit is `Ok(None)`, not an error.
+pub fn read_codeowners_at(
+    mirror_root: &Path,
+    store_id: &str,
+    commit: &str,
+) -> Result<Option<String>> {
+    let mirror = mirror_path(mirror_root, store_id);
+    read_codeowners(&mirror, store_id, commit)
 }
 
 /// Read the first existing CODEOWNERS file from the mirror at `commit`, or `None`.

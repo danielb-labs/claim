@@ -60,7 +60,7 @@ pub mod sync;
 pub use error::{Result, StoreError};
 pub use findings::{Findings, SyncFinding};
 pub use ledger::{Appended, Ledger, Position, StoredEvent};
-pub use nag::{fired_keys, owners_for, resolve_owners};
+pub use nag::{fired_keys, owners_for, read_codeowners_at, resolve_owners};
 pub use registry::{RegisteredClaim, Registry, RegistryVersion, SupportsEdge};
 pub use rejections::Rejections;
 pub use snapshot::{ledger_events, registry_snapshot};

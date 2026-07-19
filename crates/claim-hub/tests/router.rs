@@ -10,8 +10,12 @@
 //! - a **clock-crossing stale** fires with no new verdict — time advances, nothing else;
 //! - a **no-owner** transition routes to the dead-letter queue and the served view shows it;
 //! - **one commit breaking N claims is one grouped nag**, not N;
-//! - a **lapsed skip `until`** fires; and
-//! - the rendered nag content is **served** at `GET /api/nags` for the CI glue to pull.
+//! - a **lapsed skip `until`** fires;
+//! - the rendered nag content is **served** at `GET /api/nags` for the CI glue to pull;
+//! - owners resolve against the claim's **real synced path**, never a synthetic `.claims/<id>.md`
+//!   (a non-canonical claim routes to its true owner, not a wrong more-specific one); and
+//! - delivery **re-resolves owners at read time** — a once-dead-lettered claim re-surfaces
+//!   owned once an owner appears, and a re-owned claim shows the new owner without re-firing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -91,6 +95,16 @@ impl GitFixture {
 
     fn url(&self) -> String {
         self.dir.path().to_string_lossy().into_owned()
+    }
+
+    /// Write `files` and commit them, advancing the tip — so a re-sync reads a new CODEOWNERS
+    /// or a moved claim. Used by the re-owning tests to change ownership between passes.
+    fn commit_files(&self, files: &[(&str, &str)]) {
+        for (rel, contents) in files {
+            self.write(rel, contents);
+        }
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", "update"]);
     }
 
     fn write(&self, rel: &str, contents: &str) {
@@ -472,5 +486,169 @@ async fn the_rendered_nag_content_is_served_for_delivery() {
         nag_count(&store).await,
         0,
         "GET /api/nags is a read — it appends no nag mark"
+    );
+}
+
+// ---- (7) owners resolve against the claim's REAL path, never a synthetic one ----
+
+#[tokio::test]
+async fn a_claim_at_a_non_canonical_path_routes_by_its_real_path_not_a_synthetic_one() {
+    // A claim `id: payments/pin` living at a NON-canonical path `.claims/foo.md`. The old
+    // code reconstructed a synthetic `.claims/payments/pin.md` from the id, which the
+    // `.claims/payments/` rule would match — routing to @acme/payments, a WRONG owner (the
+    // claim does not live under `.claims/payments/`). Matching the REAL synced path
+    // `.claims/foo.md` falls only to the catch-all, routing to @acme/eng — the true owner,
+    // the one the CI glue (which matches the same real path) also picks. This test fails on
+    // the old synthetic-path code.
+    let fixture = GitFixture::with_files(&[
+        (".claims/foo.md", &claim_file("payments/pin", "")),
+        (
+            ".github/CODEOWNERS",
+            "*                  @acme/eng\n.claims/payments/  @acme/payments\n",
+        ),
+    ]);
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let mirror_root = sync(&store, &fixture).await;
+
+    let pin = claim_of("id: payments/pin\nchecks:\n  - kind: cmd\n    run: \"true\"");
+    store
+        .append(&verdict_event(
+            &pin,
+            Verdict::Drifted,
+            "c1",
+            "run-1",
+            "2026-07-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let r = router(store.clone(), &mirror_root);
+    let view = r.run_once(ts("2026-07-02T00:00:00Z")).await.unwrap();
+
+    assert_eq!(view.nags.len(), 1, "the drift is owned and surfaced");
+    assert_eq!(
+        view.nags[0].owners,
+        vec!["@acme/eng"],
+        "the real path `.claims/foo.md` routes to the catch-all owner, \
+         NOT the synthetic-path `.claims/payments/` owner"
+    );
+    assert!(
+        !view.nags[0].owners.contains(&"@acme/payments".to_owned()),
+        "the wrong, synthetic-path owner never appears"
+    );
+}
+
+// ---- (8) a once-dead-lettered transition re-surfaces with an owner after re-sync ----
+
+#[tokio::test]
+async fn a_dead_lettered_transition_re_surfaces_owned_after_an_owner_appears() {
+    // Dead-letter a drift (no CODEOWNERS), which fires its nag mark. Then add a CODEOWNERS
+    // rule and re-sync. The transition must re-surface OWNED — proving delivery re-resolves
+    // owners at READ time, not once at fire time: a future refactor gating delivery on
+    // `fired_this_pass` would strand this already-fired claim in the dead-letter queue.
+    let fixture =
+        GitFixture::with_files(&[(".claims/payments/pin.md", &claim_file("payments/pin", ""))]);
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let mirror_root = sync(&store, &fixture).await;
+
+    let pin = claim_of("id: payments/pin\nchecks:\n  - kind: cmd\n    run: \"true\"");
+    store
+        .append(&verdict_event(
+            &pin,
+            Verdict::Drifted,
+            "c1",
+            "run-1",
+            "2026-07-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let now = ts("2026-07-02T00:00:00Z");
+    let r = router(store.clone(), &mirror_root);
+
+    // First pass: no owner, so the drift dead-letters — and still fires its mark once.
+    let view = r.run_once(now).await.unwrap();
+    assert!(view.nags.is_empty(), "no owner yet");
+    assert_eq!(view.dead_letters.len(), 1, "the drift dead-lettered");
+    assert_eq!(view.fired_this_pass, 1, "the dead-letter still fired once");
+    assert_eq!(nag_count(&store).await, 1, "one nag mark on the ledger");
+
+    // An owner appears: add a CODEOWNERS rule and re-sync the same mirror.
+    fixture.commit_files(&[(".github/CODEOWNERS", "*  @acme/payments\n")]);
+    sync(&store, &fixture).await;
+
+    // The already-fired transition re-surfaces OWNED, not re-fired: read-time re-resolution
+    // delivers a once-dead-lettered claim to its now-known owner.
+    let view = r.run_once(now).await.unwrap();
+    assert!(view.dead_letters.is_empty(), "no longer a dead-letter");
+    assert_eq!(view.nags.len(), 1, "now owned and surfaced");
+    assert_eq!(
+        view.nags[0].owners,
+        vec!["@acme/payments"],
+        "owner resolved"
+    );
+    assert_eq!(
+        view.fired_this_pass, 0,
+        "already fired — surfaced by read-time resolution, not re-fired"
+    );
+    assert_eq!(nag_count(&store).await, 1, "still one nag mark");
+}
+
+// ---- (9) a re-owned claim never re-fires, but the read re-resolves to the new owner ----
+
+#[tokio::test]
+async fn re_owning_a_claim_re_resolves_the_owner_without_re_firing() {
+    // The fire key excludes owners, so a claim whose ownership changes never re-fires. But
+    // owners resolve at read time, so the surfaced item shows the NEW owner. Pin this
+    // intended split: fire-once is owner-independent, delivery is owner-current.
+    let fixture = GitFixture::with_files(&[
+        (".claims/payments/pin.md", &claim_file("payments/pin", "")),
+        (".github/CODEOWNERS", "*  @acme/old\n"),
+    ]);
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let mirror_root = sync(&store, &fixture).await;
+
+    let pin = claim_of("id: payments/pin\nchecks:\n  - kind: cmd\n    run: \"true\"");
+    store
+        .append(&verdict_event(
+            &pin,
+            Verdict::Drifted,
+            "c1",
+            "run-1",
+            "2026-07-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let now = ts("2026-07-02T00:00:00Z");
+    let r = router(store.clone(), &mirror_root);
+
+    // First pass: fires once, owned by @acme/old.
+    let view = r.run_once(now).await.unwrap();
+    assert_eq!(view.fired_this_pass, 1, "fires once under the old owner");
+    assert_eq!(view.nags[0].owners, vec!["@acme/old"]);
+    assert_eq!(nag_count(&store).await, 1);
+
+    // Re-own the claim and re-sync.
+    fixture.commit_files(&[(".github/CODEOWNERS", "*  @acme/new\n")]);
+    sync(&store, &fixture).await;
+
+    // The read re-resolves to the NEW owner, but the transition does NOT re-fire (the fire
+    // key excludes owners — it is the same transition).
+    let view = r.run_once(now).await.unwrap();
+    assert_eq!(
+        view.fired_this_pass, 0,
+        "a re-owned claim is the same transition — it never re-fires"
+    );
+    assert_eq!(view.nags.len(), 1, "still surfaced");
+    assert_eq!(
+        view.nags[0].owners,
+        vec!["@acme/new"],
+        "the read re-resolves to the new owner"
+    );
+    assert_eq!(
+        nag_count(&store).await,
+        1,
+        "still one nag mark — no re-fire"
     );
 }

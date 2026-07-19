@@ -249,16 +249,30 @@ fn producer_run(producer: &Producer) -> Option<String> {
 /// derived ledger-diff. A nag with no fire key, or a verdict-kind event with no check, is
 /// ill-formed: it is rejected loudly rather than stored with a NULL digest that would never
 /// dedup and could double-fire (invariant #6).
+///
+/// A `Verdict`-kind event must also carry a `verdict`: the columns became nullable for nags
+/// (hub-11), but a verdict row with a NULL verdict is unreadable — every later `scan_from`
+/// would fail on "a verdict row has no verdict", bricking the whole hub with no recovery on
+/// an append-only ledger. So the write boundary rejects it here, symmetrically with the
+/// missing-check guard, rather than storing an unrecoverable NULL (invariant #6).
 fn dedup_digest(event: &Event) -> Result<String> {
     match event.kind {
-        EventKind::Verdict => event
-            .check
-            .as_ref()
-            .map(|c| c.digest.clone())
-            .ok_or_else(|| StoreError::Corrupt {
-                context: "a verdict event carries no check digest".to_owned(),
-                value: event.claim.clone(),
-            }),
+        EventKind::Verdict => {
+            if event.verdict.is_none() {
+                return Err(StoreError::Corrupt {
+                    context: "a verdict event carries no verdict".to_owned(),
+                    value: event.claim.clone(),
+                });
+            }
+            event
+                .check
+                .as_ref()
+                .map(|c| c.digest.clone())
+                .ok_or_else(|| StoreError::Corrupt {
+                    context: "a verdict event carries no check digest".to_owned(),
+                    value: event.claim.clone(),
+                })
+        }
         EventKind::Nag => claim_hub_core::fire_key_of(event)
             .map(|k| k.as_str().to_owned())
             .ok_or_else(|| StoreError::Corrupt {
@@ -493,8 +507,8 @@ async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) 
         let hub_recheck = claim.hub.recheck.map(|d| d.to_string());
         sqlx::query!(
             r#"
-            INSERT INTO claims_at_tip (store, claim_id, statement, "commit", hub_max_age, hub_recheck)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO claims_at_tip (store, claim_id, statement, "commit", hub_max_age, hub_recheck, path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
             store,
             id,
@@ -502,6 +516,7 @@ async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) 
             claim.commit,
             hub_max_age,
             hub_recheck,
+            claim.path,
         )
         .execute(&mut **tx)
         .await?;
@@ -647,7 +662,7 @@ impl Registry for SqliteStore {
     async fn claims_of(&self, store: &str) -> Result<Vec<RegisteredClaim>> {
         let rows = sqlx::query!(
             r#"
-            SELECT claim_id, statement, "commit" AS commit_sha, hub_max_age, hub_recheck
+            SELECT claim_id, statement, "commit" AS commit_sha, hub_max_age, hub_recheck, path
             FROM claims_at_tip
             WHERE store = ?
             ORDER BY claim_id ASC
@@ -667,6 +682,9 @@ impl Registry for SqliteStore {
                 statement: row.statement,
                 supports,
                 commit: row.commit_sha,
+                // A NULL path (a pre-hub-11 row) reads as empty; the router treats an empty
+                // path as "no path" and dead-letters rather than routing to a guessed owner.
+                path: row.path.unwrap_or_default(),
                 check_digests,
                 hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
                 check_skips,
@@ -679,7 +697,7 @@ impl Registry for SqliteStore {
         let id_str = id.as_str();
         let row = sqlx::query!(
             r#"
-            SELECT statement, "commit" AS commit_sha, hub_max_age, hub_recheck
+            SELECT statement, "commit" AS commit_sha, hub_max_age, hub_recheck, path
             FROM claims_at_tip
             WHERE store = ? AND claim_id = ?
             "#,
@@ -699,6 +717,9 @@ impl Registry for SqliteStore {
             statement: row.statement,
             supports,
             commit: row.commit_sha,
+            // A NULL path (a pre-hub-11 row) reads as empty; the router dead-letters on an
+            // empty path rather than routing to a guessed owner.
+            path: row.path.unwrap_or_default(),
             check_digests,
             hub: hub_hints(row.hub_max_age.as_deref(), row.hub_recheck.as_deref())?,
             check_skips,

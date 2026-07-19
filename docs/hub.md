@@ -539,11 +539,17 @@ the ledger and never re-nags. A `nag` event is the hub's own scheduling telemetr
 no verdict and no single check, so it can never be read as a verdict (invariant #4).
 
 **Owners resolve from CODEOWNERS at fire time**, read from the synced git mirror — never a
-stored owner field (invariant #3), and never a forge call. The matcher is GitHub's
-last-matching-pattern-wins rule, the same one the CI glue uses, so a hub-side owner and a
-glue-side owner never disagree. **One commit breaking N claims is one grouped nag**, not N
-(the drift groups on the breaking commit). **A transition with no resolvable owner is a
-dead-letter** — first-class in the queue, visible, never silently dropped (invariant #6).
+stored owner field (invariant #3), and never a forge call. The match is against the claim's
+**real synced path** (a standalone file's own path, or an embedded claim's host file), not a
+path guessed from the id — a claim's id does not fix where its file lives, so guessing would
+route to a directory owner the claim never belongs to. Because the path is real and the
+matcher is GitHub's last-matching-pattern-wins rule — the same path and rule the CI glue
+uses — a hub-side owner and a glue-side owner never disagree. **One commit breaking N claims
+is one grouped nag**, not N (the drift groups on the breaking commit). **A transition with no
+resolvable owner is a dead-letter** — first-class in the queue, visible, never silently
+dropped (invariant #6). Owners are re-resolved at read time, so a claim that dead-lettered
+for lack of an owner is delivered once an owner appears, and a re-owned claim shows its new
+owner — without either re-firing (the fire key does not depend on the owner).
 
 The hub **renders** nag content and serves it; the CI glue **delivers** it (the standing issue
 and PR comments). The hub holds no forge write credential in v1. `GET /api/nags` is what the

@@ -28,11 +28,23 @@
 //!
 //! ## Owners at fire time, dead-letter when none
 //!
-//! Owners resolve from CODEOWNERS in the synced git mirror at fire time
-//! ([`claim_hub_store::resolve_owners`]) — never a stored owner field (invariant #3). A
-//! group with no resolvable owner is a **dead-letter** queue item, first-class in the view
-//! (invariant #6 — a nag with nobody to route to is visible, never silently dropped). One
-//! commit breaking N claims is one grouped item (grouping by envelope commit).
+//! Owners resolve from CODEOWNERS in the synced git mirror at fire time — never a stored
+//! owner field (invariant #3). The match is against the claim's **real synced path** (the
+//! store-relative path the registry recorded at sync, `RegisteredClaim::path`), which is a
+//! standalone file's own path or an embedded claim's host file — the same path the CI glue
+//! matches, so hub-side and glue-side owners agree. It is never a synthetic `.claims/<id>.md`
+//! reconstructed from the id: a claim's id does not fix its path, so a synthetic path would
+//! match a directory rule the claim does not belong to and route to a **wrong** owner, worse
+//! than a dead-letter (the real owner never hears; the wrong person cannot act — invariant
+//! #6). When the real path is somehow absent (a defensive pre-hub-11 NULL), the group
+//! dead-letters rather than routing to a guess. A group with no resolvable owner is a
+//! **dead-letter** queue item, first-class in the view (invariant #6 — a nag with nobody to
+//! route to is visible, never silently dropped). One commit breaking N claims is one grouped
+//! item (grouping by envelope commit).
+//!
+//! Owner resolution shells out to `git show`, so it runs under `spawn_blocking` (off the
+//! reactor the tick and the axum server share) and caches each `(store, tip)`'s CODEOWNERS
+//! once per pass — the common case is one store, one CODEOWNERS, so one `git show` per pass.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,8 +56,8 @@ use claim_hub_core::{
     Event, NagGroup, PendingTransition, Transition,
 };
 use claim_hub_store::{
-    fired_keys, ledger_events, registry_snapshot, resolve_owners, Ledger, Registry, SqliteStore,
-    StoreError,
+    fired_keys, ledger_events, owners_for, read_codeowners_at, registry_snapshot, Appended, Ledger,
+    Registry, SqliteStore, StoreError,
 };
 
 /// The router's dependencies: the store it reads and appends to, the mirror root it reads
@@ -99,23 +111,29 @@ impl Router {
     /// single unresolvable owner is **not** an error — it is a dead-letter in the returned
     /// view (invariant #6).
     pub async fn run_once(&self, now: Timestamp) -> Result<RouterView, StoreError> {
-        let (groups, tips) = self.current_pass(now).await?;
+        let Pass { groups, owners } = self.current_pass(now).await?;
 
         // The fired set: derived from the ledger's `nag` events, never a stored flag.
         let already_fired = fired_keys(&self.store).await?;
 
         let mut view = RouterView::default();
-        for group in groups {
+        for (group, owners) in groups.into_iter().zip(owners) {
             let key = group.fire_key();
-            let is_new = !already_fired.contains(&key);
-            if is_new {
+            let mut fired = false;
+            if !already_fired.contains(&key) {
                 // Append the fire mark: a `nag` event whose producer carries the fire key,
-                // so the next pass (and a restart) derive this as already-fired.
+                // so the next pass (and a restart) derive this as already-fired. The DB
+                // dedup index is a second line of defense: two concurrent ticks racing on
+                // one fire key both pass the in-memory `already_fired` check, but only one
+                // `append` is `New` — count only that one, so `fired_this_pass` reports
+                // genuinely-new transitions, not the absorbed duplicate.
                 let event = self.nag_event(&group, now);
-                self.store.append(&event).await?;
-                view.fired_this_pass += 1;
+                if let Appended::New(_) = self.store.append(&event).await? {
+                    fired = true;
+                    view.fired_this_pass += 1;
+                }
             }
-            self.record_into(&mut view, group, is_new, &tips);
+            record_into(&mut view, group, owners, fired);
         }
         Ok(view)
     }
@@ -132,10 +150,10 @@ impl Router {
     ///
     /// Propagates a store read fault or a git-spawn fault from owner resolution.
     pub async fn current_view(&self, now: Timestamp) -> Result<RouterView, StoreError> {
-        let (groups, tips) = self.current_pass(now).await?;
+        let Pass { groups, owners } = self.current_pass(now).await?;
         let mut view = RouterView::default();
-        for group in groups {
-            self.record_into(&mut view, group, false, &tips);
+        for (group, owners) in groups.into_iter().zip(owners) {
+            record_into(&mut view, group, owners, false);
         }
         Ok(view)
     }
@@ -150,21 +168,24 @@ impl Router {
     ///
     /// Propagates a store read fault or a git-spawn fault from owner resolution.
     pub async fn current_groups(&self, now: Timestamp) -> Result<Vec<NagGroup>, StoreError> {
-        Ok(self.current_pass(now).await?.0)
+        Ok(self.current_pass(now).await?.groups)
     }
 
-    /// The grouped transitions plus the per-store registry tip commits — the shared spine of
-    /// the view and the fire logic.
+    /// The grouped transitions, the per-store registry tip commits, and the resolved owners
+    /// for each group — the shared spine of the view and the fire logic.
     ///
     /// The tip commits are load-bearing for owner resolution: CODEOWNERS is read from the
     /// mirror at the store's **synced tip** (a commit the mirror actually holds), not at a
     /// verdict's drift commit (which the hub may never have synced). The two are different
     /// commits with different jobs — the drift commit *groups* the nag, the tip commit is
     /// where the hub's own CODEOWNERS lives.
-    async fn current_pass(
-        &self,
-        now: Timestamp,
-    ) -> Result<(Vec<NagGroup>, BTreeMap<String, String>), StoreError> {
+    ///
+    /// The returned `owners` is index-aligned with `groups`: `owners[i]` are the resolved
+    /// CODEOWNERS owners of `groups[i]`, matched against the group's primary claim's real
+    /// path (empty when none resolved — a dead-letter). Owner resolution shells out to git,
+    /// so it runs under `spawn_blocking` (never on the reactor the tick and axum share) and
+    /// caches each `(store, tip)`'s CODEOWNERS once per pass.
+    async fn current_pass(&self, now: Timestamp) -> Result<Pass, StoreError> {
         let registry = registry_snapshot(&self.store).await?;
         let events = ledger_events(&self.store).await?;
         let model = claim_hub_core::derive(&registry, &events, now, &self.config);
@@ -182,9 +203,9 @@ impl Router {
             }
         }
 
-        // Pre-fetch each claim's statement and supports (and the store's synced tip commit)
-        // from the registry, so the grouping fold stays pure (a sync lookup, no IO).
-        let (details, tips) = self.claim_details(&pending).await?;
+        // Pre-fetch each claim's statement, supports, real path, and the store's synced tip
+        // commit from the registry, so the grouping fold stays pure (a sync lookup, no IO).
+        let (details, tips, paths) = self.claim_details(&pending).await?;
         let groups = group_transitions(&pending, |pt| {
             details
                 .get(&(pt.store.clone(), pt.claim.clone()))
@@ -196,16 +217,68 @@ impl Router {
                     supports: Vec::new(),
                 })
         });
-        Ok((groups, tips))
+
+        let owners = self.resolve_all_owners(&groups, &tips, &paths).await?;
+        Ok(Pass { groups, owners })
     }
 
-    /// The statement and supports for each pending transition's claim, plus the synced tip
-    /// commit of each store, from the registry.
+    /// Resolve every group's owners in one blocking phase, off the reactor and CODEOWNERS-
+    /// cached.
+    ///
+    /// Owner resolution reads CODEOWNERS out of the synced mirror with `git show`, which is
+    /// blocking work — the sibling registry sync wraps its git in `spawn_blocking` for the
+    /// same reason ("never stall the reactor the interval driver and the axum server
+    /// share"), and `GET /api/nags` is pollable, so a tight poll must not spawn a synchronous
+    /// subprocess per group on a worker thread. Each `(store, tip)`'s CODEOWNERS is read
+    /// **once** per pass into a cache and every group in that store is matched against the
+    /// cached text — the common case is one store, one CODEOWNERS, one tip, so one `git
+    /// show` covers the whole pass.
+    ///
+    /// Returns owners index-aligned with `groups`. A group whose primary claim has no known
+    /// real path (defensively — a pre-hub-11 NULL path) resolves to **no owners** and
+    /// dead-letters, rather than routing to a guessed synthetic-path owner (invariant #6 — a
+    /// wrong owner is worse than a dead-letter). With no mirror root configured, every group
+    /// dead-letters honestly (no mirror to read CODEOWNERS from).
+    async fn resolve_all_owners(
+        &self,
+        groups: &[NagGroup],
+        tips: &BTreeMap<String, String>,
+        paths: &BTreeMap<(String, String), String>,
+    ) -> Result<Vec<Vec<String>>, StoreError> {
+        let Some(mirror_root) = self.mirror_root.clone() else {
+            return Ok(vec![Vec::new(); groups.len()]);
+        };
+        // Everything the blocking closure needs, owned, so it borrows nothing across the
+        // await. Each group carries its store, primary-claim path, and store tip.
+        let jobs: Vec<(String, Option<String>, Option<String>)> = groups
+            .iter()
+            .map(|group| {
+                let store = group.store.clone();
+                let path = paths
+                    .get(&(store.clone(), group.primary_claim().to_owned()))
+                    .cloned();
+                let tip = tips.get(&store).cloned();
+                (store, path, tip)
+            })
+            .collect();
+
+        tokio::task::spawn_blocking(move || resolve_owner_jobs(&mirror_root, &jobs))
+            .await
+            .map_err(|join| StoreError::Io {
+                context: "the owner-resolution worker thread panicked".to_owned(),
+                source: std::io::Error::other(join.to_string()),
+            })?
+    }
+
+    /// The statement and supports for each pending transition's claim, the synced tip commit
+    /// of each store, and each claim's real store-relative path, from the registry.
     ///
     /// The tip commit is where the hub's own CODEOWNERS lives in the mirror — read from any
-    /// live claim's `commit` (all a store's claims share the synced tip). It is returned
-    /// alongside the details so owner resolution reads CODEOWNERS at a commit the mirror
-    /// actually holds, not at a verdict's drift commit the hub may never have synced.
+    /// live claim's `commit` (all a store's claims share the synced tip) — so owner
+    /// resolution reads CODEOWNERS at a commit the mirror actually holds, not at a verdict's
+    /// drift commit the hub may never have synced. The path is the claim file's real
+    /// store-relative path the router matches CODEOWNERS against (never a synthetic
+    /// `.claims/<id>.md`), so a non-canonical or embedded claim routes to its true owner.
     #[allow(clippy::type_complexity)]
     async fn claim_details(
         &self,
@@ -214,11 +287,13 @@ impl Router {
         (
             BTreeMap<(String, String), DriftedClaim>,
             BTreeMap<String, String>,
+            BTreeMap<(String, String), String>,
         ),
         StoreError,
     > {
         let mut details = BTreeMap::new();
         let mut tips: BTreeMap<String, String> = BTreeMap::new();
+        let mut paths: BTreeMap<(String, String), String> = BTreeMap::new();
         for pt in pending {
             let key = (pt.store.clone(), pt.claim.clone());
             if details.contains_key(&key) {
@@ -230,6 +305,7 @@ impl Router {
             if let Some(registered) = self.store.claim(&pt.store, &claim_id).await? {
                 tips.entry(pt.store.clone())
                     .or_insert_with(|| registered.commit.clone());
+                paths.insert(key.clone(), registered.path.clone());
                 details.insert(
                     key,
                     DriftedClaim {
@@ -241,40 +317,7 @@ impl Router {
                 );
             }
         }
-        Ok((details, tips))
-    }
-
-    /// Resolve a group's owners from CODEOWNERS in the mirror, at the group's commit.
-    ///
-    /// The claim file path CODEOWNERS matches is reconstructed as the canonical
-    /// `.claims/<id>.md` (a store's standalone claim lives there — `claim-store`'s authoring
-    /// rule), so a directory rule like `.claims/payments/` or `payments/` routes the claim.
-    /// An embedded claim (declared inside a host file) would not match its host file's path
-    /// this way; that is a v1 approximation, and an unmatched claim falls to the store's
-    /// catch-all rule or dead-letters — never a wrong owner.
-    ///
-    /// With no mirror root configured, no owner resolves and the group dead-letters —
-    /// honestly, since there is no mirror to read CODEOWNERS from.
-    ///
-    /// `tip_commit` is the store's synced registry tip — where the hub's own CODEOWNERS
-    /// lives in the mirror — **not** the group's drift commit, which the hub may never have
-    /// synced. Resolving at the tip reads the CODEOWNERS the hub actually holds.
-    fn owners_of(
-        &self,
-        group: &NagGroup,
-        tip_commit: Option<&str>,
-    ) -> Result<Vec<String>, StoreError> {
-        let Some(mirror_root) = &self.mirror_root else {
-            return Ok(Vec::new());
-        };
-        let Some(tip) = tip_commit else {
-            // No synced tip for this store: no CODEOWNERS to read, so the group dead-letters.
-            return Ok(Vec::new());
-        };
-        // Resolve against the primary claim's path; a drift group's claims share a store, and
-        // CODEOWNERS routing is per-file. v1 routes the group by its primary claim's owners.
-        let claim_file = format!(".claims/{}.md", group.primary_claim());
-        resolve_owners(mirror_root, &group.store, tip, &claim_file)
+        Ok((details, tips, paths))
     }
 
     /// Build the `nag` event that marks a group as fired.
@@ -293,25 +336,66 @@ impl Router {
             now,
         )
     }
+}
 
-    /// Record a group into the view, resolving its owners (at the store's synced tip) and
-    /// classifying it as an owned nag or a dead-letter.
-    fn record_into(
-        &self,
-        view: &mut RouterView,
-        group: NagGroup,
-        fired: bool,
-        tips: &BTreeMap<String, String>,
-    ) {
-        let owners = self
-            .owners_of(&group, tips.get(&group.store).map(String::as_str))
-            .unwrap_or_default();
-        let item = NagView::from_group(group, owners, fired);
-        if item.owners.is_empty() {
-            view.dead_letters.push(item);
-        } else {
-            view.nags.push(item);
+/// The grouped transitions and their resolved owners, index-aligned — the spine both
+/// [`Router::run_once`] and [`Router::current_view`] iterate. `owners[i]` are `groups[i]`'s
+/// resolved owners (empty for a dead-letter).
+struct Pass {
+    groups: Vec<NagGroup>,
+    owners: Vec<Vec<String>>,
+}
+
+/// Resolve every group's owners in one blocking pass, reading each `(store, tip)`'s
+/// CODEOWNERS once and matching every group's **real** claim path against the cached text.
+///
+/// The per-pass cache is the point: many groups usually share one store, one tip, and one
+/// CODEOWNERS, so one `git show` covers the whole pass instead of one per group. A job with
+/// no known tip (the store has no synced tip) or no known real path (a defensive
+/// pre-hub-11 NULL path) resolves to **no owners** — a dead-letter — rather than routing to
+/// a guessed synthetic-path owner (invariant #6). Matching the real path is what makes a
+/// non-canonical or embedded claim route to its true owner and agree with the CI glue, which
+/// matches the same path.
+fn resolve_owner_jobs(
+    mirror_root: &Path,
+    jobs: &[(String, Option<String>, Option<String>)],
+) -> Result<Vec<Vec<String>>, StoreError> {
+    // `(store, tip)` → the CODEOWNERS text (or `None`), read at most once per pass.
+    let mut codeowners: BTreeMap<(String, String), Option<String>> = BTreeMap::new();
+    let mut resolved = Vec::with_capacity(jobs.len());
+    for (store, path, tip) in jobs {
+        // Without a synced tip or a real path there is nothing safe to match; dead-letter.
+        let (Some(tip), Some(path)) = (tip.as_ref(), path.as_ref()) else {
+            resolved.push(Vec::new());
+            continue;
+        };
+        if path.is_empty() {
+            resolved.push(Vec::new());
+            continue;
         }
+        let key = (store.clone(), tip.clone());
+        if !codeowners.contains_key(&key) {
+            let text = read_codeowners_at(mirror_root, store, tip)?;
+            codeowners.insert(key.clone(), text);
+        }
+        let owners = codeowners
+            .get(&key)
+            .and_then(Option::as_ref)
+            .map(|text| owners_for(path, text))
+            .unwrap_or_default();
+        resolved.push(owners);
+    }
+    Ok(resolved)
+}
+
+/// Record a group and its precomputed owners into the view, classifying it as an owned nag
+/// or a dead-letter (no resolvable owner — visible, never dropped, invariant #6).
+fn record_into(view: &mut RouterView, group: NagGroup, owners: Vec<String>, fired: bool) {
+    let item = NagView::from_group(group, owners, fired);
+    if item.owners.is_empty() {
+        view.dead_letters.push(item);
+    } else {
+        view.nags.push(item);
     }
 }
 

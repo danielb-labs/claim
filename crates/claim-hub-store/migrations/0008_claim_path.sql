@@ -1,0 +1,21 @@
+-- The claim's real store-relative path, persisted so the router matches CODEOWNERS
+-- against where the claim actually lives (hub-11 owner-resolution fix).
+--
+-- Why the path, and why the real one: CODEOWNERS routing is per-file, and a claim's id
+-- (from YAML frontmatter) does NOT determine its path — the file can live at a
+-- non-canonical `.claims/**` path, or be embedded in a host file (CLAUDE.md, AGENTS.md).
+-- Reconstructing a synthetic `.claims/<id>.md` to match against would route a claim
+-- `id: payments/pin` living at `.claims/foo.md` to the `.claims/payments/` owner it never
+-- belongs to — a WRONG owner, worse than a dead-letter (the real owner never hears; the
+-- wrong person cannot act, invariant #6). Registry sync has the real path in hand at parse
+-- time (`Claim::source::path`, which is `loaded.path` for a standalone file and the host
+-- file's path for an embedded claim — exactly what the CI glue matches too), so it records
+-- it here. For an embedded claim this is the host file's path, so the hub-side and
+-- glue-side owner AGREE.
+--
+-- Additive on `claims_at_tip`. A snapshot replace deletes and re-inserts these rows, so an
+-- edited or moved claim's path never lingers past the next sync. NULL for a row written by
+-- a pre-hub-11 migration state (none in practice — this column ships with the sync change
+-- that populates it), which the router treats defensively as "no path" and dead-letters
+-- rather than routing to a guessed owner.
+ALTER TABLE claims_at_tip ADD COLUMN path TEXT; -- store-relative path of the claim file, or NULL.

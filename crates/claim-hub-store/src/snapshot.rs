@@ -27,11 +27,12 @@
 //! no config window — a stale fact showing green, exactly the false-green invariant #6
 //! forbids.
 //!
-//! Per-check **skips** are deliberately *not* carried here (the entry's `skip` is `None`):
-//! a skip is queue/ranking data (hub-14, issue #9), and the deriver's *standing* folds
-//! only verdicts — a skipped check records no verdict, so it never bears on `verified` /
-//! `stale` / `drifted`. Persisting skips changes no standing today, so it stays with the
-//! item that ranks them.
+//! Per-check **skips** *are* carried here now (hub-11): each stored skip flows through
+//! `claim_entry` into the deriver's [`DerivedCheck`], so the deriver can surface a lapsed
+//! skip `until` as a transition the router routes (the deferred check is due again). A skip
+//! still never freshens a claim — the deriver's *standing* folds only verdicts, and a
+//! skipped check records no verdict — so this bears on lapsed-skip detection and the queue,
+//! not on the `verified` / `stale` / `drifted` standing.
 
 use claim_hub_core::{ClaimEntry, DerivedCheck, RegistrySnapshot};
 

@@ -391,9 +391,10 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     lapsing</strong>. Each fires <strong>exactly once</strong>, and fire-once is <em>derived from the
     ledger</em>, not stored: the router appends a <code>nag</code> event and diffs against those events, so
     there is no &ldquo;notified&rdquo; flag to lose and a restart never re-nags. Owners resolve from
-    <strong>CODEOWNERS</strong> at fire time (from the synced git mirror, never a stored field); one commit
-    breaking many claims is <strong>one grouped nag</strong>; and a transition with no owner is a
-    first-class <strong>dead-letter</strong>, visible, never dropped. The hub <em>renders</em> the nag
+    <strong>CODEOWNERS</strong> at fire time (from the synced git mirror, never a stored field), matched
+    against the claim&rsquo;s <strong>real synced path</strong> &mdash; the same path the CI glue matches, so
+    the two never disagree; one commit breaking many claims is <strong>one grouped nag</strong>; and a
+    transition with no owner is a first-class <strong>dead-letter</strong>, visible, never dropped. The hub <em>renders</em> the nag
     content and serves it at <code>GET /api/nags</code>; the CI glue <em>delivers</em> it (the standing
     issue and PR comments) &mdash; the hub holds no forge write credential.</p>
     <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small

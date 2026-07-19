@@ -27,7 +27,7 @@ CREATE TABLE events_new (
     kind         TEXT    NOT NULL,
     claim_id     TEXT    NOT NULL,
     check_index  INTEGER,          -- NULL on a nag (not about one check); set on a verdict.
-    check_digest TEXT,             -- NULL on a nag's... no: a nag stores its fire key here.
+    check_digest TEXT,             -- Set on both: a verdict its check's digest, a nag its fire key.
     verdict      TEXT,             -- NULL on a nag (invariant #4: a nag reports no verdict).
     evidence     TEXT,
     "commit"     TEXT    NOT NULL,
