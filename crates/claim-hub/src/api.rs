@@ -28,6 +28,14 @@
 //!
 //! Auth is deferred to hub-13; the mount seam is [`crate::build_app`]. These routes are
 //! unauthenticated for now.
+//!
+//! **Parity with the hub MCP (hub-09).** The response *value* of each read is built by a
+//! surface-agnostic function returning a [`ReadResult`] — the JSON body on success, or a
+//! [`ReadProblem`] (a status and a reason) on a client or store fault. The axum handlers
+//! here render that value with axum's `Json`/`problem`; the MCP tools in [`crate::mcp`]
+//! render the *same* value as structured tool content. The shared function is the single
+//! place a body is derived, so the API and the MCP tool cannot drift: they are the same
+//! bytes by construction, not by a duplicated derivation kept in sync by hand.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -43,6 +51,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::http::problem;
+
+/// A read's rendered outcome, independent of the surface that renders it.
+///
+/// `Ok(value)` is the `200` body; `Err(problem)` is a non-`200` the surface renders in its
+/// own idiom — axum as a `{ "error": … }` body at the problem's status, the MCP tool as a
+/// tool error carrying the same reason (an honest 404/400 mirrored, never a fabricated
+/// standing). Sharing this outcome between the two surfaces is what makes the MCP tool
+/// return byte-identical JSON to its API twin (hub-09's parity-by-construction).
+pub type ReadResult = Result<serde_json::Value, ReadProblem>;
+
+/// A non-`200` read outcome: the HTTP status it maps to and the client-facing reason.
+///
+/// The reason is the loud, actionable message (CLAUDE.md's error-message rule). The
+/// `status` lets the API answer with the right code and the MCP tool classify the failure
+/// (a `404`/`400` is a normal "no such claim"/"bad argument" the agent reads, a `500` is a
+/// store fault). Carried as a value rather than an already-built `Response` so both surfaces
+/// can render it their own way.
+#[derive(Debug, Clone)]
+pub struct ReadProblem {
+    /// The HTTP status the API answers with; the MCP tool reads it to tell a client error
+    /// (`4xx`) from a store fault (`5xx`).
+    pub status: StatusCode,
+    /// The actionable, client-facing reason — the same text on both surfaces.
+    pub reason: String,
+}
+
+impl ReadProblem {
+    fn new(status: StatusCode, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+        }
+    }
+
+    /// Render this problem as the API's `{ "error": … }` response at its status.
+    fn into_response(self) -> Response {
+        problem(self.status, &self.reason)
+    }
+}
+
+impl From<ReadError> for ReadProblem {
+    /// A store fault becomes a `500` problem, logging the underlying error first so the
+    /// operator sees the disk/connection detail the client must not.
+    fn from(error: ReadError) -> Self {
+        tracing::error!(error = %error.source, "a read failed to reach the store");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error.message)
+    }
+}
 
 /// The read API's router: every hub-08 read route, nested under `/api` by
 /// [`crate::build_app`].
@@ -73,9 +129,10 @@ pub fn router() -> Router<AppState> {
 /// keeps the derivation identical across handlers and the as-of consistent: the model's
 /// [`AsOf`] is the single source of every response's as-of.
 ///
-/// Visible to the crate so the UI ([`crate::ui`]) renders its pages from **the same
-/// derivation** the JSON API serves — the HTML/markdown surface is a lens over this read
-/// model, not a second read of the store, so the two can never disagree.
+/// Visible to the crate so every read surface renders from **the same derivation** the JSON
+/// API serves — the UI's HTML/markdown pages ([`crate::ui`]) and the MCP tools
+/// ([`crate::mcp`]) are lenses over this one read model, not second reads of the store, so
+/// they can never disagree.
 pub(crate) struct ReadState {
     /// The derived read model — every claim's standing, the due set, the horizon, and the
     /// as-of the whole surface reports.
@@ -96,7 +153,8 @@ pub(crate) struct ReadState {
 /// maps to a `500` — the hub cannot state the standing, so it says so loudly rather than
 /// fabricating one (invariant #6).
 ///
-/// `pub(crate)` so the UI reuses the identical derivation rather than re-deriving.
+/// `pub(crate)` so the UI and the MCP tools reuse the identical derivation rather than
+/// re-deriving.
 pub(crate) async fn read_state(state: &AppState) -> Result<ReadState, ReadError> {
     let registry = registry_snapshot(&state.store)
         .await
@@ -113,11 +171,21 @@ pub(crate) async fn read_state(state: &AppState) -> Result<ReadState, ReadError>
     Ok(ReadState { model, events })
 }
 
+/// The rendered value of a claim's full dossier, addressed by its id (the MCP `dossier`
+/// tool). Builds the read state and delegates to [`dossier_value`], so the tool returns the
+/// same body `GET /api/claims/{id}/dossier` does.
+pub(crate) async fn dossier_value_for(state: &AppState, id: &str) -> ReadResult {
+    let read = read_state(state).await?;
+    dossier_value(state, &read, id).await
+}
+
 /// A store read fault, with the operator-facing message the handler answers `500` with.
 ///
 /// The underlying [`StoreError`] is logged (it may name a disk or connection fault the
-/// client must not see), and the client gets the terse, safe `message`. `pub(crate)` so the
-/// UI answers a store fault the same loud way (invariant #6).
+/// client must not see), and the client gets the terse, safe `message`. Converts into a
+/// [`ReadProblem`] via `?` (logging the source as it does), so a shared value function
+/// short-circuits a store fault into a `500` without duplicating the log-and-map. `pub(crate)`
+/// so the UI answers a store fault the same loud way (invariant #6).
 pub(crate) struct ReadError {
     message: &'static str,
     source: StoreError,
@@ -141,6 +209,32 @@ impl ReadError {
     }
 }
 
+/// Serialize a response body into the shared JSON [`ReadResult`] value.
+///
+/// The one place a read body becomes JSON, so the API handler and the MCP tool serialize
+/// through the identical path — parity by construction. A serialization fault (a `Serialize`
+/// impl that errors, which the hub's plain data types do not) is a `500`, never a partial or
+/// fabricated body.
+fn value_of<T: Serialize>(body: T) -> ReadResult {
+    serde_json::to_value(body).map_err(|error| {
+        tracing::error!(%error, "failed to serialize a read response body");
+        ReadProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot render the response right now",
+        )
+    })
+}
+
+/// Render a shared [`ReadResult`] as an axum [`Response`]: the JSON body at `200`, or the
+/// problem at its status. The MCP surface renders the same [`ReadResult`] its own way (a
+/// tool result), so this is the API-specific half of the shared outcome.
+fn render(result: ReadResult) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(problem) => problem.into_response(),
+    }
+}
+
 /// `GET /api/claims/{id}` and `GET /api/claims/{id}/dossier`, disambiguated by a trailing
 /// `/dossier` in the catch-all capture.
 ///
@@ -158,35 +252,39 @@ impl ReadError {
 async fn claim_or_dossier(State(state): State<AppState>, Path(rest): Path<String>) -> Response {
     let read = match read_state(&state).await {
         Ok(read) => read,
-        Err(error) => return error.into_response(),
+        Err(error) => return ReadProblem::from(error).into_response(),
     };
-    if let Some(prefix) = rest.strip_suffix("/dossier") {
+    let value = if let Some(prefix) = rest.strip_suffix("/dossier") {
         if read.model.claims.keys().any(|(_, cid)| cid == prefix) {
-            return dossier(&state, &read, prefix).await;
+            dossier_value(&state, &read, prefix).await
+        } else {
+            claim_standing_value(&read, &rest)
         }
-    }
-    claim_standing(&read, &rest)
+    } else {
+        claim_standing_value(&read, &rest)
+    };
+    render(value)
 }
 
-/// `GET /api/claims/{id}`: the derived standing of one claim, with its as-of.
+/// The rendered value of `GET /api/claims/{id}`: one claim's derived standing, with its
+/// as-of, or a `404` problem naming it.
 ///
 /// A claim the registry does not know — never synced, or retired and with no ledger
 /// history — is a `404` naming it, never a fabricated `verified`. Where two connected
 /// stores share a claim id (ids are unique only within a store), the lexicographically
 /// first `(store, id)` match is returned — the documented M0 tie-break; the `store` query
-/// param on `GET /api/claims` addresses a claim exactly.
-fn claim_standing(read: &ReadState, id: &str) -> Response {
+/// param on `GET /api/claims` addresses a claim exactly. Shared with the MCP `dossier`
+/// tool's fallback and any surface that needs one claim's standing.
+fn claim_standing_value(read: &ReadState, id: &str) -> ReadResult {
     match read.model.claims.iter().find(|((_, cid), _)| cid == id) {
-        Some((_, standing)) => {
-            Json(StandingResponse::new(standing, read.model.as_of)).into_response()
-        }
-        None => problem(
+        Some((_, standing)) => value_of(StandingResponse::new(standing, read.model.as_of)),
+        None => Err(ReadProblem::new(
             StatusCode::NOT_FOUND,
-            &format!(
+            format!(
                 "no claim `{id}` in the registry — it may not be synced yet, or it was retired \
                  with no verdict history"
             ),
-        ),
+        )),
     }
 }
 
@@ -198,63 +296,66 @@ fn claim_standing(read: &ReadState, id: &str) -> Response {
 /// return the wrong set (invariant #6).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClaimsQuery {
+pub(crate) struct ClaimsQuery {
     /// Match claims whose id starts with this prefix. The claim id is the namespaced
     /// handle for "what the org believes about what I am touching" (HUB.md §5); the
     /// registry stores no filesystem path, so a path filter is an id-prefix match (e.g.
     /// `payments/` selects every claim under the `payments` namespace). A prefix that
     /// matches a whole id also matches that one claim.
-    path: Option<String>,
+    pub(crate) path: Option<String>,
     /// Match claims in exactly this connected store (e.g. `github.com/acme/payments`).
     /// This is the exact-address selector the hub-07 tie-break note pointed at.
-    store: Option<String>,
+    pub(crate) store: Option<String>,
     /// Match claims whose derived standing is exactly this (`verified`, `stale`,
     /// `drifted`, `suspect`, `retired`). An unrecognized value is a `400` naming the
     /// accepted set.
-    standing: Option<String>,
+    pub(crate) standing: Option<String>,
     /// Match claims that support this target — a decision ref or a claim id a claim
     /// justifies (the `supports` edge). Selects every claim whose `supports` list holds
     /// the target verbatim.
-    supports: Option<String>,
+    pub(crate) supports: Option<String>,
 }
 
 /// `GET /api/claims`: the live set filtered by `path`, `store`, `standing`, and
 /// `supports`, each claim with its derived standing.
+async fn list_claims(State(state): State<AppState>, Query(query): Query<ClaimsQuery>) -> Response {
+    render(list_claims_value(&state, &query).await)
+}
+
+/// The rendered value of `GET /api/claims`: the live set filtered by `path`, `store`,
+/// `standing`, and `supports`, each claim with its derived standing.
 ///
 /// The filters combine with AND. `standing` is parsed against the [`Standing`] enum; an
 /// unrecognized value is a `400`. `supports` is resolved through the registry's reverse
 /// supports index ([`Registry::claims_supporting`]) — the cross-store query #10 keys on —
 /// and intersected with the derived set. The result is in (store, id) order for
-/// determinism and carries the model's as-of.
-async fn list_claims(State(state): State<AppState>, Query(query): Query<ClaimsQuery>) -> Response {
+/// determinism and carries the model's as-of. Shared with the MCP `search` tool (the full
+/// filter set) and `context` tool (the `path`/`store` subset), so those tools return the
+/// same body this endpoint does.
+pub(crate) async fn list_claims_value(state: &AppState, query: &ClaimsQuery) -> ReadResult {
     // Parse the `standing` filter first: an invalid value is a client error, answered
     // before any store read so a bad request never touches the ledger.
     let standing_filter = match query.standing.as_deref().map(parse_standing) {
         Some(Ok(standing)) => Some(standing),
-        Some(Err(reason)) => return problem(StatusCode::BAD_REQUEST, &reason),
+        Some(Err(reason)) => return Err(ReadProblem::new(StatusCode::BAD_REQUEST, reason)),
         None => None,
     };
 
-    let read = match read_state(&state).await {
-        Ok(read) => read,
-        Err(error) => return error.into_response(),
-    };
+    let read = read_state(state).await?;
 
     // The `supports` filter resolves to a set of (store, id) keys via the reverse index.
     // Resolved once so the per-claim filter is a cheap membership test.
     let supports_keys = match &query.supports {
-        Some(target) => match state.store.claims_supporting(target).await {
-            Ok(edges) => Some(
-                edges
-                    .into_iter()
-                    .map(|e| (e.store, e.claim_id.as_str().to_owned()))
-                    .collect::<std::collections::BTreeSet<_>>(),
-            ),
-            Err(error) => {
-                return ReadError::new("cannot read the supports index right now", error)
-                    .into_response()
-            }
-        },
+        Some(target) => Some(
+            state
+                .store
+                .claims_supporting(target)
+                .await
+                .map_err(|error| ReadError::new("cannot read the supports index right now", error))?
+                .into_iter()
+                .map(|e| (e.store, e.claim_id.as_str().to_owned()))
+                .collect::<std::collections::BTreeSet<_>>(),
+        ),
         None => None,
     };
 
@@ -273,40 +374,41 @@ async fn list_claims(State(state): State<AppState>, Query(query): Query<ClaimsQu
         .map(|(_, standing)| StandingResponse::bare(standing))
         .collect();
 
-    Json(ClaimsListResponse {
+    value_of(ClaimsListResponse {
         claims,
         as_of: read.model.as_of,
     })
-    .into_response()
 }
 
 /// `GET /api/drifted`: every claim whose derived standing is [`Standing::Drifted`].
 async fn drifted_set(State(state): State<AppState>) -> Response {
-    standing_set(&state, Standing::Drifted).await
+    render(standing_set_value(&state, Standing::Drifted).await)
 }
 
 /// `GET /api/due`: the review queue — every drifted, stale, or due-for-recheck claim.
+async fn due_set(State(state): State<AppState>) -> Response {
+    render(due_value(&state).await)
+}
+
+/// The rendered value of `GET /api/due`: the review queue.
 ///
 /// This is the deriver's own due set ([`ReadModel::due`](claim_hub_core::ReadModel)), not a
 /// `standing == due` filter: due-ness is a union of "needs attention now" states (drifted,
 /// stale, or past its recheck cadence), so it is read from the model's computed
-/// membership, which a standing-equality filter could not reproduce.
-async fn due_set(State(state): State<AppState>) -> Response {
-    let read = match read_state(&state).await {
-        Ok(read) => read,
-        Err(error) => return error.into_response(),
-    };
+/// membership, which a standing-equality filter could not reproduce. Shared with the MCP
+/// `due` tool.
+pub(crate) async fn due_value(state: &AppState) -> ReadResult {
+    let read = read_state(state).await?;
     let claims: Vec<StandingResponse> = read
         .model
         .due
         .iter()
         .filter_map(|key| read.model.claims.get(key).map(StandingResponse::bare))
         .collect();
-    Json(ClaimsListResponse {
+    value_of(ClaimsListResponse {
         claims,
         as_of: read.model.as_of,
     })
-    .into_response()
 }
 
 /// `GET /api/suspect`: every claim whose derived standing is [`Standing::Suspect`].
@@ -315,15 +417,13 @@ async fn due_set(State(state): State<AppState>) -> Response {
 /// a later deriver rule; this endpoint serves the set today so the surface already carries
 /// it, and it is populated the moment that rule lands with no route change.
 async fn suspect_set(State(state): State<AppState>) -> Response {
-    standing_set(&state, Standing::Suspect).await
+    render(standing_set_value(&state, Standing::Suspect).await)
 }
 
-/// The shared body of `/api/drifted` and `/api/suspect`: every claim of one standing.
-async fn standing_set(state: &AppState, want: Standing) -> Response {
-    let read = match read_state(state).await {
-        Ok(read) => read,
-        Err(error) => return error.into_response(),
-    };
+/// The rendered value of a standing-set endpoint (`/api/drifted`, `/api/suspect`): every
+/// claim of one standing, with the set's shared as-of. Shared with the MCP `drifts` tool.
+pub(crate) async fn standing_set_value(state: &AppState, want: Standing) -> ReadResult {
+    let read = read_state(state).await?;
     let claims: Vec<StandingResponse> = read
         .model
         .claims
@@ -331,11 +431,10 @@ async fn standing_set(state: &AppState, want: Standing) -> Response {
         .filter(|s| s.standing == want)
         .map(StandingResponse::bare)
         .collect();
-    Json(ClaimsListResponse {
+    value_of(ClaimsListResponse {
         claims,
         as_of: read.model.as_of,
     })
-    .into_response()
 }
 
 /// `GET /api/claims/{id}/dossier`: a claim's full derivation — statement, check by git
@@ -355,47 +454,53 @@ async fn standing_set(state: &AppState, want: Standing) -> Response {
 /// the model derived from, and at most one sync ahead of it. That is a safe direction: the
 /// body can only ever describe a claim as current-or-newer than the `as_of`, never as more
 /// verified than the standing, because the standing is the model's alone.
-async fn dossier(state: &AppState, read: &ReadState, id: &str) -> Response {
-    let claim_id = match id.parse::<ClaimId>() {
-        Ok(id) => id,
-        Err(error) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                &format!("`{id}` is not a valid claim id: {error}"),
-            )
-        }
-    };
-
-    // The standing locates the store: the read model is keyed by (store, id), so the first
-    // matching id fixes the store the rest of the dossier is read against.
+pub(crate) async fn dossier_value(state: &AppState, read: &ReadState, id: &str) -> ReadResult {
+    // The model lookup gates first, so an id the model does not hold — whether malformed or
+    // simply unknown — is one uniform "no claim" `404`, the same answer the API path gives:
+    // there the dossier is only reached after the id already matched a claim, so a bad id
+    // falls through to the same not-found. Parsing the `ClaimId` before this would split a
+    // malformed id off into a `400` the API never returns, breaking parity for that case.
+    // The standing also locates the store: the read model is keyed by (store, id), so the
+    // first matching id fixes the store the rest of the dossier is read against.
     let Some(((store, _), standing)) = read.model.claims.iter().find(|((_, cid), _)| cid == id)
     else {
-        return problem(
+        return Err(ReadProblem::new(
             StatusCode::NOT_FOUND,
-            &format!(
+            format!(
                 "no claim `{id}` in the registry — it may not be synced yet, or it was retired \
                  with no verdict history"
             ),
-        );
+        ));
     };
+
+    // A registered claim's id is a valid `ClaimId` by construction (the registry only holds
+    // parsed claims), so this parse succeeds; a defensive failure maps to the same "no claim"
+    // `404` rather than a `400`, keeping the tool and the API in agreement on a bad id.
+    let claim_id = id.parse::<ClaimId>().map_err(|_| {
+        ReadProblem::new(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no claim `{id}` in the registry — it may not be synced yet, or it was retired \
+                 with no verdict history"
+            ),
+        )
+    })?;
 
     // The registry entry carries the git-referenced statement, check digests, commit, and
     // supports edges. A claim in the derived model but absent from the registry read is a
     // retirement with only ledger history — no live statement to render, so a `404`.
-    let registered = match state.store.claim(store, &claim_id).await {
-        Ok(Some(registered)) => registered,
-        Ok(None) => {
-            return problem(
+    let registered = match state.store.claim(store, &claim_id).await.map_err(|error| {
+        ReadError::new("cannot read the claim from the registry right now", error)
+    })? {
+        Some(registered) => registered,
+        None => {
+            return Err(ReadProblem::new(
                 StatusCode::NOT_FOUND,
-                &format!(
+                format!(
                     "claim `{id}` in store `{store}` is retired (absent from the registry tip); \
                      its history is on the ledger but it has no live statement to render"
                 ),
-            )
-        }
-        Err(error) => {
-            return ReadError::new("cannot read the claim from the registry right now", error)
-                .into_response()
+            ))
         }
     };
 
@@ -419,7 +524,7 @@ async fn dossier(state: &AppState, read: &ReadState, id: &str) -> Response {
         })
         .collect();
 
-    Json(DossierResponse {
+    value_of(DossierResponse {
         id: id.to_owned(),
         store: store.clone(),
         statement: registered.statement,
@@ -430,7 +535,6 @@ async fn dossier(state: &AppState, read: &ReadState, id: &str) -> Response {
         history,
         as_of: read.model.as_of,
     })
-    .into_response()
 }
 
 /// The query parameter for `GET /api/feed`: the ledger position to resume after.
@@ -461,7 +565,11 @@ async fn cursor_feed(State(state): State<AppState>, Query(query): Query<FeedQuer
     let stored = match state.store.scan_from(cursor).await {
         Ok(stored) => stored,
         Err(error) => {
-            return ReadError::new("cannot read the ledger feed right now", error).into_response()
+            return ReadProblem::from(ReadError::new(
+                "cannot read the ledger feed right now",
+                error,
+            ))
+            .into_response()
         }
     };
 
@@ -470,7 +578,11 @@ async fn cursor_feed(State(state): State<AppState>, Query(query): Query<FeedQuer
     let head = match state.store.head().await {
         Ok(head) => head.0,
         Err(error) => {
-            return ReadError::new("cannot read the ledger head right now", error).into_response()
+            return ReadProblem::from(ReadError::new(
+                "cannot read the ledger head right now",
+                error,
+            ))
+            .into_response()
         }
     };
 

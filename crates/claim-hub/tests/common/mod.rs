@@ -357,6 +357,41 @@ pub async fn post_ingest(
     (status, json)
 }
 
+/// GET `/api/claims/{id}` and return the parsed JSON body (the derived standing with its
+/// as-of), for tests that read the hub's one read endpoint over the assembled app.
+pub async fn get_claim(app: &axum::Router, id: &str) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/claims/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Back up a live hub to one self-contained file at `dst`, via the store's online backup
+/// (`VACUUM INTO`), then assert `dst` carries no `-wal`/`-shm` sidecar. This is the
+/// self-host backup the docs promise, taken against a *running* hub: a consistent snapshot
+/// under a read transaction that cannot lose a committed event to a racing checkpoint — the
+/// data-loss a bare `cp hub.db` risks (invariants #4 and #6). A restore is then a plain copy
+/// of this one file.
+pub async fn backup_database(store: &SqliteStore, dst: &std::path::Path) {
+    store.backup(dst).await.expect("online backup the hub");
+    for suffix in ["-wal", "-shm"] {
+        let mut name = dst.as_os_str().to_owned();
+        name.push(suffix);
+        assert!(
+            !std::path::Path::new(&name).exists(),
+            "an online backup produces no {suffix} sidecar"
+        );
+    }
+}
+
 /// Read `/status` and return the parsed body.
 pub async fn get_status(app: &axum::Router) -> serde_json::Value {
     let response = app

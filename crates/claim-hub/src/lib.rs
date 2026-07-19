@@ -31,6 +31,7 @@ pub mod app;
 pub mod config;
 pub mod http;
 pub mod ingest;
+pub mod mcp;
 pub mod oidc;
 pub mod status;
 pub mod ui;
@@ -158,16 +159,30 @@ fn build_verifier(config: &Config) -> anyhow::Result<Option<oidc::SharedVerifier
     Ok(Some(Arc::new(verifier)))
 }
 
-/// Boot the hub from the config file at `config_path`: load config, wire tracing,
+/// Boot the hub, resolving its config from `config_path`: load config, wire tracing,
 /// and serve.
 ///
-/// The top-level entry the binary's `main` calls. A missing or invalid config fails
-/// loudly here, naming the file and the field (via [`Config::load_with_env`]), before
-/// anything binds — the "fail loudly, name the problem" requirement of the item.
-/// Environment variables (`CLAIM_HUB_LISTEN`, `CLAIM_HUB_DATABASE`) override the
-/// file's fields.
-pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
-    let config = Config::load_with_env(config_path)?;
+/// `config_path` is `Some(path)` when the operator named a config with `--config`, and
+/// `None` when they did not — in which case the default [`DEFAULT_CONFIG_PATH`] applies.
+/// The top-level entry the binary's `main` calls. An invalid config fails loudly here,
+/// naming the file and the field (via [`Config::load_with_env`]), before anything binds
+/// — the "fail loudly, name the problem" requirement of the item. Environment variables
+/// (`CLAIM_HUB_LISTEN`, `CLAIM_HUB_DATABASE`) override the file's fields.
+///
+/// A **missing** file behaves differently by source: an absent *default* `hub.toml`
+/// yields an empty config so the env overrides alone can boot a container off an empty
+/// volume (HUB-IMPLEMENTATION.md §1.13); an absent *named* `--config` path is a loud
+/// error, since a mistyped config name must never silently become defaults.
+pub async fn run(config_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let default_path;
+    let source = match &config_path {
+        Some(path) => config::ConfigSource::Explicit(path),
+        None => {
+            default_path = std::path::PathBuf::from(DEFAULT_CONFIG_PATH);
+            config::ConfigSource::Default(&default_path)
+        }
+    };
+    let config = Config::load_with_env(source)?;
     serve(config).await
 }
 

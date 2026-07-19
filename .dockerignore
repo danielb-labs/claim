@@ -1,0 +1,20 @@
+# Keep the Docker build context small and the image cache stable: the build stage copies
+# the whole workspace, so exclude everything the compile does not need. `target/` is the
+# big one (a local debug build can be gigabytes); the git dir and editor scratch add
+# nothing to a from-source build. The committed `.sqlx/` cache is deliberately NOT excluded
+# — the offline build depends on it.
+target/
+.git/
+.github/
+.claude/
+
+# Docs and examples are not needed to compile the binary. The self-host docs ship with the
+# repo, not inside the image.
+docs/
+examples/
+
+# Local scratch, editor state, and OS cruft.
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

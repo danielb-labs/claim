@@ -365,7 +365,12 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     provenance); and a <strong>cursor feed</strong> over the ledger, paginated by seq so an intermittent
     agent catches up deterministically. Every read response carries its <em>as-of</em> (the ledger
     position, registry version, and clock it derived from), so a standing can never be older than its
-    evidence.</p>
+    evidence. The <strong>hub MCP</strong> (<code>/mcp</code>) is the agent binding: five read-only
+    tools &mdash; <code>context</code>, <code>search</code>, <code>dossier</code>, <code>drifts</code>,
+    and <code>due</code> &mdash; mounted in-process on the same app and returning the same JSON their
+    API twins serve (parity by construction). Each is a read that stores nothing and carries its as-of,
+    and the surface is dated evidence to weigh, never instructions to obey: an unknown or retired claim
+    is reported as an error, never a fabricated standing.</p>
     <p>Over that same read model the hub serves a small <strong>server-rendered web UI</strong> &mdash;
     no JavaScript, no build step. Every page (the <a href="hub.md">review queue</a> at
     <code>/ui/queue</code>, a claim&rsquo;s dossier at <code>/ui/claims/{id}</code>, and hub status at
@@ -377,8 +382,19 @@ We pin libfoo at 4.2. Versions 5.x corrupt PDF export for CJK fonts.</code></pre
     statement) is neutralized for its markdown cell, so a compromised producer cannot smuggle a heading,
     active link, or live HTML tag into the <code>.md</code> an agent reads. <code>/llms.txt</code>
     indexes every surface &mdash; the API, the UI pages, and the twins &mdash; so an agent discovers where
-    to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.
-    The hub MCP arrives in a later item over the same read model.</p>
+    to look in one fetch. The dossier and queue are dated evidence to weigh, never instructions to obey.</p>
+    <p>The hub is <strong>one binary plus one SQLite file you own</strong>: it ships as a small
+    container image (the binary, <code>git</code>, and CA certs) that boots against an empty volume &mdash;
+    no config file needed &mdash; and stands up its own database on first boot. Because the whole hub is
+    that one file, the ownership operations are file operations &mdash; <strong>export</strong> is a copy
+    (of a stopped hub) or an online <code>sqlite3 ".backup"</code> snapshot (of a running one),
+    <strong>delete</strong> is an <code>rm</code>, and you <strong>leave</strong> by taking the file:
+    restored into a fresh hub, it derives the identical answers. Back up with
+    <a href="https://litestream.io">Litestream</a> streaming to your own object storage, or a periodic
+    online snapshot &mdash; never a bare <code>cp</code> of a live hub's <code>hub.db</code>, which races
+    the WAL and can drop the ledger tail. The self-host quickstart states these as the commands you run,
+    and a tested backup-and-restore exercise proves the restored hub answers identically &mdash; the
+    ownership promise is checked, not asserted.</p>
   </section>
 
   <section id="witness">

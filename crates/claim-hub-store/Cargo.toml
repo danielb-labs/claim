@@ -74,3 +74,13 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "time",
 ] }
+# The backup test issues a raw `PRAGMA wal_checkpoint(TRUNCATE)` and appends through a
+# second connection — the operations that reproduce the exact live-WAL copy race the
+# CRITICAL finding proved, which the `Ledger`/`Registry` traits do not (and should not)
+# expose. Same version/features as the crate's own sqlx so the dev and library drivers
+# unify to one.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+] }

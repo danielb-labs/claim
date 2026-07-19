@@ -6,9 +6,19 @@
 //! `CLAIM_HUB_*` variable set on the *spawned* process actually reaches the config
 //! through `from_process` → `apply_env`. The environment is set on the child
 //! (`Command::env`), never on the test process, so nothing leaks between tests and
-//! the runs stay deterministic (CLAUDE.md). Each case exits 1 with a message naming
-//! what to fix; none binds a port or reaches the network — every failure is caught
-//! at config/boot time before serving.
+//! the runs stay deterministic (CLAUDE.md). Most cases exit 1 with a message naming
+//! what to fix, caught at config/boot time before serving.
+//!
+//! One case ([`boots_config_less_from_env_and_status_reports_truthful_zeros`]) is the
+//! exception: it proves the empty-volume contract — no `hub.toml` and no `--config`,
+//! only `CLAIM_HUB_LISTEN`/`CLAIM_HUB_DATABASE`, so the binary must fall back to an
+//! empty config and serve. That one boots the process for real, binds a loopback port,
+//! reads `/status`, and kills it. It is the exact path `docker run` against an empty
+//! volume hits.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::str::contains;
@@ -102,4 +112,102 @@ fn a_database_env_override_reaches_the_config() {
         .code(1)
         .stderr(contains("opening the hub database"))
         .stderr(contains(dir_as_db));
+}
+
+#[test]
+fn boots_config_less_from_env_and_status_reports_truthful_zeros() {
+    // The empty-volume contract (HUB-IMPLEMENTATION.md §1.13): no `hub.toml`, no
+    // `--config`, only `CLAIM_HUB_*` env overrides — so the binary must fall back to an
+    // empty config and serve. This is the exact command `docker run` against a fresh
+    // volume issues; before the missing-default fallback it died with `config hub.toml:
+    // No such file or directory`. The child's working directory is an empty temp dir, so
+    // there is provably no default `hub.toml` to read, and the port is a fresh loopback
+    // bind released just before spawn.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        !dir.path().join("hub.toml").exists(),
+        "the temp working directory must have no default config file"
+    );
+    let db_path = dir.path().join("hub.db");
+    let port = free_loopback_port();
+
+    let bin = assert_cmd::cargo::cargo_bin("claim-hub");
+    let mut child = std::process::Command::new(bin)
+        .current_dir(dir.path())
+        .env_clear()
+        .env("CLAIM_HUB_LISTEN", format!("127.0.0.1:{port}"))
+        .env("CLAIM_HUB_DATABASE", &db_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the config-less hub");
+
+    let status = poll_status(port, Duration::from_secs(20));
+    // Kill before asserting so the process never outlives the test, whatever the result.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let status = status.unwrap_or_else(|| {
+        panic!("the config-less hub never served /status on port {port}");
+    });
+    assert!(
+        status.contains("\"ledger_head\":0") || status.contains("\"ledger_head\": 0"),
+        "empty ledger reports head 0: {status}"
+    );
+    assert!(
+        status.contains("\"registry_version\":0") || status.contains("\"registry_version\": 0"),
+        "empty registry reports version 0: {status}"
+    );
+    assert!(
+        db_path.exists(),
+        "the hub created its database on first boot at {}",
+        db_path.display()
+    );
+}
+
+/// Reserve a free loopback TCP port by binding it and reading the assigned number, then
+/// releasing it. The hub re-binds it milliseconds later; a race is possible but rare, and
+/// a lost race fails loudly as a boot error rather than a wrong answer.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral loopback port")
+        .local_addr()
+        .expect("read the assigned port")
+        .port()
+}
+
+/// Poll `GET /status` on the loopback port until it answers `200 OK`, returning the
+/// response body, or `None` if `deadline` elapses first. A minimal raw-socket HTTP/1.0
+/// request so the test needs no HTTP client dependency; the hub is a local loopback
+/// server, so no real network is touched.
+fn poll_status(port: u16, deadline: Duration) -> Option<String> {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if let Some(body) = try_status(port) {
+            return Some(body);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// One `GET /status` attempt: connect, send an HTTP/1.0 request, read the whole
+/// response, and return the body when the status line is `200 OK`. Any connection or
+/// read failure (the hub is not up yet) is `None`, so the caller retries.
+fn try_status(port: u16) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    // HTTP/1.0 with an explicit close so the server closes the socket after the body,
+    // letting `read_to_string` reach EOF without parsing `Content-Length`.
+    stream
+        .write_all(b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if head.lines().next()?.contains("200") {
+        Some(body.to_owned())
+    } else {
+        None
+    }
 }

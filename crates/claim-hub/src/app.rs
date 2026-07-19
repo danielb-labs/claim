@@ -23,7 +23,7 @@ use claim_hub_store::SqliteStore;
 use tower_http::trace::TraceLayer;
 
 use crate::oidc::SharedVerifier;
-use crate::{api, ingest, status, ui};
+use crate::{api, ingest, mcp, status, ui};
 
 /// A source of the current instant, injectable so ingest is deterministic under test.
 ///
@@ -128,14 +128,14 @@ impl AppState {
 /// The router is the mount board for every hub surface. It mounts `/status` always, the
 /// read API ([`api::router`] — the claims queries, the derived sets, the dossier, and the
 /// cursor feed, all under `/api`), the UI ([`ui::router`] — the server-rendered queue,
-/// dossier, and status pages, each with a `.md` markdown twin, plus `/llms.txt`), and the
-/// ingest route `POST /ingest` **only when the state carries a verifier** — a hub with no
-/// OIDC config has no way to authenticate a producer, so it exposes no write path rather
-/// than a route that rejects everything. The remaining mount points are named for the later
-/// items:
+/// dossier, and status pages, each with a `.md` markdown twin, plus `/llms.txt`), the hub
+/// MCP ([`mcp`] — five read-only tools over the same read model, nested at
+/// [`mcp::MCP_MOUNT_PATH`] so the JSON API and the MCP are one process on one port and one
+/// middleware stack, HUB.md §5's "one substrate"), and the ingest route `POST /ingest`
+/// **only when the state carries a verifier** — a hub with no OIDC config has no way to
+/// authenticate a producer, so it exposes no write path rather than a route that rejects
+/// everything. The remaining mount point is named for the later item:
 ///
-/// - **hub-09 MCP** — rmcp's streamable-HTTP tower service, mounted with
-///   `Router::nest_service`.
 /// - **hub-13 read auth** — the OAuth 2.1 bearer layer over `/api`, the UI, and MCP; the
 ///   read routes are unauthenticated until it lands.
 ///
@@ -143,6 +143,10 @@ impl AppState {
 /// the stack (HUB-IMPLEMENTATION.md §1.12); it is applied last so it observes the
 /// whole router, and it is where a later item stacks auth and timeout layers.
 pub fn build_app(state: AppState) -> Router {
+    // The MCP service holds its own copy of the state (it builds a fresh handler per
+    // request), so it is constructed before `with_state` consumes `state` for the
+    // state-carrying routes.
+    let mcp = mcp::mcp_service(state.clone());
     let mut router = Router::new()
         .route("/status", get(status::status))
         // The read API (hub-08): claims queries, the drifted/due/suspect sets, the
@@ -157,7 +161,9 @@ pub fn build_app(state: AppState) -> Router {
         router = router.route("/ingest", post(ingest::ingest));
     }
     router
-        // hub-09: `.nest_service("/mcp", mcp_service)`.
+        // hub-09: the hub MCP — rmcp's streamable-HTTP transport as a tower service, so the
+        // five read tools share the hub's one port and middleware stack.
+        .nest_service(mcp::MCP_MOUNT_PATH, mcp)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
