@@ -13,15 +13,16 @@
 //!    conventional agent-context host files for embedded `<!-- claim -->` blocks
 //!    with `claim-core`'s [`extract_embedded_claims`]. Both funnel through the one
 //!    `claim-core` grammar the CLI uses — one grammar for every front door.
-//! 3. **Snapshots** the parsed claims into [`RegisteredClaim`]s and calls
-//!    [`Registry::replace_store`], so a claim absent at the new tip is *retired*
-//!    (dropped from the live set; its history stays derivable from git and the
-//!    ledger), and the cross-store `supports` index is maintained in both
-//!    directions.
-//! 4. **Records malformed files as findings** ([`Findings::replace_store_findings`]),
-//!    never silent skips (invariant #6): a claim file that fails to parse at the tip
-//!    becomes a queryable [`SyncFinding`] naming the file and the reason, while the
-//!    well-formed claims still index.
+//! 3. **Snapshots** the parsed claims into [`RegisteredClaim`]s and, together with any
+//!    findings, calls the atomic [`Registry::replace_store_snapshot`], so a claim
+//!    absent at the new tip is *retired* (dropped from the live set; its history stays
+//!    derivable from git and the ledger), and the cross-store `supports` index is
+//!    maintained in both directions.
+//! 4. **Records malformed files as findings** in that same atomic write, never silent
+//!    skips (invariant #6): a claim file that fails to parse at the tip becomes a
+//!    queryable [`SyncFinding`] naming the file and the reason, while the well-formed
+//!    claims still index. Because the claims and findings land in one transaction, a
+//!    malformed file can never be indexed-away from the registry with its nag lost.
 //!
 //! The public entry points are [`sync_store`] — one callable sync of one store,
 //! which hub-07 wires to the manual-resync route once routes land — and
@@ -39,10 +40,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claim_core::{extract_embedded_claims, Claim};
-use claim_store::{discover, LoadError};
+use claim_store::{discover, LoadError, StoreError as ClaimStoreError};
 
 use crate::error::{Result, StoreError};
-use crate::findings::{Findings, SyncFinding};
+use crate::findings::SyncFinding;
 use crate::registry::{RegisteredClaim, Registry, RegistryVersion};
 
 /// The default git branch a store is read at when a sync does not name one.
@@ -79,23 +80,38 @@ pub const EMBEDDED_HOST_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 /// network is required to exercise sync. Keeping the two distinct means the stored
 /// identity is stable even if the fetch URL changes (a mirror moves hosts).
 ///
+/// The fields are **private and validated at construction**: a `url` or `branch`
+/// beginning with `-` is rejected ([`ConnectedStore::try_new`]), because git would
+/// parse such a value as an option rather than a positional and a crafted
+/// `--upload-pack=…`/`ext::…` URL reaches arbitrary command execution during a clone.
+/// Making the fields private closes the struct-literal bypass, so every
+/// `ConnectedStore` a sync sees has passed the check — defense in depth alongside the
+/// `--end-of-options` guard on the git argv itself. [`ConnectedStore::new`] is the
+/// infallible constructor for statically-known-safe inputs (tests, config already
+/// validated); it debug-asserts the same rule.
+///
 /// [`Event`]: claim_hub_core::Event
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedStore {
-    /// The store's canonical id, as events and the registry reference it.
-    pub id: String,
-    /// The git URL or local path to clone/fetch the mirror from.
-    pub url: String,
-    /// The branch whose tip is read. Defaults to [`DEFAULT_BRANCH`] via
-    /// [`ConnectedStore::new`].
-    pub branch: String,
+    id: String,
+    url: String,
+    branch: String,
 }
 
 impl ConnectedStore {
-    /// A connected store read at [`DEFAULT_BRANCH`].
+    /// A connected store read at [`DEFAULT_BRANCH`], for a statically-known-safe
+    /// `url`.
     ///
     /// `id` is the canonical store name; `url` is the git remote (or local path) to
-    /// mirror from. Use struct-literal construction to read a non-default branch.
+    /// mirror from. This constructor does **not** validate the URL — it is for
+    /// call sites (tests, a literal, config already checked) that promise a safe
+    /// input. For a fetch URL from untrusted configuration, use
+    /// [`try_new`](ConnectedStore::try_new), which rejects an option-like URL loudly
+    /// with [`StoreError::UnsafeStoreInput`]. A URL that slips through here anyway is
+    /// still safe against argument injection: every git call passes the URL after
+    /// `--end-of-options`, so git treats it as a positional path, never an option — the
+    /// argv guard is the always-on floor, and construction-time validation is the loud
+    /// early nag on top of it.
     #[must_use]
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
@@ -103,6 +119,58 @@ impl ConnectedStore {
             url: url.into(),
             branch: DEFAULT_BRANCH.to_owned(),
         }
+    }
+
+    /// A connected store read at [`DEFAULT_BRANCH`], validating the `url`.
+    ///
+    /// The one constructor to use for a fetch URL from untrusted configuration. A
+    /// `url` beginning with `-` is rejected with [`StoreError::UnsafeStoreInput`], so
+    /// an option-like URL never reaches `git`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsafeStoreInput`] if `url` begins with `-`.
+    pub fn try_new(id: impl Into<String>, url: impl Into<String>) -> Result<Self> {
+        let url = url.into();
+        reject_option_like("url", &url)?;
+        Ok(Self {
+            id: id.into(),
+            url,
+            branch: DEFAULT_BRANCH.to_owned(),
+        })
+    }
+
+    /// This store read at `branch` instead of [`DEFAULT_BRANCH`], validating it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsafeStoreInput`] if `branch` begins with `-`. The branch is
+    /// wrapped in `refs/heads/{branch}` before it reaches git — already safe from
+    /// being read as an option — but it is validated anyway, so no external input
+    /// reaches git argv unchecked.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Result<Self> {
+        let branch = branch.into();
+        reject_option_like("branch", &branch)?;
+        self.branch = branch;
+        Ok(self)
+    }
+
+    /// The store's canonical id, as events and the registry reference it.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The git URL or local path the mirror is cloned/fetched from.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The branch whose tip is read.
+    #[must_use]
+    pub fn branch(&self) -> &str {
+        &self.branch
     }
 }
 
@@ -113,7 +181,7 @@ impl ConnectedStore {
 /// tip sha the snapshot was taken at, the new registry version the replace advanced
 /// to, and how many claims indexed versus how many files were recorded as findings.
 /// A non-zero `findings` count is the nag surface — the caller may surface it, and
-/// the findings themselves are queryable through [`Findings`].
+/// the findings themselves are queryable through [`Findings`](crate::Findings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
     /// The default-branch tip sha the snapshot was read at.
@@ -133,13 +201,15 @@ pub struct SyncOutcome {
 /// poll ([`spawn_interval_poll`]) and, once routes land (hub-07), the authenticated
 /// manual-resync endpoint. `mirror_root` is the directory bare per-store mirrors live
 /// under; it is created if absent and reused across syncs so a re-sync fetches rather
-/// than re-clones. `store` is the storage backend implementing both [`Registry`] and
-/// [`Findings`] (the one [`SqliteStore`](crate::SqliteStore) does).
+/// than re-clones. `store` is the storage backend implementing [`Registry`] (the one
+/// [`SqliteStore`](crate::SqliteStore) does).
 ///
-/// A claim absent at the new tip is retired by the [`Registry::replace_store`] this
-/// calls; a malformed file is recorded as a [`SyncFinding`] and the well-formed
-/// claims still index (invariant #6). The registry and findings for the store are each
-/// *replaced*, so the snapshot exactly describes the tip — idempotent in content: a
+/// The claims and the findings are written together through
+/// [`Registry::replace_store_snapshot`] — **one atomic write**, load-bearing for
+/// invariant #6: a malformed file must never be indexed-away from the registry while
+/// its [`SyncFinding`] is lost, a silent coverage gap. A claim absent at the new tip
+/// is retired; a malformed file is recorded as a finding and the well-formed claims
+/// still index. The snapshot exactly describes the tip — idempotent in content: a
 /// second sync of an unchanged tip reproduces the same registry (only the version
 /// counter advances, marking that a sync happened).
 ///
@@ -159,12 +229,12 @@ pub async fn sync_store<S>(
     mirror_root: &Path,
 ) -> Result<SyncOutcome>
 where
-    S: Registry + Findings,
+    S: Registry,
 {
     // Mirroring and reading the tip are blocking git + filesystem work; run them off
     // the async runtime's threads so a sync of a large store never stalls the reactor
-    // the interval driver and (later) the axum server share. The storage writes below
-    // are the crate's own async trait methods.
+    // the interval driver and (later) the axum server share. The storage write below
+    // is the crate's own async trait method.
     let connected = connected.clone();
     let mirror_root = mirror_root.to_path_buf();
     let read = tokio::task::spawn_blocking(move || read_tip(&connected, &mirror_root))
@@ -174,9 +244,11 @@ where
             source: std::io::Error::other(join.to_string()),
         })??;
 
-    let version = store.replace_store(&read.store_id, &read.claims).await?;
-    store
-        .replace_store_findings(&read.store_id, &read.findings)
+    // Claims and findings in one atomic write, so the registry and its findings can
+    // never skew (invariant #6): the malformed-file nag and the claims that indexed
+    // around it land together or not at all.
+    let version = store
+        .replace_store_snapshot(&read.store_id, &read.claims, &read.findings)
         .await?;
 
     Ok(SyncOutcome {
@@ -210,9 +282,9 @@ fn read_tip(connected: &ConnectedStore, mirror_root: &Path) -> Result<TipRead> {
     let commit = resolve_tip(connected, &mirror)?;
     let checkout = TipCheckout::create(connected, &mirror, &commit)?;
 
-    let (claims, findings) = parse_store_at(&connected.id, checkout.path(), &commit)?;
+    let (claims, findings) = parse_store_at(connected.id(), checkout.path(), &commit)?;
     Ok(TipRead {
-        store_id: connected.id.clone(),
+        store_id: connected.id().to_owned(),
         commit,
         claims,
         findings,
@@ -236,11 +308,13 @@ fn update_mirror(connected: &ConnectedStore, mirror_root: &Path) -> Result<PathB
         ),
         source,
     })?;
-    let mirror = mirror_root.join(format!("{}.git", sanitize_store_id(&connected.id)));
+    let mirror = mirror_root.join(format!("{}.git", sanitize_store_id(connected.id())));
 
     if mirror.join("HEAD").exists() {
         // An existing mirror: fetch new refs and prune deleted ones. `git -C <mirror>
-        // remote update --prune` refreshes every ref the `--mirror` clone tracks.
+        // remote update --prune` refreshes every ref the `--mirror` clone tracks. The
+        // URL is not on this argv (git reads it from the mirror's stored config), so
+        // no external input reaches git as a positional here.
         run_git(
             connected,
             mirror_root,
@@ -255,13 +329,18 @@ fn update_mirror(connected: &ConnectedStore, mirror_root: &Path) -> Result<PathB
     } else {
         // First sync: a bare mirror clone of every ref. The URL may be a real remote
         // or a local path (a test fixture used as a remote), so no network is implied.
+        // `--end-of-options` immediately before the `<url>` positional forces git to
+        // treat the URL as a path, never an option, so a crafted `--upload-pack=…` /
+        // `ext::…` URL cannot inject a command (defense in depth over the
+        // construction-time rejection of a leading-dash url).
         run_git(
             connected,
             mirror_root,
             &[
                 "clone",
                 "--mirror",
-                &connected.url,
+                "--end-of-options",
+                connected.url(),
                 &mirror.to_string_lossy(),
             ],
         )?;
@@ -277,6 +356,10 @@ fn update_mirror(connected: &ConnectedStore, mirror_root: &Path) -> Result<PathB
 /// is a loud [`StoreError::Git`], not an empty snapshot — a sync that cannot find its
 /// tip must fail rather than retire every claim (invariant #6).
 fn resolve_tip(connected: &ConnectedStore, mirror: &Path) -> Result<String> {
+    // The branch is wrapped in `refs/heads/{branch}`, so it can never be read as an
+    // option, and it was rejected at construction if it began with `-`. `rev-parse`
+    // echoes an `--end-of-options` literal into its own output, so that guard is not
+    // used here; the two protections above are what keep this call safe.
     let out = run_git(
         connected,
         mirror,
@@ -284,7 +367,7 @@ fn resolve_tip(connected: &ConnectedStore, mirror: &Path) -> Result<String> {
             "-C",
             &mirror.to_string_lossy(),
             "rev-parse",
-            &format!("refs/heads/{}", connected.branch),
+            &format!("refs/heads/{}", connected.branch()),
         ],
     )?;
     Ok(out)
@@ -298,6 +381,8 @@ fn resolve_tip(connected: &ConnectedStore, mirror: &Path) -> Result<String> {
 /// The worktree lives under the system temp root, outside both the mirror and any
 /// caller tree.
 struct TipCheckout {
+    /// The owning mirror the worktree belongs to, retained so [`Drop`] can address it
+    /// in the `git worktree remove` call (a worktree is removed via its parent repo).
     mirror: PathBuf,
     path: Option<PathBuf>,
 }
@@ -305,7 +390,12 @@ struct TipCheckout {
 impl TipCheckout {
     /// Check `commit` out of `mirror` into a fresh temp worktree.
     fn create(connected: &ConnectedStore, mirror: &Path, commit: &str) -> Result<Self> {
-        let dir = unique_temp_dir(&connected.id)?;
+        let dir = unique_temp_dir(connected.id())?;
+        // Both positionals are internally generated and already safe: `dir` is our own
+        // temp path (never option-like), and `commit` is a resolved 40-char sha from
+        // `resolve_tip`. `git worktree add` does not accept `--end-of-options`, so no
+        // argv guard is added here; the guard lives where external input reaches git
+        // (the clone URL) and where a subcommand accepts it (rev-parse).
         run_git(
             connected,
             mirror,
@@ -366,15 +456,18 @@ impl Drop for TipCheckout {
 /// A well-formed claim becomes a [`RegisteredClaim`] stamped with `commit`. A
 /// malformed standalone file becomes a [`SyncFinding`] (invariant #6). A host file
 /// whose embedded block fails to parse likewise becomes a finding, while its
-/// well-formed siblings — and every other file — still index. The store must exist at
-/// the tip: a checkout with no `.claims/` yields an empty snapshot (no claims, no
+/// well-formed siblings — and every other file — still index. A checkout whose store
+/// is *legitimately absent* (no `.claims/`) yields an empty snapshot (no claims, no
 /// findings), which retires everything the store previously had, honestly reflecting a
 /// tip that removed its store.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Corpus`] only when the `.claims/` directory cannot be listed
-/// at all — the whole-corpus failure, distinct from a single malformed file.
+/// Returns [`StoreError::Corpus`] when the store cannot be *read* — the `.claims/`
+/// directory cannot be listed, or discovery hits a real filesystem fault (as opposed
+/// to a store that is simply not there). A genuine read fault is loud, never swallowed
+/// into an empty snapshot that would mass-retire every claim (invariant #6). A single
+/// malformed file is not this error; it is a recorded finding.
 ///
 /// [`Store::load_all`]: claim_store::Store::load_all
 fn parse_store_at(
@@ -388,24 +481,39 @@ fn parse_store_at(
     let mut parsed: Vec<ParsedClaim> = Vec::new();
     let mut findings: Vec<SyncFinding> = Vec::new();
 
-    // Standalone files. `discover` from the checkout root finds `.claims/`; a checkout
-    // with no store at all is a valid empty snapshot, not an error. `load_all` already
-    // rejects duplicate ids *within* the standalone corpus as errors, so those arrive
-    // as findings here; the cross-source dedup below catches an embedded block
-    // colliding with a standalone file.
-    if let Ok(store) = discover(checkout) {
-        let load = store.load_all().map_err(|e| StoreError::Corpus {
-            store: store_id.to_owned(),
-            reason: e.to_string(),
-        })?;
-        for loaded in load.claims {
-            parsed.push(ParsedClaim {
-                claim: registered(&loaded.claim, commit),
-                file: loaded.path,
-            });
+    // Standalone files. `discover` from the checkout root finds `.claims/`. Only a
+    // *legitimately absent* store (`NoStore`) is an empty snapshot; any other discovery
+    // fault (an I/O error, a `.claims` that is a file) is a loud `Corpus` error, never
+    // swallowed into an empty snapshot that would mass-retire every claim on a
+    // filesystem fault (invariant #6). `load_all` already rejects duplicate ids *within*
+    // the standalone corpus as errors, so those arrive as findings; the cross-source
+    // dedup below catches an embedded block colliding with a standalone file.
+    match discover(checkout) {
+        Ok(store) => {
+            let load = store.load_all().map_err(|e| StoreError::Corpus {
+                store: store_id.to_owned(),
+                reason: e.to_string(),
+            })?;
+            for loaded in load.claims {
+                parsed.push(ParsedClaim {
+                    claim: registered(&loaded.claim, commit),
+                    file: loaded.path,
+                });
+            }
+            for err in load.errors {
+                findings.push(finding(store_id, err, commit));
+            }
         }
-        for err in load.errors {
-            findings.push(finding(store_id, err, commit));
+        // No `.claims/` at this tip: the store removed its claim store, so the snapshot
+        // is legitimately empty and everything retires — the honest reading of that tip.
+        Err(ClaimStoreError::NoStore { .. }) => {}
+        // A genuine read fault (not a truly-absent store): loud, so a filesystem
+        // hiccup cannot masquerade as "the store deleted all its claims".
+        Err(e) => {
+            return Err(StoreError::Corpus {
+                store: store_id.to_owned(),
+                reason: e.to_string(),
+            });
         }
     }
 
@@ -503,6 +611,13 @@ fn reject_duplicate_ids(
 /// skip. A host file that cannot be read is itself a finding — we cannot prove it
 /// carries no claim, so it nags rather than being dropped. The `.git` metadata
 /// directory of the worktree is skipped so mirror internals are never scanned.
+///
+/// Only a *regular file* named like a host file is read: `entry.file_type()` does not
+/// follow symlinks, so a symlink named `CLAUDE.md` reports as a symlink and is skipped
+/// rather than followed — a symlink could point outside the checkout or at an
+/// arbitrarily large file, and following it while scanning an untrusted checkout is a
+/// footgun. (`claim-store`'s `collect_claim_files` follows symlinks for standalone
+/// files under `.claims/`; that is a separate, tracked concern, not fixed here.)
 fn scan_embedded(
     store_id: &str,
     root: &Path,
@@ -527,6 +642,8 @@ fn scan_embedded(
             source,
         })?;
         let path = entry.path();
+        // `file_type()` is the entry's own type and does not follow a symlink, so a
+        // symlinked host file reports neither dir nor regular file and is skipped below.
         let file_type = entry.file_type().map_err(|source| StoreError::Io {
             context: format!("failed to stat {}", path.display()),
             source,
@@ -537,7 +654,7 @@ fn scan_embedded(
                 continue;
             }
             scan_embedded(store_id, root, &path, commit, claims, findings)?;
-        } else if is_embedded_host_file(&path) {
+        } else if file_type.is_file() && is_embedded_host_file(&path) {
             let rel = path.strip_prefix(root).unwrap_or(&path);
             harvest_embedded(store_id, &path, rel, commit, claims, findings);
         }
@@ -684,17 +801,29 @@ fn unique_temp_dir(store_id: &str) -> Result<PathBuf> {
 /// runs when `args` does not already `-C` into a specific repo (clone runs in the
 /// mirror root); the explicit `-C` in most calls makes the working directory
 /// immaterial, but a valid one is always passed.
+///
+/// Credential prompting is disabled three ways so a background sync tick can never
+/// wedge on an unanswerable prompt: `GIT_TERMINAL_PROMPT=0` (the terminal prompt),
+/// and `GIT_ASKPASS`/`SSH_ASKPASS` pointed at `false` (the GUI/askpass and
+/// ssh-passphrase prompts a credential helper or ssh-agent would otherwise raise).
+/// `GIT_ASKPASS` set to a program that exits non-zero makes git fall through to
+/// failure rather than block. A bounded subprocess timeout would be stronger against a
+/// helper that ignores these and blocks anyway; it is a noted follow-up, not built
+/// here.
 fn run_git(connected: &ConnectedStore, cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .current_dir(cwd)
         // Never prompt for credentials in a background sync: a private remote with no
-        // usable credential must fail loudly and fast, not hang the interval task on
-        // an interactive prompt that no one will answer.
+        // usable credential must fail loudly and fast, not hang the interval task on a
+        // prompt no one will answer. `false` exits non-zero, so git gets an empty/failed
+        // credential and gives up instead of blocking.
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "false")
+        .env("SSH_ASKPASS", "false")
         .args(args)
         .output()
         .map_err(|source| StoreError::GitSpawn {
-            store: connected.id.clone(),
+            store: connected.id().to_owned(),
             args: args.join(" "),
             source,
         })?;
@@ -702,11 +831,27 @@ fn run_git(connected: &ConnectedStore, cwd: &Path, args: &[&str]) -> Result<Stri
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         Err(StoreError::Git {
-            store: connected.id.clone(),
+            store: connected.id().to_owned(),
             args: args.join(" "),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
+}
+
+/// Reject a git-bound external input that begins with `-`, which git would parse as an
+/// option rather than a positional.
+///
+/// The construction-time half of the argument-injection defense (the argv-time half is
+/// `--end-of-options` on each git call). `field` names the offending input in the
+/// error so an operator can fix the misconfiguration.
+fn reject_option_like(field: &'static str, value: &str) -> Result<()> {
+    if value.starts_with('-') {
+        return Err(StoreError::UnsafeStoreInput {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Spawn the interval-poll trigger: a background task that re-syncs every connected
@@ -739,7 +884,7 @@ pub fn spawn_interval_poll<S, F>(
     mut on_result: F,
 ) -> tokio::task::JoinHandle<()>
 where
-    S: Registry + Findings + Sync + Send + 'static,
+    S: Registry + Sync + Send + 'static,
     F: FnMut(&str, &Result<SyncOutcome>) + Send + 'static,
 {
     tokio::spawn(async move {
@@ -748,7 +893,7 @@ where
             interval.tick().await;
             for connected in &stores {
                 let result = sync_store(&store, connected, &mirror_root).await;
-                on_result(&connected.id, &result);
+                on_result(connected.id(), &result);
             }
         }
     })
@@ -780,7 +925,48 @@ mod tests {
     #[test]
     fn connected_store_new_defaults_to_the_main_branch() {
         let s = ConnectedStore::new("github.com/acme/payments", "/tmp/x");
-        assert_eq!(s.branch, DEFAULT_BRANCH);
-        assert_eq!(s.id, "github.com/acme/payments");
+        assert_eq!(s.branch(), DEFAULT_BRANCH);
+        assert_eq!(s.id(), "github.com/acme/payments");
+    }
+
+    #[test]
+    fn try_new_rejects_an_option_like_url() {
+        // A URL git would read as an option (`--upload-pack=…`, `ext::…` after an
+        // option flag, etc.) is refused up front, so it never reaches git argv.
+        let err = ConnectedStore::try_new("s", "--upload-pack=touch /tmp/pwned").unwrap_err();
+        assert!(
+            matches!(err, StoreError::UnsafeStoreInput { field: "url", .. }),
+            "{err:?}"
+        );
+        // A short-option form is caught the same way.
+        assert!(ConnectedStore::try_new("s", "-u").is_err());
+        // A legitimate URL and a local path both pass.
+        assert!(ConnectedStore::try_new("s", "https://github.com/acme/x.git").is_ok());
+        assert!(ConnectedStore::try_new("s", "/tmp/local/repo.git").is_ok());
+    }
+
+    #[test]
+    fn with_branch_rejects_an_option_like_branch() {
+        let err = ConnectedStore::new("s", "/tmp/x")
+            .with_branch("--output=/tmp/pwned")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::UnsafeStoreInput {
+                    field: "branch",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // An ordinary branch name is accepted.
+        assert_eq!(
+            ConnectedStore::new("s", "/tmp/x")
+                .with_branch("release/2.0")
+                .unwrap()
+                .branch(),
+            "release/2.0"
+        );
     }
 }

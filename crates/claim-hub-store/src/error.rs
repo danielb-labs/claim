@@ -118,6 +118,20 @@ pub enum StoreError {
         /// The underlying store-load error, as text.
         reason: String,
     },
+
+    /// A connected store's `url` or `branch` was rejected at construction as unsafe to
+    /// hand to `git`. A value beginning with `-` would be parsed by git as an option
+    /// rather than a positional (`--upload-pack=…`, `--config=…`, `ext::…` reach
+    /// arbitrary command execution), so registry sync refuses it up front — defense in
+    /// depth alongside the `--end-of-options` guard on the argv itself. The message
+    /// names the field and value so an operator fixes the misconfiguration.
+    #[error("connected store {field} {value:?} is rejected: it must not begin with '-', which git would parse as an option")]
+    UnsafeStoreInput {
+        /// The offending field (`url` or `branch`).
+        field: &'static str,
+        /// The rejected value.
+        value: String,
+    },
 }
 
 /// The store's result type.

@@ -335,6 +335,100 @@ impl Ledger for SqliteStore {
     }
 }
 
+/// A live SQLite transaction, the type the snapshot-write helpers execute against.
+///
+/// Aliased so the helpers read cleanly and the `sqlx::Transaction` type stays an
+/// implementation detail of this module — it never appears on the `Registry`/
+/// `Findings` trait surface, so the seam stays clean for the Postgres impl.
+type Tx<'a> = sqlx::Transaction<'a, sqlx::Sqlite>;
+
+/// Replace a store's claims and supports edges within an open transaction.
+///
+/// Ensures the store row exists (idempotent), wipes the store's claims — the supports
+/// edges cascade from `claims_at_tip`'s `ON DELETE CASCADE` — and re-inserts the
+/// snapshot. Factored out so `replace_store` and the atomic `replace_store_snapshot`
+/// share one definition and cannot drift.
+async fn write_claims(tx: &mut Tx<'_>, store: &str, claims: &[RegisteredClaim]) -> Result<()> {
+    sqlx::query!("INSERT OR IGNORE INTO stores (store) VALUES (?)", store)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query!("DELETE FROM claims_at_tip WHERE store = ?", store)
+        .execute(&mut **tx)
+        .await?;
+
+    for claim in claims {
+        let id = claim.id.as_str();
+        sqlx::query!(
+            r#"
+            INSERT INTO claims_at_tip (store, claim_id, statement, "commit")
+            VALUES (?, ?, ?, ?)
+            "#,
+            store,
+            id,
+            claim.statement,
+            claim.commit,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        for target in &claim.supports {
+            sqlx::query!(
+                r#"
+                INSERT OR IGNORE INTO supports_edges (store, claim_id, target)
+                VALUES (?, ?, ?)
+                "#,
+                store,
+                id,
+                target,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace a store's sync findings within an open transaction.
+///
+/// Wipes the store's findings and re-inserts `findings`, so a file fixed at the new
+/// tip no longer nags. The store row is assumed to exist (a snapshot write inserts it
+/// via [`write_claims`] first); the standalone [`Findings::replace_store_findings`]
+/// inserts it itself for independent use.
+async fn write_findings(tx: &mut Tx<'_>, store: &str, findings: &[SyncFinding]) -> Result<()> {
+    sqlx::query!("DELETE FROM sync_findings WHERE store = ?", store)
+        .execute(&mut **tx)
+        .await?;
+    for f in findings {
+        sqlx::query!(
+            r#"
+            INSERT INTO sync_findings (store, file, "commit", reason)
+            VALUES (?, ?, ?, ?)
+            "#,
+            store,
+            f.file,
+            f.commit,
+            f.reason,
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Advance the single registry version counter within an open transaction, returning
+/// the new value.
+///
+/// In the same transaction as the snapshot write, so a sync and its version bump are
+/// atomic: a reader never sees new claims at an old version or vice versa.
+async fn bump_version(tx: &mut Tx<'_>) -> Result<RegistryVersion> {
+    let row = sqlx::query!(
+        "UPDATE registry_version SET version = version + 1 WHERE id = 0 RETURNING version"
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(RegistryVersion(row.version))
+}
+
 impl Registry for SqliteStore {
     async fn replace_store(
         &self,
@@ -342,58 +436,28 @@ impl Registry for SqliteStore {
         claims: &[RegisteredClaim],
     ) -> Result<RegistryVersion> {
         let mut tx = self.pool.begin().await?;
-
-        // Ensure the store row exists (idempotent), then wipe its claims. The
-        // supports edges cascade from claims_at_tip's ON DELETE CASCADE, so deleting
-        // the claims clears the edges too.
-        sqlx::query!("INSERT OR IGNORE INTO stores (store) VALUES (?)", store)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!("DELETE FROM claims_at_tip WHERE store = ?", store)
-            .execute(&mut *tx)
-            .await?;
-
-        for claim in claims {
-            let id = claim.id.as_str();
-            sqlx::query!(
-                r#"
-                INSERT INTO claims_at_tip (store, claim_id, statement, "commit")
-                VALUES (?, ?, ?, ?)
-                "#,
-                store,
-                id,
-                claim.statement,
-                claim.commit,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            for target in &claim.supports {
-                sqlx::query!(
-                    r#"
-                    INSERT OR IGNORE INTO supports_edges (store, claim_id, target)
-                    VALUES (?, ?, ?)
-                    "#,
-                    store,
-                    id,
-                    target,
-                )
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-
-        // Advance the version counter as part of the same transaction, so a sync and
-        // its version bump are atomic: a reader never sees new claims at an old
-        // version or vice versa.
-        let row = sqlx::query!(
-            "UPDATE registry_version SET version = version + 1 WHERE id = 0 RETURNING version"
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-
+        write_claims(&mut tx, store, claims).await?;
+        let version = bump_version(&mut tx).await?;
         tx.commit().await?;
-        Ok(RegistryVersion(row.version))
+        Ok(version)
+    }
+
+    async fn replace_store_snapshot(
+        &self,
+        store: &str,
+        claims: &[RegisteredClaim],
+        findings: &[SyncFinding],
+    ) -> Result<RegistryVersion> {
+        // Claims, supports edges, findings, and the version bump in one transaction.
+        // If any step faults, the whole snapshot rolls back — the registry and its
+        // findings can never skew, so a malformed file is never indexed-away with its
+        // nag lost (invariant #6). See the trait doc.
+        let mut tx = self.pool.begin().await?;
+        write_claims(&mut tx, store, claims).await?;
+        write_findings(&mut tx, store, findings).await?;
+        let version = bump_version(&mut tx).await?;
+        tx.commit().await?;
+        Ok(version)
     }
 
     async fn version(&self) -> Result<RegistryVersion> {
@@ -498,30 +562,13 @@ impl Registry for SqliteStore {
 impl Findings for SqliteStore {
     async fn replace_store_findings(&self, store: &str, findings: &[SyncFinding]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        // The store row must exist for the FK; a sync always replaces the registry
-        // first (which inserts it), but insert-or-ignore here keeps this method safe to
-        // call independently. Then wipe the store's findings and re-insert the current
-        // set, so a file fixed at the new tip no longer nags.
+        // The store row must exist for the finding's foreign key. A snapshot write
+        // inserts it via `write_claims`; this standalone path inserts it itself so the
+        // method is safe to call independently (in isolation tests, say).
         sqlx::query!("INSERT OR IGNORE INTO stores (store) VALUES (?)", store)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!("DELETE FROM sync_findings WHERE store = ?", store)
-            .execute(&mut *tx)
-            .await?;
-        for f in findings {
-            sqlx::query!(
-                r#"
-                INSERT INTO sync_findings (store, file, "commit", reason)
-                VALUES (?, ?, ?, ?)
-                "#,
-                store,
-                f.file,
-                f.commit,
-                f.reason,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        write_findings(&mut tx, store, findings).await?;
         tx.commit().await?;
         Ok(())
     }

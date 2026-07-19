@@ -6,7 +6,11 @@
 //! drive the trait directly against a temp SQLite file — no git, no network — so the
 //! storage seam is proven independently of the sync that feeds it.
 
-use claim_hub_store::{Findings, Registry, SqliteStore, SyncFinding};
+use claim_core::ClaimId;
+use claim_hub_store::{
+    Findings, RegisteredClaim, Registry, RegistryVersion, SqliteStore, SyncFinding,
+};
+use std::str::FromStr;
 use tempfile::TempDir;
 
 const STORE: &str = "github.com/acme/payments";
@@ -125,4 +129,31 @@ async fn replacing_a_stores_registry_snapshot_cascades_its_findings() {
     // Re-snapshotting the registry (a later sync) does not touch findings on its own.
     store.replace_store(STORE, &[]).await.unwrap();
     assert_eq!(store.findings_of(STORE).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn replace_store_snapshot_writes_claims_and_findings_together() {
+    // The atomic method sync uses: claims and findings land in one call, one version
+    // bump. Both are visible after it, and the version advanced once.
+    let (store, _dir) = fresh_store().await;
+    let claim = RegisteredClaim {
+        id: ClaimId::from_str("good").unwrap(),
+        statement: "Good".to_owned(),
+        supports: vec!["decisions/x".to_owned()],
+        commit: "c1".to_owned(),
+    };
+    let v = store
+        .replace_store_snapshot(STORE, &[claim], &[finding(STORE, "broken.md", "bad YAML")])
+        .await
+        .unwrap();
+    assert_eq!(v, RegistryVersion(1), "one snapshot, one version bump");
+
+    let claims = store.claims_of(STORE).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].id.as_str(), "good");
+    assert_eq!(claims[0].supports, vec!["decisions/x".to_owned()]);
+
+    let findings = store.findings_of(STORE).await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].file, "broken.md");
 }

@@ -22,7 +22,8 @@ use std::process::Command;
 
 use claim_core::ClaimId;
 use claim_hub_store::{
-    sync_store, ConnectedStore, Findings, Registry, RegistryVersion, SqliteStore,
+    sync_store, ConnectedStore, Findings, RegisteredClaim, Registry, RegistryVersion, SqliteStore,
+    SyncFinding,
 };
 use std::str::FromStr;
 use tempfile::TempDir;
@@ -426,5 +427,292 @@ async fn the_interval_poll_driver_syncs_each_connected_store() {
     assert!(
         recorded.iter().any(|(id, ok)| id == STORE_ID && *ok),
         "the driver reported a successful sync through on_result"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_write_is_atomic_so_a_failure_never_drops_a_findings_nag() {
+    // Invariant #6, the load-bearing atomicity: the registry and its findings must
+    // never skew. This forces a failure *mid* snapshot write — two findings share the
+    // (store, file) primary key, so the second INSERT violates it and the transaction
+    // aborts *after* the claims were already written in that same transaction. The
+    // whole write must roll back: the prior, self-consistent snapshot (its claim AND
+    // its finding) survives, and no claim is retired-away with its nag lost.
+    let (store, _dir) = store().await;
+    let claim = |id: &str| RegisteredClaim {
+        id: ClaimId::from_str(id).unwrap(),
+        statement: id.to_owned(),
+        supports: vec![],
+        commit: "c1".to_owned(),
+    };
+    let finding = |file: &str| SyncFinding {
+        store: STORE_ID.to_owned(),
+        file: file.to_owned(),
+        commit: "c1".to_owned(),
+        reason: "malformed".to_owned(),
+    };
+
+    // A good prior snapshot: one claim, one finding.
+    let v1 = store
+        .replace_store_snapshot(STORE_ID, &[claim("keep")], &[finding("broken.md")])
+        .await
+        .unwrap();
+
+    // A new snapshot that would retire `keep` and add a claim — but its findings carry
+    // a duplicate (store, file), so the write faults partway through the transaction.
+    let err = store
+        .replace_store_snapshot(
+            STORE_ID,
+            &[claim("newcomer")],
+            &[finding("dup.md"), finding("dup.md")],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, claim_hub_store::StoreError::Sql(_)),
+        "a constraint violation surfaces as a Sql error, got {err:?}"
+    );
+
+    // Nothing changed: the version did not advance, the prior claim survived (not
+    // retired), and the prior finding survived (the nag was not dropped).
+    assert_eq!(
+        store.version().await.unwrap(),
+        v1,
+        "the failed write rolled back"
+    );
+    let claims = store.claims_of(STORE_ID).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].id.as_str(),
+        "keep",
+        "the prior claim was not retired"
+    );
+    let findings = store.findings().await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        findings[0].file, "broken.md",
+        "the prior nag survived the failed write — no dropped finding"
+    );
+}
+
+#[tokio::test]
+async fn a_leading_dash_url_cannot_inject_a_command() {
+    // Argument-injection defense, end to end. A crafted `--upload-pack=…` URL is
+    // refused at construction (try_new), so it never reaches git; and even the
+    // infallible `new` path is guarded at the argv by `--end-of-options`, so a forced
+    // sync treats the URL as a path and runs no embedded command. The marker file the
+    // payload would create must never appear.
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("PWNED");
+    let payload = format!("--upload-pack=touch {}", marker.display());
+
+    // Construction rejects it loudly.
+    assert!(ConnectedStore::try_new(STORE_ID, &payload).is_err());
+
+    // Even forced through the argv (bypassing try_new), the clone treats it as a
+    // repository path, not an option, so nothing executes.
+    let (store, sdir) = store().await;
+    let connected = ConnectedStore::new(STORE_ID, &payload);
+    let _ = sync_store(&store, &connected, &mirror_root(&sdir)).await;
+    assert!(
+        !marker.exists(),
+        "the injection payload must not have executed"
+    );
+}
+
+#[tokio::test]
+async fn a_sync_leaves_no_worktree_behind_including_the_parse_failure_path() {
+    // A long-running poller must not accrete worktrees. Two syncs on the same mirror —
+    // one of them exercising the malformed-file finding path — must leave the mirror
+    // registering only itself, proving each sync's tip checkout was torn down and a
+    // poller does not accumulate them. (The per-mirror worktree count is the
+    // deterministic signal; a global temp-dir scan would race concurrent tests.)
+    let fixture = Fixture::new();
+    fixture.write(".claims/good.md", &claim_file("good", "Good", &[]));
+    fixture.write(".claims/broken.md", "---\nchecks: [unterminated\n---\nS.\n");
+    fixture.commit("good and broken");
+
+    let (store, dir) = store().await;
+    let mirrors = mirror_root(&dir);
+    let outcome = sync_store(&store, &fixture.connected(), &mirrors)
+        .await
+        .unwrap();
+    assert_eq!(outcome.findings_recorded, 1, "the parse-failure path ran");
+    // A second sync reuses the same mirror; its checkout must also be torn down.
+    sync_store(&store, &fixture.connected(), &mirrors)
+        .await
+        .unwrap();
+
+    let mirror = mirrors.join(format!(
+        "{}.git",
+        STORE_ID.replace(
+            |c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-',
+            "_"
+        )
+    ));
+    let worktrees = Command::new("git")
+        .arg("-C")
+        .arg(&mirror)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    let count = String::from_utf8_lossy(&worktrees.stdout)
+        .lines()
+        .filter(|l| l.starts_with("worktree "))
+        .count();
+    assert_eq!(
+        count, 1,
+        "no tip-checkout worktree leaked across two syncs (a poller does not accrete)"
+    );
+}
+
+#[tokio::test]
+async fn a_symlinked_host_file_is_skipped_not_followed() {
+    // A symlink named CLAUDE.md must not be read through: it could point outside the
+    // checkout or at a large file. It is skipped, so its target's contents never index.
+    let fixture = Fixture::new();
+    // A real embedded claim (indexes) plus a symlink named like a host file whose
+    // target *would* declare another claim if followed.
+    fixture.write(
+        "AGENTS.md",
+        "Real embedded.\n\
+         <!-- claim\n\
+         id: real\n\
+         checks:\n  - kind: cmd\n    run: \"true\"\n\
+         -->\n",
+    );
+    fixture.write(
+        "secret-target.md",
+        "Should not index.\n\
+         <!-- claim\n\
+         id: sneaked\n\
+         checks:\n  - kind: cmd\n    run: \"true\"\n\
+         -->\n",
+    );
+    std::os::unix::fs::symlink(
+        fixture.path().join("secret-target.md"),
+        fixture.path().join("CLAUDE.md"),
+    )
+    .unwrap();
+    fixture.commit("real plus a symlinked host file");
+
+    let (store, dir) = store().await;
+    sync_store(&store, &fixture.connected(), &mirror_root(&dir))
+        .await
+        .unwrap();
+
+    let ids: Vec<String> = store
+        .claims_of(STORE_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.id.as_str().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&"real".to_owned()),
+        "the real host file indexed"
+    );
+    assert!(
+        !ids.contains(&"sneaked".to_owned()),
+        "the symlinked host file was not followed"
+    );
+}
+
+#[tokio::test]
+async fn a_directory_named_like_a_host_file_is_skipped_not_read() {
+    // The `is_file()` guard: a directory named CLAUDE.md is not a regular file, so it
+    // is skipped (never read, never a spurious finding) and a sibling standalone claim
+    // still indexes. git tracks the entry via a placeholder inside the directory.
+    let fixture = Fixture::new();
+    fixture.write(".claims/good.md", &claim_file("good", "Good", &[]));
+    fixture.write("CLAUDE.md/inner.txt", "x");
+    fixture.commit("good plus a CLAUDE.md directory");
+
+    let (store, dir) = store().await;
+    let outcome = sync_store(&store, &fixture.connected(), &mirror_root(&dir))
+        .await
+        .unwrap();
+    assert_eq!(outcome.claims_indexed, 1);
+    assert_eq!(
+        outcome.findings_recorded, 0,
+        "a directory is skipped, not a finding"
+    );
+    assert_eq!(
+        store.claims_of(STORE_ID).await.unwrap()[0].id.as_str(),
+        "good"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_embedded_block_becomes_a_finding_while_a_sibling_indexes() {
+    // An embedded block with malformed YAML in a host file is a loud finding, never a
+    // silent skip, while a sibling standalone claim still indexes.
+    let fixture = Fixture::new();
+    fixture.write(".claims/good.md", &claim_file("good", "Good", &[]));
+    // A CLAUDE.md whose <!-- claim --> block has malformed YAML (unterminated list).
+    fixture.write(
+        "CLAUDE.md",
+        "A statement.\n\
+         <!-- claim\n\
+         id: bad\n\
+         checks: [unterminated\n\
+         -->\n",
+    );
+    fixture.commit("good plus a malformed embedded block");
+
+    let (store, dir) = store().await;
+    let outcome = sync_store(&store, &fixture.connected(), &mirror_root(&dir))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.claims_indexed, 1,
+        "the sibling standalone claim indexes"
+    );
+    assert_eq!(outcome.findings_recorded, 1);
+    let findings = store.findings().await.unwrap();
+    assert_eq!(findings[0].file, "CLAUDE.md");
+    assert!(
+        !findings[0].reason.is_empty(),
+        "the finding carries the parser's reason"
+    );
+    assert_eq!(
+        store.claims_of(STORE_ID).await.unwrap()[0].id.as_str(),
+        "good"
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_failure_on_an_existing_mirror_is_loud() {
+    // First sync clones the mirror; then the remote is made unreachable (its directory
+    // removed) and a re-sync's `remote update` must fail loudly, never silently reuse a
+    // stale mirror as if it were the current tip.
+    let fixture = Fixture::new();
+    fixture.write(".claims/a.md", &claim_file("a", "A", &[]));
+    fixture.commit("seed");
+
+    let (store, dir) = store().await;
+    let mirrors = mirror_root(&dir);
+    // A dedicated remote directory we can delete out from under the mirror. Clone the
+    // fixture into it via git so it is a real remote, then connect to *that*.
+    let remote = dir.path().join("remote.git");
+    let clone = Command::new("git")
+        .args(["clone", "--bare", "--quiet"])
+        .arg(fixture.path())
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "seed the deletable remote");
+    let connected = ConnectedStore::new(STORE_ID, remote.to_string_lossy().into_owned());
+
+    sync_store(&store, &connected, &mirrors).await.unwrap();
+    assert_eq!(store.claims_of(STORE_ID).await.unwrap().len(), 1);
+
+    // Delete the remote, then re-sync: `remote update` cannot reach it and must error.
+    std::fs::remove_dir_all(&remote).unwrap();
+    let err = sync_store(&store, &connected, &mirrors).await.unwrap_err();
+    assert!(
+        matches!(err, claim_hub_store::StoreError::Git { .. }),
+        "a fetch failure is loud, got {err:?}"
     );
 }

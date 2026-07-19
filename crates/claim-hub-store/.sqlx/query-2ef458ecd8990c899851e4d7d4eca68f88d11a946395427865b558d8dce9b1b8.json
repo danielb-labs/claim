@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO sync_findings (store, file, \"commit\", reason)\n            VALUES (?, ?, ?, ?)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "2ef458ecd8990c899851e4d7d4eca68f88d11a946395427865b558d8dce9b1b8"
+}
