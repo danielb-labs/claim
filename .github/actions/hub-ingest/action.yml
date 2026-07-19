@@ -1,0 +1,102 @@
+# Push attested verdicts from a CI lane to the hub — the one CLI→hub ingest path.
+#
+# The hub's ingest Action: it runs `claim check --json` over the repo's `.claims/`
+# store, mints the runner's GitHub Actions OIDC id-token for the hub's audience, and
+# POSTs the report + token to the hub's `/ingest`. A non-2xx from the hub FAILS the
+# step loudly, printing the hub's rejection reason — a rejected or broken push is never
+# swallowed into a green light (CLAUDE.md invariants #1 and #6). The trust for each
+# verdict comes from WHO produced it — the pipeline, proven by its OIDC token — not a
+# shared secret (HUB.md §4).
+#
+# The core flow lives in `ci/hub-ingest.sh` so it is testable outside a real runner
+# (crates/claim-hub/tests/ingest_action.rs runs it against a locally-served hub). This
+# YAML is the thin runner-specific wrapper: it mints the OIDC token (the one step that
+# genuinely needs a GitHub runner) and hands it to the script through HUB_INGEST_TOKEN,
+# the same injection seam the test uses.
+#
+# The calling JOB must grant `permissions: id-token: write` (and `contents: read` to
+# check out the store). Without `id-token: write` the runner sets no OIDC token endpoint
+# and the mint step fails loudly, rather than pushing an unauthenticated report the hub
+# would reject anyway.
+
+name: Push verdicts to the claim hub
+description: >
+  Run `claim check --json` and push the attested report to the hub's /ingest with the
+  runner's GitHub Actions OIDC identity. Fails loudly on any non-2xx from the hub.
+
+inputs:
+  hub-url:
+    description: The hub's base URL (e.g. https://hub.acme.example). `/ingest` is appended.
+    required: true
+  audience:
+    description: >
+      The audience to mint the OIDC token for. MUST equal the hub's configured
+      `[oidc].audience`, or the hub rejects the token (401).
+    required: true
+  claims-dir:
+    description: The working directory containing the `.claims/` store to check.
+    required: false
+    default: "."
+  claim-bin:
+    description: The `claim` binary to run (a path, or a name on PATH).
+    required: false
+    default: claim
+
+runs:
+  using: composite
+  steps:
+    # Mint the runner's OIDC id-token for the hub's audience. This is the one step that
+    # needs a real GitHub runner: `core.getIDToken(audience)` calls the Actions token
+    # endpoint, which is available only when the job granted `id-token: write`. The token
+    # is passed to the script through HUB_INGEST_TOKEN — the injectable seam — rather than
+    # having the script call the endpoint, so the script stays runner-agnostic and
+    # testable. The token is a masked step output (`core.setSecret`) so it never appears
+    # in logs; a leaked id-token is a replayable credential until it expires.
+    - name: Mint the OIDC id-token
+      id: token
+      uses: actions/github-script@v7
+      env:
+        HUB_AUDIENCE: ${{ inputs.audience }}
+      with:
+        script: |
+          const audience = process.env.HUB_AUDIENCE;
+          if (!audience) {
+            core.setFailed('the `audience` input is required to mint an OIDC token');
+            return;
+          }
+          let token;
+          try {
+            token = await core.getIDToken(audience);
+          } catch (e) {
+            core.setFailed(
+              'could not mint a GitHub Actions OIDC token — the job must grant ' +
+              '`permissions: id-token: write`. Underlying error: ' + e.message,
+            );
+            return;
+          }
+          core.setSecret(token);
+          core.setOutput('token', token);
+
+    # Run the check, POST the report, and fail loud on any non-2xx. The token is injected
+    # through HUB_INGEST_TOKEN, so the script never touches the GitHub token endpoint.
+    - name: Check and push to the hub
+      shell: bash
+      env:
+        # The minted token, masked in the log, handed to the script's injection seam.
+        HUB_INGEST_TOKEN: ${{ steps.token.outputs.token }}
+        HUB_URL: ${{ inputs.hub-url }}
+        HUB_AUDIENCE: ${{ inputs.audience }}
+        CLAIMS_DIR: ${{ inputs.claims-dir }}
+        CLAIM_BIN: ${{ inputs.claim-bin }}
+        # The action's own directory, so the script is found regardless of the caller's
+        # checkout layout. GITHUB_ACTION_PATH points at this action's root.
+        ACTION_PATH: ${{ github.action_path }}
+      # Inputs are passed via env, never interpolated into the command line, to keep
+      # untrusted input off the shell (the Actions injection footgun). The script under
+      # ci/ is two levels up from this action directory (.github/actions/hub-ingest).
+      run: |
+        "$ACTION_PATH/../../../ci/hub-ingest.sh" \
+          --hub-url "$HUB_URL" \
+          --audience "$HUB_AUDIENCE" \
+          --claims-dir "$CLAIMS_DIR" \
+          --claim-bin "$CLAIM_BIN"
