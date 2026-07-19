@@ -7,85 +7,86 @@
 //! instruction, `negate`, and any `skip`), the `supports` targets, and the `hub:`
 //! hints. No check executes, no verdict is produced, nothing is stored.
 //!
-//! `show` is about a *single* claim, which shapes its error contract. An unknown id
-//! is a loud exit-2 error naming the id, never an empty "success" — printing nothing
-//! and exiting 0 for a typo is exactly the quiet failure the tool exists to prevent
-//! (invariant #6). If the requested id names a file that failed to parse, that
-//! parse error is surfaced instead of "not found", so the user sees *why* the claim
-//! could not be shown. But an unrelated malformed *sibling* — a different id in the
-//! load errors — is not this command's concern: if the requested claim loaded
-//! cleanly, it is shown and the command exits 0. Store-wide health is `list`/`check`.
+//! `show` is about a *single* claim, which shapes its error contract. Every miss is a
+//! loud exit-2 error, never an empty "success" — printing nothing and exiting 0 for a
+//! typo is exactly the quiet failure the tool exists to prevent (invariant #6) — but
+//! the *message* is the honest one for the cause, via [`claim_store::StoreLoad::resolve`]:
+//! an unknown id names the id; a *duplicate* id (declared in two files, so dropped as
+//! ambiguous) says "declared more than once" rather than a false "not found"; and an
+//! id whose file failed to parse surfaces that parse error, so the user sees *why* the
+//! claim could not be shown. An unrelated malformed *sibling* — a different id in the
+//! load errors — is not this command's concern: if the requested claim loaded cleanly,
+//! it is shown and the command exits 0. Store-wide health is `list`/`check`.
 
 use anyhow::{Context, Result};
-use claim_core::{Check, CheckKind, Claim, Hub, Skip, SupportTarget};
+use claim_core::{Check, CheckKind, Hub, Skip, SupportTarget};
 use serde::Serialize;
 
 use crate::apperror::{app, ErrorKind};
 use crate::cli::ShowArgs;
 use crate::output::{emit, Format};
-use claim_store::{discover, LoadedClaim, Store};
+use claim_store::{discover, LoadedClaim, Resolved};
+
+/// The exit code when the claim was found and printed. `show` is binary: this or an
+/// `Err` (exit 2). Carried on the `--json` envelope for symmetry with the read verbs
+/// (`list`/`check`/`drift`/`graph` all report `exit`) so a consumer need not inspect
+/// `$?`.
+const EXIT_OK: i32 = 0;
 
 /// Run `claim show`.
 ///
 /// Returns `Ok(())` (exit 0) once the claim is printed. Every failure is an `Err`
-/// (exit 2): no store found, an unknown id, or a target whose file could not be
-/// parsed. There is no review-worthy middle code — `show` either found and printed
-/// the one claim or it did not.
+/// (exit 2): no store found, an unknown id, a duplicate id declared twice, or a
+/// target whose file could not be parsed. There is no review-worthy middle code —
+/// `show` either found and printed the one claim or it did not.
 ///
 /// # Errors
 ///
 /// Fails when no store is found; when no claim in the store has the requested id
-/// ([`ErrorKind::InvalidInput`], naming the id); or when the file that *is* the
-/// requested id failed to parse (surfacing that parse reason so a typo and a broken
-/// file are distinguishable).
+/// ([`ErrorKind::InvalidInput`], naming the id); when two files declare the id (so it
+/// was dropped as ambiguous — reported as "declared twice", not "not found"); or when
+/// the file that *is* the requested id failed to parse (surfacing that parse reason,
+/// so a typo, a duplicate, and a broken file are three distinct messages).
 pub fn run(args: &ShowArgs, format: Format) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     let store = discover(&cwd)?;
-    let loaded = resolve_claim(&store, &args.id)?;
-
-    let report = ClaimReport::new(&loaded);
-    emit(format, &report, || human(&report, &loaded.claim))
-}
-
-/// Find the one claim whose id matches, or fail loudly.
-///
-/// A cleanly loaded match is returned. If no clean claim matches but a *load-errored
-/// file's* path is the file for this id, that file's parse error is surfaced — so a
-/// broken target reports why it broke rather than "not found". Only when neither a
-/// clean claim nor a same-id broken file exists is it a true "no such claim". An
-/// unrelated broken sibling (a different id) is ignored: it is `list`/`check`'s
-/// concern, not this single-claim lookup's.
-fn resolve_claim(store: &Store, id: &str) -> Result<LoadedClaim> {
     let load = store.load_all()?;
-    if let Some(loaded) = load.claims.iter().find(|c| c.claim.id.as_str() == id) {
-        return Ok(loaded.clone());
-    }
-    if let Some(err) = load
-        .errors
-        .iter()
-        .find(|e| file_stem_matches_id(&e.file, id))
-    {
-        return Err(app(
-            ErrorKind::InvalidInput,
-            format!("claim '{id}' could not be loaded: {}", err.message),
-        ));
-    }
-    Err(app(
-        ErrorKind::InvalidInput,
-        format!(
-            "no claim with id '{id}' in this store; run `claim list` to see the ids that exist"
-        ),
-    ))
-}
 
-/// Whether a load-errored file's path could be the file for `id`: its `.md` stem,
-/// relative to `.claims/`, equals the id. So an unparseable file named after the
-/// requested id reports *that* file's error rather than "not found". Mirrors the
-/// same rule in `retire`, kept local so the two verbs stay independently readable.
-fn file_stem_matches_id(file: &str, id: &str) -> bool {
-    file.strip_prefix(".claims/")
-        .and_then(|rest| rest.strip_suffix(".md"))
-        .is_some_and(|stem| stem == id)
+    let loaded = match load.resolve(&args.id) {
+        Resolved::Found(loaded) => loaded,
+        // A duplicate exists twice, so "no such claim" would be a lie; name the
+        // conflict (its message lists the colliding files) instead.
+        Resolved::Duplicate(err) => {
+            return Err(app(
+                ErrorKind::InvalidInput,
+                format!(
+                    "claim '{}' is declared more than once: {}",
+                    args.id, err.message
+                ),
+            ));
+        }
+        // A broken file named for the id: surface *why* it could not be shown, so a
+        // broken file is distinguishable from a typo.
+        Resolved::LoadFailed(err) => {
+            return Err(app(
+                ErrorKind::InvalidInput,
+                format!("claim '{}' could not be loaded: {}", args.id, err.message),
+            ));
+        }
+        Resolved::NotFound => {
+            return Err(app(
+                ErrorKind::InvalidInput,
+                format!(
+                    "no claim with id '{}' in this store; run `claim list` to see the ids that \
+                     exist",
+                    args.id
+                ),
+            ));
+        }
+    };
+
+    let report = ClaimReport::new(loaded);
+    emit(format, &report, || human(&report))
 }
 
 /// The machine form of `claim show`: a self-describing envelope carrying the one
@@ -102,6 +103,10 @@ struct ClaimReport<'a> {
     /// Always `"ok"`: the claim was found and printed. A failure never reaches here
     /// — it is an `Err` mapped to an exit-2 error object.
     status: &'static str,
+    /// The exit code (always [`EXIT_OK`] here, since a failure is an `Err`),
+    /// duplicated in the process exit so a `--json` consumer need not inspect `$?` —
+    /// matching `list`/`check`/`drift`/`graph`.
+    exit: i32,
     /// The claim's id.
     id: String,
     /// The claim file's path relative to the store root, e.g.
@@ -123,6 +128,7 @@ impl<'a> ClaimReport<'a> {
         let claim = &loaded.claim;
         ClaimReport {
             status: "ok",
+            exit: EXIT_OK,
             id: claim.id.to_string(),
             file: loaded.path.clone(),
             statement: claim.statement.trim().to_owned(),
@@ -135,29 +141,26 @@ impl<'a> ClaimReport<'a> {
 
 /// Print the claim as an aligned, readable definition, so a person sees at a glance
 /// what the claim asserts and how it is verified.
-///
-/// Takes both the report (for the id/file/statement it lifted) and the `Claim` (for
-/// the typed checks/supports/hub it renders in detail), rather than re-deriving them.
-fn human(report: &ClaimReport, claim: &Claim) {
+fn human(report: &ClaimReport) {
     println!("{}  ({})", report.id, report.file);
     println!();
     println!("{}", report.statement);
 
     println!();
     println!("checks:");
-    for (i, check) in claim.checks.iter().enumerate() {
+    for (i, check) in report.checks.iter().enumerate() {
         print_check(i, check);
     }
 
-    if !claim.supports.is_empty() {
+    if !report.supports.is_empty() {
         println!();
         println!("supports:");
-        for target in &claim.supports {
+        for target in report.supports {
             println!("  - {target}");
         }
     }
 
-    print_hub(&claim.hub);
+    print_hub(&report.hub);
 }
 
 /// Print one check: its kind and payload, then its skip if it declares one.
@@ -219,18 +222,9 @@ fn print_hub(hub: &Hub) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_stem_matches_id_maps_a_claim_path_to_its_id() {
-        assert!(file_stem_matches_id(
-            ".claims/payments/pin.md",
-            "payments/pin"
-        ));
-        assert!(!file_stem_matches_id(".claims/payments/pin.md", "other"));
-        assert!(!file_stem_matches_id("elsewhere/pin.md", "pin"));
-    }
-
     /// The report lifts id/file/statement onto the envelope and borrows the claim's
-    /// typed checks/supports/hub, so the machine form carries the whole definition.
+    /// typed checks/supports/hub, so the machine form carries the whole definition,
+    /// with a binary `exit: 0` for cross-verb symmetry.
     #[test]
     fn report_carries_the_full_definition() {
         let text = "---\nid: pin\nchecks:\n  - kind: cmd\n    run: \"true\"\nsupports:\n  - a\nhub:\n  max-age: 30d\n---\nWe pin it.\n";
@@ -243,6 +237,7 @@ mod tests {
         assert_eq!(report.id, "pin");
         assert_eq!(report.file, ".claims/pin.md");
         assert_eq!(report.statement, "We pin it.");
+        assert_eq!(report.exit, 0);
         assert_eq!(report.checks.len(), 1);
         assert_eq!(report.supports.len(), 1);
         assert_eq!(report.hub.max_age.map(|d| d.get()), Some(30));

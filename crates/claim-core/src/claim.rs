@@ -1977,4 +1977,113 @@ See [[libfoo-cjk-repro]] for the reproduction.
         let claim = parse_claim_file("f.md", text).unwrap();
         assert_eq!(claim.id.as_str(), "a");
     }
+
+    // The `Serialize` impls the CLI's `claim show --json` reuses. These pin the
+    // exact wire shape directly (not transitively through the CLI), so a change to a
+    // rename, a tag, a `skip_serializing_if`, or `Days`' custom impl is a visible,
+    // deliberate diff here.
+    use serde_json::json;
+
+    #[test]
+    fn days_serializes_as_its_canonical_string() {
+        // Not a bare integer: the `<N>d` spelling round-trips and cannot be confused
+        // with a plain number.
+        assert_eq!(serde_json::to_value(Days(nz(30))).unwrap(), json!("30d"));
+    }
+
+    #[test]
+    fn support_target_serializes_transparently_as_its_string() {
+        let target = SupportTarget("requirements.txt#libfoo".to_owned());
+        assert_eq!(
+            serde_json::to_value(&target).unwrap(),
+            json!("requirements.txt#libfoo")
+        );
+    }
+
+    #[test]
+    fn hub_uses_kebab_case_max_age_and_omits_absent_hints() {
+        // Both present: `max-age` is kebab-cased and every hint is its `<N>d` string.
+        let full = Hub {
+            recheck: Some(Days(nz(30))),
+            max_age: Some(Days(nz(120))),
+        };
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            json!({"recheck": "30d", "max-age": "120d"})
+        );
+        // Absent hints are omitted, not null — a hint-free block is an empty object,
+        // so the CLI never invents a cadence a hub would read as a real default.
+        assert_eq!(serde_json::to_value(Hub::default()).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn check_kind_is_internally_tagged_by_kind() {
+        // A cmd check: `{kind: "cmd", run, negate}` — the file's own discriminator.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Cmd {
+                run: "true".to_owned(),
+                negate: true,
+            })
+            .unwrap(),
+            json!({"kind": "cmd", "run": "true", "negate": true})
+        );
+        // An agent check: `{kind: "agent", instruction}`.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Agent {
+                instruction: "look".to_owned(),
+            })
+            .unwrap(),
+            json!({"kind": "agent", "instruction": "look"})
+        );
+        // A human check with no prompt omits the `prompt` key entirely.
+        assert_eq!(
+            serde_json::to_value(CheckKind::Human { prompt: None }).unwrap(),
+            json!({"kind": "human"})
+        );
+    }
+
+    #[test]
+    fn check_flattens_its_kind_and_omits_an_absent_skip() {
+        // The kind is flattened onto the check object (a top-level `kind` beside its
+        // fields), and a check with no skip carries no `skip` key.
+        let check = Check {
+            kind: CheckKind::Cmd {
+                run: "true".to_owned(),
+                negate: false,
+            },
+            skip: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            json!({"kind": "cmd", "run": "true", "negate": false})
+        );
+    }
+
+    #[test]
+    fn skip_serializes_its_guards_and_omits_absent_ones() {
+        // A full skip: reason, unless, and an RFC 3339 `until` (jiff's default form).
+        let full = Skip {
+            reason: "windows CI has no grep".to_owned(),
+            unless: Some("test -x /usr/bin/grep".to_owned()),
+            until: Some("2027-01-01T00:00:00Z".parse().unwrap()),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            json!({
+                "reason": "windows CI has no grep",
+                "unless": "test -x /usr/bin/grep",
+                "until": "2027-01-01T00:00:00Z",
+            })
+        );
+        // A reason-only skip omits both guards rather than emitting nulls.
+        let bare = Skip {
+            reason: "flaky in CI".to_owned(),
+            unless: None,
+            until: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"reason": "flaky in CI"})
+        );
+    }
 }

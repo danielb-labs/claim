@@ -94,6 +94,35 @@ fn retire_of_an_unknown_id_errors_and_removes_nothing() {
 }
 
 #[test]
+fn retire_of_a_duplicate_id_reports_declared_more_than_once_and_removes_nothing() {
+    // Two files declare id `dup`, so both are dropped as ambiguous. `retire` must say
+    // "declared more than once", not a false "no such claim" — the same latent bug
+    // `show` had, fixed once in the shared resolver. Neither file is removed.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "one",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nFirst.\n",
+    );
+    repo.write_claim(
+        "two",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nSecond.\n",
+    );
+
+    repo.claim()
+        .args(["retire", "dup", "--note", "x"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "claim 'dup' is declared more than once",
+        ))
+        .stderr(predicate::str::contains("no claim with id 'dup'").not());
+    // A refused retire removes neither conflicting file.
+    assert!(repo.exists(".claims/one.md"));
+    assert!(repo.exists(".claims/two.md"));
+}
+
+#[test]
 fn retire_json_shape_carries_the_essentials() {
     let repo = TestRepo::new();
     repo.claim().arg("init").assert().success();

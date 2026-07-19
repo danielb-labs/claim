@@ -31,7 +31,7 @@ fn seeded_store() -> TestRepo {
 }
 
 /// Parse `show --json` into its envelope object, asserting it is one object with
-/// `status: ok`.
+/// `status: ok` and the binary `exit: 0` the read verbs all carry.
 fn show_json(repo: &TestRepo, id: &str) -> serde_json::Value {
     let output = repo
         .claim()
@@ -43,6 +43,10 @@ fn show_json(repo: &TestRepo, id: &str) -> serde_json::Value {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&output).expect("show --json is one object");
     assert_eq!(v["status"], "ok");
+    assert_eq!(
+        v["exit"], 0,
+        "the envelope carries exit for cross-verb symmetry"
+    );
     v
 }
 
@@ -193,4 +197,65 @@ fn a_malformed_sibling_does_not_stop_showing_a_good_claim() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Statement for good."));
+}
+
+#[test]
+fn a_duplicate_id_reports_declared_more_than_once_not_not_found() {
+    // Two files declare id `dup`, so both are dropped as ambiguous. `show` must say
+    // "declared more than once" — a claim that exists twice is not "no such claim".
+    // Exit 2 in either case (no false green), but the diagnosis must be the true one.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "one",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nFirst.\n",
+    );
+    repo.write_claim(
+        "two",
+        "---\nid: dup\nchecks:\n  - kind: cmd\n    run: \"true\"\n---\nSecond.\n",
+    );
+    repo.claim()
+        .args(["show", "dup"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "claim 'dup' is declared more than once",
+        ))
+        // Not the "no claim with id" wording that misled before the fix.
+        .stderr(predicate::str::contains("no claim with id 'dup'").not());
+}
+
+#[test]
+fn renders_a_human_check_with_and_without_a_prompt() {
+    // The `human` check arm renders untested by the cmd/agent cases, so a regression
+    // there would ship green. One human check has a prompt, one does not.
+    let repo = TestRepo::new();
+    repo.claim().arg("init").assert().success();
+    repo.write_claim(
+        "review",
+        "---\nid: review\nchecks:\n  - kind: human\n    prompt: Confirm the pin is still needed.\n  - kind: human\n---\nA human look.\n",
+    );
+
+    // Human output shows both `human` checks and the prompt on the first.
+    repo.claim()
+        .args(["show", "review"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[0] human"))
+        .stdout(predicate::str::contains(
+            "prompt: Confirm the pin is still needed.",
+        ))
+        .stdout(predicate::str::contains("[1] human"));
+
+    // JSON carries both, the promptless one omitting the `prompt` key entirely.
+    let v = show_json(&repo, "review");
+    let checks = v["checks"].as_array().expect("checks is an array");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["kind"], "human");
+    assert_eq!(checks[0]["prompt"], "Confirm the pin is still needed.");
+    assert_eq!(checks[1]["kind"], "human");
+    assert!(
+        checks[1].get("prompt").is_none(),
+        "a promptless human check omits the prompt key"
+    );
 }

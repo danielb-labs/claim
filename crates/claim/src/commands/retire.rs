@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::apperror::{app, ErrorKind};
 use crate::cli::RetireArgs;
 use crate::output::{emit, relative_to, Format};
-use claim_store::{discover, Store};
+use claim_store::{discover, Resolved, Store};
 
 /// The machine form of `claim retire`.
 #[derive(Debug, Serialize)]
@@ -89,40 +89,32 @@ pub fn run(args: &RetireArgs, format: Format) -> Result<()> {
 
 /// Resolve the requested id to a claim that actually exists in the store.
 ///
-/// An unknown id is a loud error naming the id, never a silent no-op: retiring a
-/// claim that does not exist would do nothing and look like success. A file that
-/// *is* the requested id but failed to parse reports *that* file's error rather than
-/// "not found", so a typo and a broken file are distinguishable.
+/// A miss is a loud error, never a silent no-op: retiring a claim that does not
+/// exist would do nothing and look like success. The message is the honest one for
+/// the cause (via [`claim_store::StoreLoad::resolve`]): an unknown id names the id; a
+/// *duplicate* id (declared in two files, dropped as ambiguous) says "declared more
+/// than once" rather than a false "not found"; a file that *is* the requested id but
+/// failed to parse reports *that* file's error — so a typo, a duplicate, and a broken
+/// file are three distinct messages.
 fn resolve_claim(store: &Store, id: &str) -> Result<claim_core::Claim> {
     let load = store.load_all()?;
-    if let Some(loaded) = load.claims.iter().find(|c| c.claim.id.as_str() == id) {
-        return Ok(loaded.claim.clone());
-    }
-    if let Some(err) = load
-        .errors
-        .iter()
-        .find(|e| file_stem_matches_id(&e.file, id))
-    {
-        return Err(app(
+    match load.resolve(id) {
+        Resolved::Found(loaded) => Ok(loaded.claim.clone()),
+        Resolved::Duplicate(err) => Err(app(
+            ErrorKind::InvalidInput,
+            format!("claim '{id}' is declared more than once: {}", err.message),
+        )),
+        Resolved::LoadFailed(err) => Err(app(
             ErrorKind::InvalidInput,
             format!("claim '{id}' could not be loaded: {}", err.message),
-        ));
+        )),
+        Resolved::NotFound => Err(app(
+            ErrorKind::InvalidInput,
+            format!(
+                "no claim with id '{id}' in this store; run `claim list` to see the ids that exist"
+            ),
+        )),
     }
-    Err(app(
-        ErrorKind::InvalidInput,
-        format!(
-            "no claim with id '{id}' in this store; run `claim list` to see the ids that exist"
-        ),
-    ))
-}
-
-/// Whether a load-errored file's path could be the file for `id`: its `.md` stem,
-/// relative to `.claims/`, equals the id. So an unparseable file named after the
-/// requested id reports *that* file's error rather than "not found".
-fn file_stem_matches_id(file: &str, id: &str) -> bool {
-    file.strip_prefix(".claims/")
-        .and_then(|rest| rest.strip_suffix(".md"))
-        .is_some_and(|stem| stem == id)
 }
 
 /// Confirm the retirement and tell the user exactly what to commit.
@@ -139,19 +131,4 @@ fn human(report: &RetireReport) {
         "  git -C {} commit -m \"Retire claim {}: {}\"",
         report.root, report.id, report.note
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_stem_matches_id_maps_a_claim_path_to_its_id() {
-        assert!(file_stem_matches_id(
-            ".claims/payments/pin.md",
-            "payments/pin"
-        ));
-        assert!(!file_stem_matches_id(".claims/payments/pin.md", "other"));
-        assert!(!file_stem_matches_id("elsewhere/pin.md", "pin"));
-    }
 }
