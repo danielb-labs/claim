@@ -620,22 +620,30 @@ through an authenticated act endpoint), broker-backed ledger (behind the
 "later" item to actually schedule is the Postgres trait impl, because it
 proves the seam while the seam is young.
 
-### 4.5 Human decisions needed before agents start
+### 4.5 Decisions (resolved 2026-07-18)
 
-1. **The five stack vetoes (§3)** — before hub-01 branches.
-2. **Envelope field sign-off** (blocks hub-01): confirm HUB.md §2's sketch as
-   the frozen v1 wire set — in particular the check-digest definition (what
-   exactly is hashed) and whether `evidence` is capped at ingest.
-3. **The `hub:` key set** (blocks hub-06): `recheck` and `max-age` exist;
-   confirm whether v1 adds anything else (CLI-HUB-BOUNDARY.md lists this
-   open). Any new key is a `claim-core` parser change first, own branch.
-4. **Nag delivery split** (blocks hub-11/12b): confirm v1 keeps forge write
-   credentials in the CI glue with the hub rendering content, per §1.9 — or
-   accepts a hub-held token for direct delivery.
-5. **Read-auth default** (blocks hub-13): open reads inside a private network
-   as the self-host default, or authed-everything with the token floor.
-6. **Naming** (before hub-01, trivial but freezing): crate names
-   `claim-hub-core` / `claim-hub-store` / `claim-hub`, binary `claim-hub`.
+Signed off by the owner before the fleet started; agents build to these, not to
+the open questions this section once held.
+
+1. **Stack vetoes (§3):** all five accepted — Rust in-workspace, SQLite behind
+   `Ledger`/`Registry` traits, askama SSR with markdown twins, `jsonwebtoken` +
+   own JWKS cache, in-workspace crates (not a separate repo).
+2. **Envelope fields (hub-01):** HUB.md §2's set is the frozen v1 wire. The
+   **check-digest is a hash of the check's canonical definition** (kind plus the
+   run/instruction, negate, and skip fields in a normalized form), so a check's
+   identity is stable across reordering and cosmetic edits. **`evidence` is
+   capped at ingest** (a few KB); over-cap evidence is truncated with a recorded
+   marker, never dropped silently (invariant #6).
+3. **`hub:` keys (hub-06):** v1 is `recheck` + `max-age` only; no additions. Any
+   later key is a `claim-core` parser change first, on its own branch.
+4. **Nag delivery (hub-11/12b):** v1 keeps forge write credentials in the CI
+   glue — the hub renders nag content and serves it, the glue delivers (§1.9).
+   The hub holds no forge write token in v1.
+5. **Read-auth default (hub-13):** authed-everything with the scoped-token floor
+   is the default; open reads are an explicit opt-in config for a trusted private
+   network. Secure by default.
+6. **Naming:** crates `claim-hub-core` / `claim-hub-store` / `claim-hub`, binary
+   `claim-hub`.
 
 ## Appendix: sources (surveyed July 2026)
 
